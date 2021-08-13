@@ -1,0 +1,62 @@
+<!doctype html>
+<html>
+    <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta charset="utf-8">
+        <title>Kristian's Webpage | Home</title>
+        <link rel="stylesheet" href="style.css">
+    </head>
+    <body>
+        <header>
+            <img src="nordbg.png" class="banner">
+            <a href="#" class="logo">Kristian</a>
+            <div class="toggle"></div>
+            <nav>
+                <ul>
+                    <li><a href="#">Home</a></li>
+                    <li><a href="#">About</a></li>
+                    <li><a href="#">Projects</a></li>
+                    <li><a href="#">Contact Me</a></li>
+                </ul>
+            </nav>
+        </header>
+       <section>
+            <h2>300 Word Example</h2>
+                <p>BLAH BLAH BLAH, BLAH BLAH, BLAH BLAH BLAH, BLAH BLAH. BLAH BLAH BLAH, BLAH BLAH, BLAH BLAH BLAH, BLAH BLAH. BLAH BLAH BLAH, BLAH BLAH, BLAH BLAH BLAH, BLAH BLAH. BLAH BLAH BLAH, BLAH BLAH, BLAH BLAH BLAH, BLAH BLAH. BLAH BLAH BLAH, BLAH BLAH, BLAH BLAH BLAH, BLAH BLAH. BLAH BLAH BLAH, BLAH BLAH, BLAH BLAH BLAH, BLAH BLAH. BLAH BLAH BLAH, BLAH BLAH, BLAH BLAH BLAH, BLAH BLAH. BLAH BLAH BLAH, BLAH BLAH, BLAH BLAH BLAH, BLAH BLAH. BLAH BLAH BLAH, BLAH BLAH, BLAH BLAH BLAH, BLAH BLAH. BLAH BLAH BLAH, BLAH BLAH, BLAH BLAH BLAH, BLAH BLAH. BLAH BLAH BLAH, BLAH BLAH, BLAH BLAH BLAH, BLAH BLAH.</p>
+        </section>
+        <script>
+            window.addEventListener("scroll",function(){
+                const header = document.querySelector('header');
+                header.classList.toggle('sticky', window.scrollY > 0);
+            });
+
+            const navigation = document.querySelector('nav');
+            document.querySelector('.toggle').onclick = function(){
+                this.classList.toggle('active');
+                navigation.classList.toggle('active');
+            }
+            
+       </script>
+        <!--- <section>
+           <div class="side" id="side1">
+           <video src="mountain.mp4" type="video/mp4" autoplay loop muted></video>
+       </div> 
+           <div class="side" id="side2"><video src="mountain.mp4" type="video/mp4" autoplay loop muted></video>
+           </div>
+            
+       </section>
+       <div class="content">
+           <h2>Split Video on page scroll</h2>
+           <p>Write anything here</p>
+       </div>
+       <script>
+           let side1 = document.getElementById('side1');
+           let side2 = document.getElementById('side2');
+
+           window.addEventListener('scroll', function(){
+               side1.style.left = -window.pageYOffset+'px';
+               side2.style.left = window.pageYOffset+'px';
+           }) 
+       </script> -->
+    </body>
+</html>
