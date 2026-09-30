@@ -12330,13 +12330,14 @@ class House3DCard extends HTMLElement {
 
   /** A trigger as Home Assistant writes it; `flip` is its opposite (for Else). */
   _auTrig(w, flip = false) {
-    if (w.type === "time") return { trigger: "time", at: `${w.at}:00` };
-    if (w.type === "sunset" || w.type === "sunrise") return { trigger: "sun", event: w.type };
+    // written the classic way (platform:, trigger:, service:): every Home Assistant version reads it, new and old
+    if (w.type === "time") return { platform: "time", at: `${w.at}:00` };
+    if (w.type === "sunset" || w.type === "sunrise") return { platform: "sun", event: w.type };
     if (w.type === "num") {
       const dir = (w.dir === "below") !== flip ? "below" : "above";
-      return { trigger: "numeric_state", entity_id: w.entity, [dir]: Number(w.value) };
+      return { platform: "numeric_state", entity_id: w.entity, [dir]: Number(w.value) };
     }
-    return flip ? { trigger: "state", entity_id: w.entity, from: w.to } : { trigger: "state", entity_id: w.entity, to: w.to };
+    return flip ? { platform: "state", entity_id: w.entity, from: w.to } : { platform: "state", entity_id: w.entity, to: w.to };
   }
 
   _auCond(c) {
@@ -12352,12 +12353,12 @@ class House3DCard extends HTMLElement {
   _auHaConfig(s) {
     const acts = (list) => list.flatMap((a) => this._auSteps(a).map(([d, sv, data]) => {
       const { entity_id, ...rest } = data;
-      return { action: `${d}.${sv}`, target: { entity_id }, ...(Object.keys(rest).length ? { data: rest } : {}) };
+      return { service: `${d}.${sv}`, target: { entity_id }, ...(Object.keys(rest).length ? { data: rest } : {}) };
     }));
     const hasElse = !!(s.else?.length && this._auElseText(s.when));
     const triggers = hasElse ? [{ ...this._auTrig(s.when), id: "then" }, { ...this._auTrig(s.when, true), id: "else" }] : [this._auTrig(s.when)];
     const actions = hasElse ? [{ if: [{ condition: "trigger", id: "then" }], then: acts(s.actions), else: acts(s.else) }] : acts(s.actions);
-    return { alias: s.name, description: "Made in the 3D house card (Devices → Shortcuts).", mode: "restart", triggers, conditions: (s.conds || []).map((c) => this._auCond(c)), actions };
+    return { alias: s.name, description: "Made in the 3D house card (Devices → Shortcuts).", mode: "restart", trigger: triggers, condition: (s.conds || []).map((c) => this._auCond(c)), action: actions };
   }
 
   _auHa(method, id, body) {
@@ -12391,7 +12392,10 @@ class House3DCard extends HTMLElement {
     } catch (e) {
       au.busy = false;
       const who = e?.status_code === 401 || e?.status === 401 || /unauthor/i.test(e?.message || e?.body?.message || "") ? " Only Home Assistant admins can make automations." : "";
-      return fail(`Home Assistant didn't save the automation.${who}`);
+      // Home Assistant's own reason, so it can be fixed (e.g. "Message malformed: ...")
+      const why = e?.body?.message || e?.error || e?.message || (typeof e === "string" ? e : "");
+      console.warn("house3d-card: saving the automation failed", e);
+      return fail(`Home Assistant didn't save the automation.${who}${why && !who ? ` It said: ${String(why).slice(0, 200)}` : ""}`);
     }
     const list = [...(this._shortcuts || [])];
     const i = list.findIndex((x) => x.id === s.id);
