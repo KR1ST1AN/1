@@ -1,0 +1,234 @@
+# Paste into a dashboard: Edit dashboard → ⋮ → Raw configuration editor (as a card), or a Manual card.
+type: custom:house3d-card
+model: /local/house3d/huone/Huone.obj
+height: 560
+start_azimuth: 45
+start_elevation: 35
+snap_azimuths: [45, 135, 225, 315]
+snap_elevations: [35, 89]
+snap: false
+phone_first: [light.hogvind]
+phone_last: [fan.dyson, vacuum.robot]
+return_home: 4
+look_height: 0.5
+buttons: false
+background: motion
+weather: weather.forecast_home
+hide_objects:
+- ground_1
+- '109'
+- '110'
+- '111'
+- '112'
+- '113'
+- '114'
+- '115'
+- '116'
+- '117'
+- '118'
+- '119'
+- '120'
+- bottom_165
+- top_166
+- left_167
+- right_168
+- back_169
+- front_170
+- bottom_171
+- top_172
+- left_173
+- right_174
+- back_175
+- front_176
+props:
+- type: fejka_plant
+  name: fejka
+  position: [535, 75.2, 328]
+  pot_color: '#1c1c1e'
+- type: unifi_cgu
+  name: unifi_gateway
+  position: [631.5, 36.3, 490]
+  rotation: 180
+- type: unifi_ap
+  name: unifi_ap
+  position: [612, 36.3, 490]
+  flip: true
+- type: model
+  name: robot_vacuum
+  url: /local/house3d/robot_vacuum.glb
+  size: 35
+  position: [580, 1.2, 487]
+  rotation: 180
+labels:
+- name: Network
+  icon: wifi
+  position: [612, 140, 492]
+  menu_of: binary_sensor.unifi_internet
+  parts:
+  - entity: sensor.unifi_download
+    icon: down
+  - entity: sensor.unifi_upload
+    icon: up
+    unit: ' Mbit/s'
+  - entity: sensor.unifi_clients
+    icon: devices
+  - entity: device_tracker.jani_phone
+    icon: phone
+    presence: true
+    name: Phone
+  - entity: device_tracker.noir_pc
+    icon: pc
+    presence: true
+    name: PC
+- entity: sensor.dyson_temperature
+  name: Room temperature
+  position: [586, 190, 405]
+entities:
+- entity: light.hogvind
+  name: HÖGVIND lamp
+  object: [HOGVIND_Ikea_1_224, HOGVIND_Ikea_272_2_225, HOGVIND_Ikea_2192_3_226, HOGVIND_Ikea_2544_4_227, HOGVIND_Ikea_2864_5_228, HOGVIND_Ikea_4612_6_229]
+  glow_objects: [HOGVIND_Ikea_272_2_225, HOGVIND_Ikea_2192_3_226]
+  light_offset: [0, 4, 0]
+  intensity: 24
+  light_decay: 1
+  light_distance: 13
+  light_reach: 0.85
+- entity: cover.blind
+  name: Blind
+  object:
+  - bottom_177
+  - top_178
+  - left_179
+  - right_180
+  - back_181
+  - front_182
+  - Cylinder_183
+  - Cylinder_32_184
+  - Cylinder_96_185
+  - bottom_186
+  - top_187
+  - left_188
+  - right_189
+  - back_190
+  - front_191
+  cover:
+    fabric: [bottom_177, top_178, left_179, right_180, back_181, front_182]
+    bar: [Cylinder_183, Cylinder_32_184, Cylinder_96_185]
+    side: up
+    duration: 6
+- entity: binary_sensor.aqara_door_and_window_sensor_t1_door
+  name: Door
+  object: [sweethome3d_opening_on_hinge_1_door_42, sweethome3d_opening_on_hinge_1_handleOut_12_38, sweethome3d_opening_on_hinge_1_handleOut_39,
+    sweethome3d_opening_on_hinge_1_handleIn_12_40, sweethome3d_opening_on_hinge_1_handleIn_41]
+  hint: false
+  door:
+    hinge: sweethome3d_hinge_1_2_35
+    degrees: 35
+    direction: inner
+- entity: binary_sensor.aqara_door_and_window_sensor_door
+  name: Window
+  object: [sweethome3d_opening_on_hinge_1_48, sweethome3d_window_pane_on_hinge_1_49, sweethome3d_opening_on_hinge_1_handle_12_46, sweethome3d_opening_on_hinge_1_handle_47]
+  hint: false
+  door:
+    hinge: sweethome3d_hinge_1_2_44
+    degrees: 35
+    direction: inner
+- entity: binary_sensor.aqara_door_and_window_sensor_t1_door_2
+  name: Small window
+  object: [sweethome3d_opening_on_hinge_1_54, sweethome3d_window_pane_on_hinge_1_57, sweethome3d_opening_on_hinge_1_handle_12_55, sweethome3d_opening_on_hinge_1_handle_56]
+  hint: false
+  door:
+    hinge: sweethome3d_hinge_1_2_53
+    degrees: 50
+    direction: inner
+- entity: camera.eufy_cctv
+  name: CCTV
+  object: [Sphere_86, Sphere_112_87, Circle_88]
+  camera_start: eufy_security.start_p2p_livestream
+  camera_stop: eufy_security.stop_p2p_livestream
+- entity: binary_sensor.unifi_internet
+  name: Cloud Gateway Ultra
+  object: unifi_gateway
+  glow_objects: [unifi_gateway_led]
+  color: '#3d8bff'
+  off_color: '#ff3b30'
+  light: false
+  alert_when_off: true
+  alert_text: Internet down
+  back_text: Internet back
+  dot_color: '#3ddc84'
+  graph_minutes: 5
+  network:
+    download: sensor.unifi_download
+    upload: sensor.unifi_upload
+    clients: sensor.unifi_clients
+  presence:
+  - entity: device_tracker.jani_phone
+    name: Phone
+    icon: phone
+  - entity: device_tracker.noir_pc
+    name: PC
+    icon: pc
+- entity: device_tracker.unifi_ap
+  name: UniFi AP
+  object: unifi_ap
+  glow_objects: [unifi_ap_ring]
+  color: '#3d8bff'
+  light: false
+  hint: false
+  network:
+    download: sensor.unifi_download
+    upload: sensor.unifi_upload
+    clients: sensor.unifi_clients
+  presence:
+  - entity: device_tracker.jani_phone
+    name: Phone
+    icon: phone
+  - entity: device_tracker.noir_pc
+    name: PC
+    icon: pc
+- entity: sensor.noir_noir_sessionstate
+  name: PC
+  object: ['198', Plane_199, Plane_18_200, '201', '202', '203', Plane_204, Plane_18_205, '206', '207']
+  screen: true
+  on_state: Unlocked
+- entity: fan.dyson
+  climate: climate.dyson
+  direction_labels: [Front, Back]
+  sensors:
+  - entity: sensor.dyson_temperature
+    name: Temp
+  - entity: sensor.dyson_humidity
+    name: Humidity
+  - entity: sensor.dyson_pm_2_5
+    name: PM2.5
+  - entity: sensor.dyson_pm_10
+    name: PM10
+  - entity: sensor.dyson_no2_index
+    name: NO₂
+  - entity: sensor.dyson_voc_index
+    name: VOC
+  name: Dyson purifier
+  object: [Dyson_Fan_Fot_1_230, Dyson_Fan_Mid_2_231, Dyson_Fan_Top_3_232]
+  airflow:
+    from: [Dyson_Fan_Top_3_232]
+  rotate:
+    objects: [Dyson_Fan_Mid_2_231, Dyson_Fan_Top_3_232]
+    mode: oscillate
+    degrees: 40
+- entity: vacuum.robot
+  name: Robot vacuum
+  object: robot_vacuum
+  vacuum:
+    area: [460, 360, 642, 480]
+    avoid:
+    - [555, 335, 617, 397]
+    - [600, 468, 645, 512]
+    - [524, 481, 559, 516]
+  sensors:
+  - entity: sensor.robot_filter_time_left
+    name: Filter
+  - entity: sensor.robot_main_brush_time_left
+    name: Main brush
+  - entity: sensor.robot_side_brush_time_left
+    name: Side brush

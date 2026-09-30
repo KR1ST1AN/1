@@ -1,0 +1,15744 @@
+/*
+ * house3d-card — a rotatable 3D house for Home Assistant dashboards.
+ *
+ *  - Drag to rotate, scroll / pinch to zoom. On release the view snaps
+ *    (with a little spring) to the nearest preset angle.
+ *  - Tap an object bound to an entity to toggle it, long-press for more-info.
+ *  - Lamps glow and cast light when on (brightness + colour aware).
+ *  - Loads a .glb / .gltf / .obj model, or shows a built-in demo house.
+ *
+ * Files: put the whole "house3d" folder in /config/www/ and add
+ * /local/house3d/house3d-card.js as a JavaScript module resource.
+ */
+import * as THREE from "./three.module.min.js"; // three.js r160, shipped next to this file (MIT licence)
+const __OBJLoader = (() => {
+const { BufferGeometry, FileLoader, Float32BufferAttribute, Group, LineBasicMaterial, LineSegments, Loader, Material, Mesh, MeshPhongMaterial, Points, PointsMaterial, Vector3, Color } = THREE;
+
+// o object_name | g group_name
+const _object_pattern = /^[og]\s*(.+)?/;
+// mtllib file_reference
+const _material_library_pattern = /^mtllib /;
+// usemtl material_name
+const _material_use_pattern = /^usemtl /;
+// usemap map_name
+const _map_use_pattern = /^usemap /;
+const _face_vertex_data_separator_pattern = /\s+/;
+
+const _vA = new Vector3();
+const _vB = new Vector3();
+const _vC = new Vector3();
+
+const _ab = new Vector3();
+const _cb = new Vector3();
+
+const _color = new Color();
+
+function ParserState() {
+
+	const state = {
+		objects: [],
+		object: {},
+
+		vertices: [],
+		normals: [],
+		colors: [],
+		uvs: [],
+
+		materials: {},
+		materialLibraries: [],
+
+		startObject: function ( name, fromDeclaration ) {
+
+			// If the current object (initial from reset) is not from a g/o declaration in the parsed
+			// file. We need to use it for the first parsed g/o to keep things in sync.
+			if ( this.object && this.object.fromDeclaration === false ) {
+
+				this.object.name = name;
+				this.object.fromDeclaration = ( fromDeclaration !== false );
+				return;
+
+			}
+
+			const previousMaterial = ( this.object && typeof this.object.currentMaterial === 'function' ? this.object.currentMaterial() : undefined );
+
+			if ( this.object && typeof this.object._finalize === 'function' ) {
+
+				this.object._finalize( true );
+
+			}
+
+			this.object = {
+				name: name || '',
+				fromDeclaration: ( fromDeclaration !== false ),
+
+				geometry: {
+					vertices: [],
+					normals: [],
+					colors: [],
+					uvs: [],
+					hasUVIndices: false
+				},
+				materials: [],
+				smooth: true,
+
+				startMaterial: function ( name, libraries ) {
+
+					const previous = this._finalize( false );
+
+					// New usemtl declaration overwrites an inherited material, except if faces were declared
+					// after the material, then it must be preserved for proper MultiMaterial continuation.
+					if ( previous && ( previous.inherited || previous.groupCount <= 0 ) ) {
+
+						this.materials.splice( previous.index, 1 );
+
+					}
+
+					const material = {
+						index: this.materials.length,
+						name: name || '',
+						mtllib: ( Array.isArray( libraries ) && libraries.length > 0 ? libraries[ libraries.length - 1 ] : '' ),
+						smooth: ( previous !== undefined ? previous.smooth : this.smooth ),
+						groupStart: ( previous !== undefined ? previous.groupEnd : 0 ),
+						groupEnd: - 1,
+						groupCount: - 1,
+						inherited: false,
+
+						clone: function ( index ) {
+
+							const cloned = {
+								index: ( typeof index === 'number' ? index : this.index ),
+								name: this.name,
+								mtllib: this.mtllib,
+								smooth: this.smooth,
+								groupStart: 0,
+								groupEnd: - 1,
+								groupCount: - 1,
+								inherited: false
+							};
+							cloned.clone = this.clone.bind( cloned );
+							return cloned;
+
+						}
+					};
+
+					this.materials.push( material );
+
+					return material;
+
+				},
+
+				currentMaterial: function () {
+
+					if ( this.materials.length > 0 ) {
+
+						return this.materials[ this.materials.length - 1 ];
+
+					}
+
+					return undefined;
+
+				},
+
+				_finalize: function ( end ) {
+
+					const lastMultiMaterial = this.currentMaterial();
+					if ( lastMultiMaterial && lastMultiMaterial.groupEnd === - 1 ) {
+
+						lastMultiMaterial.groupEnd = this.geometry.vertices.length / 3;
+						lastMultiMaterial.groupCount = lastMultiMaterial.groupEnd - lastMultiMaterial.groupStart;
+						lastMultiMaterial.inherited = false;
+
+					}
+
+					// Ignore objects tail materials if no face declarations followed them before a new o/g started.
+					if ( end && this.materials.length > 1 ) {
+
+						for ( let mi = this.materials.length - 1; mi >= 0; mi -- ) {
+
+							if ( this.materials[ mi ].groupCount <= 0 ) {
+
+								this.materials.splice( mi, 1 );
+
+							}
+
+						}
+
+					}
+
+					// Guarantee at least one empty material, this makes the creation later more straight forward.
+					if ( end && this.materials.length === 0 ) {
+
+						this.materials.push( {
+							name: '',
+							smooth: this.smooth
+						} );
+
+					}
+
+					return lastMultiMaterial;
+
+				}
+			};
+
+			// Inherit previous objects material.
+			// Spec tells us that a declared material must be set to all objects until a new material is declared.
+			// If a usemtl declaration is encountered while this new object is being parsed, it will
+			// overwrite the inherited material. Exception being that there was already face declarations
+			// to the inherited material, then it will be preserved for proper MultiMaterial continuation.
+
+			if ( previousMaterial && previousMaterial.name && typeof previousMaterial.clone === 'function' ) {
+
+				const declared = previousMaterial.clone( 0 );
+				declared.inherited = true;
+				this.object.materials.push( declared );
+
+			}
+
+			this.objects.push( this.object );
+
+		},
+
+		finalize: function () {
+
+			if ( this.object && typeof this.object._finalize === 'function' ) {
+
+				this.object._finalize( true );
+
+			}
+
+		},
+
+		parseVertexIndex: function ( value, len ) {
+
+			const index = parseInt( value, 10 );
+			return ( index >= 0 ? index - 1 : index + len / 3 ) * 3;
+
+		},
+
+		parseNormalIndex: function ( value, len ) {
+
+			const index = parseInt( value, 10 );
+			return ( index >= 0 ? index - 1 : index + len / 3 ) * 3;
+
+		},
+
+		parseUVIndex: function ( value, len ) {
+
+			const index = parseInt( value, 10 );
+			return ( index >= 0 ? index - 1 : index + len / 2 ) * 2;
+
+		},
+
+		addVertex: function ( a, b, c ) {
+
+			const src = this.vertices;
+			const dst = this.object.geometry.vertices;
+
+			dst.push( src[ a + 0 ], src[ a + 1 ], src[ a + 2 ] );
+			dst.push( src[ b + 0 ], src[ b + 1 ], src[ b + 2 ] );
+			dst.push( src[ c + 0 ], src[ c + 1 ], src[ c + 2 ] );
+
+		},
+
+		addVertexPoint: function ( a ) {
+
+			const src = this.vertices;
+			const dst = this.object.geometry.vertices;
+
+			dst.push( src[ a + 0 ], src[ a + 1 ], src[ a + 2 ] );
+
+		},
+
+		addVertexLine: function ( a ) {
+
+			const src = this.vertices;
+			const dst = this.object.geometry.vertices;
+
+			dst.push( src[ a + 0 ], src[ a + 1 ], src[ a + 2 ] );
+
+		},
+
+		addNormal: function ( a, b, c ) {
+
+			const src = this.normals;
+			const dst = this.object.geometry.normals;
+
+			dst.push( src[ a + 0 ], src[ a + 1 ], src[ a + 2 ] );
+			dst.push( src[ b + 0 ], src[ b + 1 ], src[ b + 2 ] );
+			dst.push( src[ c + 0 ], src[ c + 1 ], src[ c + 2 ] );
+
+		},
+
+		addFaceNormal: function ( a, b, c ) {
+
+			const src = this.vertices;
+			const dst = this.object.geometry.normals;
+
+			_vA.fromArray( src, a );
+			_vB.fromArray( src, b );
+			_vC.fromArray( src, c );
+
+			_cb.subVectors( _vC, _vB );
+			_ab.subVectors( _vA, _vB );
+			_cb.cross( _ab );
+
+			_cb.normalize();
+
+			dst.push( _cb.x, _cb.y, _cb.z );
+			dst.push( _cb.x, _cb.y, _cb.z );
+			dst.push( _cb.x, _cb.y, _cb.z );
+
+		},
+
+		addColor: function ( a, b, c ) {
+
+			const src = this.colors;
+			const dst = this.object.geometry.colors;
+
+			if ( src[ a ] !== undefined ) dst.push( src[ a + 0 ], src[ a + 1 ], src[ a + 2 ] );
+			if ( src[ b ] !== undefined ) dst.push( src[ b + 0 ], src[ b + 1 ], src[ b + 2 ] );
+			if ( src[ c ] !== undefined ) dst.push( src[ c + 0 ], src[ c + 1 ], src[ c + 2 ] );
+
+		},
+
+		addUV: function ( a, b, c ) {
+
+			const src = this.uvs;
+			const dst = this.object.geometry.uvs;
+
+			dst.push( src[ a + 0 ], src[ a + 1 ] );
+			dst.push( src[ b + 0 ], src[ b + 1 ] );
+			dst.push( src[ c + 0 ], src[ c + 1 ] );
+
+		},
+
+		addDefaultUV: function () {
+
+			const dst = this.object.geometry.uvs;
+
+			dst.push( 0, 0 );
+			dst.push( 0, 0 );
+			dst.push( 0, 0 );
+
+		},
+
+		addUVLine: function ( a ) {
+
+			const src = this.uvs;
+			const dst = this.object.geometry.uvs;
+
+			dst.push( src[ a + 0 ], src[ a + 1 ] );
+
+		},
+
+		addFace: function ( a, b, c, ua, ub, uc, na, nb, nc ) {
+
+			const vLen = this.vertices.length;
+
+			let ia = this.parseVertexIndex( a, vLen );
+			let ib = this.parseVertexIndex( b, vLen );
+			let ic = this.parseVertexIndex( c, vLen );
+
+			this.addVertex( ia, ib, ic );
+			this.addColor( ia, ib, ic );
+
+			// normals
+
+			if ( na !== undefined && na !== '' ) {
+
+				const nLen = this.normals.length;
+
+				ia = this.parseNormalIndex( na, nLen );
+				ib = this.parseNormalIndex( nb, nLen );
+				ic = this.parseNormalIndex( nc, nLen );
+
+				this.addNormal( ia, ib, ic );
+
+			} else {
+
+				this.addFaceNormal( ia, ib, ic );
+
+			}
+
+			// uvs
+
+			if ( ua !== undefined && ua !== '' ) {
+
+				const uvLen = this.uvs.length;
+
+				ia = this.parseUVIndex( ua, uvLen );
+				ib = this.parseUVIndex( ub, uvLen );
+				ic = this.parseUVIndex( uc, uvLen );
+
+				this.addUV( ia, ib, ic );
+
+				this.object.geometry.hasUVIndices = true;
+
+			} else {
+
+				// add placeholder values (for inconsistent face definitions)
+
+				this.addDefaultUV();
+
+			}
+
+		},
+
+		addPointGeometry: function ( vertices ) {
+
+			this.object.geometry.type = 'Points';
+
+			const vLen = this.vertices.length;
+
+			for ( let vi = 0, l = vertices.length; vi < l; vi ++ ) {
+
+				const index = this.parseVertexIndex( vertices[ vi ], vLen );
+
+				this.addVertexPoint( index );
+				this.addColor( index );
+
+			}
+
+		},
+
+		addLineGeometry: function ( vertices, uvs ) {
+
+			this.object.geometry.type = 'Line';
+
+			const vLen = this.vertices.length;
+			const uvLen = this.uvs.length;
+
+			for ( let vi = 0, l = vertices.length; vi < l; vi ++ ) {
+
+				this.addVertexLine( this.parseVertexIndex( vertices[ vi ], vLen ) );
+
+			}
+
+			for ( let uvi = 0, l = uvs.length; uvi < l; uvi ++ ) {
+
+				this.addUVLine( this.parseUVIndex( uvs[ uvi ], uvLen ) );
+
+			}
+
+		}
+
+	};
+
+	state.startObject( '', false );
+
+	return state;
+
+}
+
+//
+
+class OBJLoader extends Loader {
+
+	constructor( manager ) {
+
+		super( manager );
+
+		this.materials = null;
+
+	}
+
+	load( url, onLoad, onProgress, onError ) {
+
+		const scope = this;
+
+		const loader = new FileLoader( this.manager );
+		loader.setPath( this.path );
+		loader.setRequestHeader( this.requestHeader );
+		loader.setWithCredentials( this.withCredentials );
+		loader.load( url, function ( text ) {
+
+			try {
+
+				onLoad( scope.parse( text ) );
+
+			} catch ( e ) {
+
+				if ( onError ) {
+
+					onError( e );
+
+				} else {
+
+					console.error( e );
+
+				}
+
+				scope.manager.itemError( url );
+
+			}
+
+		}, onProgress, onError );
+
+	}
+
+	setMaterials( materials ) {
+
+		this.materials = materials;
+
+		return this;
+
+	}
+
+	parse( text ) {
+
+		const state = new ParserState();
+
+		if ( text.indexOf( '\r\n' ) !== - 1 ) {
+
+			// This is faster than String.split with regex that splits on both
+			text = text.replace( /\r\n/g, '\n' );
+
+		}
+
+		if ( text.indexOf( '\\\n' ) !== - 1 ) {
+
+			// join lines separated by a line continuation character (\)
+			text = text.replace( /\\\n/g, '' );
+
+		}
+
+		const lines = text.split( '\n' );
+		let result = [];
+
+		for ( let i = 0, l = lines.length; i < l; i ++ ) {
+
+			const line = lines[ i ].trimStart();
+
+			if ( line.length === 0 ) continue;
+
+			const lineFirstChar = line.charAt( 0 );
+
+			// @todo invoke passed in handler if any
+			if ( lineFirstChar === '#' ) continue; // skip comments
+
+			if ( lineFirstChar === 'v' ) {
+
+				const data = line.split( _face_vertex_data_separator_pattern );
+
+				switch ( data[ 0 ] ) {
+
+					case 'v':
+						state.vertices.push(
+							parseFloat( data[ 1 ] ),
+							parseFloat( data[ 2 ] ),
+							parseFloat( data[ 3 ] )
+						);
+						if ( data.length >= 7 ) {
+
+							_color.setRGB(
+								parseFloat( data[ 4 ] ),
+								parseFloat( data[ 5 ] ),
+								parseFloat( data[ 6 ] )
+							).convertSRGBToLinear();
+
+							state.colors.push( _color.r, _color.g, _color.b );
+
+						} else {
+
+							// if no colors are defined, add placeholders so color and vertex indices match
+
+							state.colors.push( undefined, undefined, undefined );
+
+						}
+
+						break;
+					case 'vn':
+						state.normals.push(
+							parseFloat( data[ 1 ] ),
+							parseFloat( data[ 2 ] ),
+							parseFloat( data[ 3 ] )
+						);
+						break;
+					case 'vt':
+						state.uvs.push(
+							parseFloat( data[ 1 ] ),
+							parseFloat( data[ 2 ] )
+						);
+						break;
+
+				}
+
+			} else if ( lineFirstChar === 'f' ) {
+
+				const lineData = line.slice( 1 ).trim();
+				const vertexData = lineData.split( _face_vertex_data_separator_pattern );
+				const faceVertices = [];
+
+				// Parse the face vertex data into an easy to work with format
+
+				for ( let j = 0, jl = vertexData.length; j < jl; j ++ ) {
+
+					const vertex = vertexData[ j ];
+
+					if ( vertex.length > 0 ) {
+
+						const vertexParts = vertex.split( '/' );
+						faceVertices.push( vertexParts );
+
+					}
+
+				}
+
+				// Draw an edge between the first vertex and all subsequent vertices to form an n-gon
+
+				const v1 = faceVertices[ 0 ];
+
+				for ( let j = 1, jl = faceVertices.length - 1; j < jl; j ++ ) {
+
+					const v2 = faceVertices[ j ];
+					const v3 = faceVertices[ j + 1 ];
+
+					state.addFace(
+						v1[ 0 ], v2[ 0 ], v3[ 0 ],
+						v1[ 1 ], v2[ 1 ], v3[ 1 ],
+						v1[ 2 ], v2[ 2 ], v3[ 2 ]
+					);
+
+				}
+
+			} else if ( lineFirstChar === 'l' ) {
+
+				const lineParts = line.substring( 1 ).trim().split( ' ' );
+				let lineVertices = [];
+				const lineUVs = [];
+
+				if ( line.indexOf( '/' ) === - 1 ) {
+
+					lineVertices = lineParts;
+
+				} else {
+
+					for ( let li = 0, llen = lineParts.length; li < llen; li ++ ) {
+
+						const parts = lineParts[ li ].split( '/' );
+
+						if ( parts[ 0 ] !== '' ) lineVertices.push( parts[ 0 ] );
+						if ( parts[ 1 ] !== '' ) lineUVs.push( parts[ 1 ] );
+
+					}
+
+				}
+
+				state.addLineGeometry( lineVertices, lineUVs );
+
+			} else if ( lineFirstChar === 'p' ) {
+
+				const lineData = line.slice( 1 ).trim();
+				const pointData = lineData.split( ' ' );
+
+				state.addPointGeometry( pointData );
+
+			} else if ( ( result = _object_pattern.exec( line ) ) !== null ) {
+
+				// o object_name
+				// or
+				// g group_name
+
+				// WORKAROUND: https://bugs.chromium.org/p/v8/issues/detail?id=2869
+				// let name = result[ 0 ].slice( 1 ).trim();
+				const name = ( ' ' + result[ 0 ].slice( 1 ).trim() ).slice( 1 );
+
+				state.startObject( name );
+
+			} else if ( _material_use_pattern.test( line ) ) {
+
+				// material
+
+				state.object.startMaterial( line.substring( 7 ).trim(), state.materialLibraries );
+
+			} else if ( _material_library_pattern.test( line ) ) {
+
+				// mtl file
+
+				state.materialLibraries.push( line.substring( 7 ).trim() );
+
+			} else if ( _map_use_pattern.test( line ) ) {
+
+				// the line is parsed but ignored since the loader assumes textures are defined MTL files
+				// (according to https://www.okino.com/conv/imp_wave.htm, 'usemap' is the old-style Wavefront texture reference method)
+
+				console.warn( 'THREE.OBJLoader: Rendering identifier "usemap" not supported. Textures must be defined in MTL files.' );
+
+			} else if ( lineFirstChar === 's' ) {
+
+				result = line.split( ' ' );
+
+				// smooth shading
+
+				// @todo Handle files that have varying smooth values for a set of faces inside one geometry,
+				// but does not define a usemtl for each face set.
+				// This should be detected and a dummy material created (later MultiMaterial and geometry groups).
+				// This requires some care to not create extra material on each smooth value for "normal" obj files.
+				// where explicit usemtl defines geometry groups.
+				// Example asset: examples/models/obj/cerberus/Cerberus.obj
+
+				/*
+					 * http://paulbourke.net/dataformats/obj/
+					 *
+					 * From chapter "Grouping" Syntax explanation "s group_number":
+					 * "group_number is the smoothing group number. To turn off smoothing groups, use a value of 0 or off.
+					 * Polygonal elements use group numbers to put elements in different smoothing groups. For free-form
+					 * surfaces, smoothing groups are either turned on or off; there is no difference between values greater
+					 * than 0."
+					 */
+				if ( result.length > 1 ) {
+
+					const value = result[ 1 ].trim().toLowerCase();
+					state.object.smooth = ( value !== '0' && value !== 'off' );
+
+				} else {
+
+					// ZBrush can produce "s" lines #11707
+					state.object.smooth = true;
+
+				}
+
+				const material = state.object.currentMaterial();
+				if ( material ) material.smooth = state.object.smooth;
+
+			} else {
+
+				// Handle null terminated files without exception
+				if ( line === '\0' ) continue;
+
+				console.warn( 'THREE.OBJLoader: Unexpected line: "' + line + '"' );
+
+			}
+
+		}
+
+		state.finalize();
+
+		const container = new Group();
+		container.materialLibraries = [].concat( state.materialLibraries );
+
+		const hasPrimitives = ! ( state.objects.length === 1 && state.objects[ 0 ].geometry.vertices.length === 0 );
+
+		if ( hasPrimitives === true ) {
+
+			for ( let i = 0, l = state.objects.length; i < l; i ++ ) {
+
+				const object = state.objects[ i ];
+				const geometry = object.geometry;
+				const materials = object.materials;
+				const isLine = ( geometry.type === 'Line' );
+				const isPoints = ( geometry.type === 'Points' );
+				let hasVertexColors = false;
+
+				// Skip o/g line declarations that did not follow with any faces
+				if ( geometry.vertices.length === 0 ) continue;
+
+				const buffergeometry = new BufferGeometry();
+
+				buffergeometry.setAttribute( 'position', new Float32BufferAttribute( geometry.vertices, 3 ) );
+
+				if ( geometry.normals.length > 0 ) {
+
+					buffergeometry.setAttribute( 'normal', new Float32BufferAttribute( geometry.normals, 3 ) );
+
+				}
+
+				if ( geometry.colors.length > 0 ) {
+
+					hasVertexColors = true;
+					buffergeometry.setAttribute( 'color', new Float32BufferAttribute( geometry.colors, 3 ) );
+
+				}
+
+				if ( geometry.hasUVIndices === true ) {
+
+					buffergeometry.setAttribute( 'uv', new Float32BufferAttribute( geometry.uvs, 2 ) );
+
+				}
+
+				// Create materials
+
+				const createdMaterials = [];
+
+				for ( let mi = 0, miLen = materials.length; mi < miLen; mi ++ ) {
+
+					const sourceMaterial = materials[ mi ];
+					const materialHash = sourceMaterial.name + '_' + sourceMaterial.smooth + '_' + hasVertexColors;
+					let material = state.materials[ materialHash ];
+
+					if ( this.materials !== null ) {
+
+						material = this.materials.create( sourceMaterial.name );
+
+						// mtl etc. loaders probably can't create line materials correctly, copy properties to a line material.
+						if ( isLine && material && ! ( material instanceof LineBasicMaterial ) ) {
+
+							const materialLine = new LineBasicMaterial();
+							Material.prototype.copy.call( materialLine, material );
+							materialLine.color.copy( material.color );
+							material = materialLine;
+
+						} else if ( isPoints && material && ! ( material instanceof PointsMaterial ) ) {
+
+							const materialPoints = new PointsMaterial( { size: 10, sizeAttenuation: false } );
+							Material.prototype.copy.call( materialPoints, material );
+							materialPoints.color.copy( material.color );
+							materialPoints.map = material.map;
+							material = materialPoints;
+
+						}
+
+					}
+
+					if ( material === undefined ) {
+
+						if ( isLine ) {
+
+							material = new LineBasicMaterial();
+
+						} else if ( isPoints ) {
+
+							material = new PointsMaterial( { size: 1, sizeAttenuation: false } );
+
+						} else {
+
+							material = new MeshPhongMaterial();
+
+						}
+
+						material.name = sourceMaterial.name;
+						material.flatShading = sourceMaterial.smooth ? false : true;
+						material.vertexColors = hasVertexColors;
+
+						state.materials[ materialHash ] = material;
+
+					}
+
+					createdMaterials.push( material );
+
+				}
+
+				// Create mesh
+
+				let mesh;
+
+				if ( createdMaterials.length > 1 ) {
+
+					for ( let mi = 0, miLen = materials.length; mi < miLen; mi ++ ) {
+
+						const sourceMaterial = materials[ mi ];
+						buffergeometry.addGroup( sourceMaterial.groupStart, sourceMaterial.groupCount, mi );
+
+					}
+
+					if ( isLine ) {
+
+						mesh = new LineSegments( buffergeometry, createdMaterials );
+
+					} else if ( isPoints ) {
+
+						mesh = new Points( buffergeometry, createdMaterials );
+
+					} else {
+
+						mesh = new Mesh( buffergeometry, createdMaterials );
+
+					}
+
+				} else {
+
+					if ( isLine ) {
+
+						mesh = new LineSegments( buffergeometry, createdMaterials[ 0 ] );
+
+					} else if ( isPoints ) {
+
+						mesh = new Points( buffergeometry, createdMaterials[ 0 ] );
+
+					} else {
+
+						mesh = new Mesh( buffergeometry, createdMaterials[ 0 ] );
+
+					}
+
+				}
+
+				mesh.name = object.name;
+
+				container.add( mesh );
+
+			}
+
+		} else {
+
+			// if there is only the default parser state object with no geometry data, interpret data as point cloud
+
+			if ( state.vertices.length > 0 ) {
+
+				const material = new PointsMaterial( { size: 1, sizeAttenuation: false } );
+
+				const buffergeometry = new BufferGeometry();
+
+				buffergeometry.setAttribute( 'position', new Float32BufferAttribute( state.vertices, 3 ) );
+
+				if ( state.colors.length > 0 && state.colors[ 0 ] !== undefined ) {
+
+					buffergeometry.setAttribute( 'color', new Float32BufferAttribute( state.colors, 3 ) );
+					material.vertexColors = true;
+
+				}
+
+				const points = new Points( buffergeometry, material );
+				container.add( points );
+
+			}
+
+		}
+
+		return container;
+
+	}
+
+}
+
+
+
+return OBJLoader;
+})();
+const __MTLLoader = (() => {
+const { Color, DefaultLoadingManager, FileLoader, FrontSide, Loader, LoaderUtils, MeshPhongMaterial, RepeatWrapping, TextureLoader, Vector2, SRGBColorSpace } = THREE;
+
+/**
+ * Loads a Wavefront .mtl file specifying materials
+ */
+
+class MTLLoader extends Loader {
+
+	constructor( manager ) {
+
+		super( manager );
+
+	}
+
+	/**
+	 * Loads and parses a MTL asset from a URL.
+	 *
+	 * @param {String} url - URL to the MTL file.
+	 * @param {Function} [onLoad] - Callback invoked with the loaded object.
+	 * @param {Function} [onProgress] - Callback for download progress.
+	 * @param {Function} [onError] - Callback for download errors.
+	 *
+	 * @see setPath setResourcePath
+	 *
+	 * @note In order for relative texture references to resolve correctly
+	 * you must call setResourcePath() explicitly prior to load.
+	 */
+	load( url, onLoad, onProgress, onError ) {
+
+		const scope = this;
+
+		const path = ( this.path === '' ) ? LoaderUtils.extractUrlBase( url ) : this.path;
+
+		const loader = new FileLoader( this.manager );
+		loader.setPath( this.path );
+		loader.setRequestHeader( this.requestHeader );
+		loader.setWithCredentials( this.withCredentials );
+		loader.load( url, function ( text ) {
+
+			try {
+
+				onLoad( scope.parse( text, path ) );
+
+			} catch ( e ) {
+
+				if ( onError ) {
+
+					onError( e );
+
+				} else {
+
+					console.error( e );
+
+				}
+
+				scope.manager.itemError( url );
+
+			}
+
+		}, onProgress, onError );
+
+	}
+
+	setMaterialOptions( value ) {
+
+		this.materialOptions = value;
+		return this;
+
+	}
+
+	/**
+	 * Parses a MTL file.
+	 *
+	 * @param {String} text - Content of MTL file
+	 * @return {MaterialCreator}
+	 *
+	 * @see setPath setResourcePath
+	 *
+	 * @note In order for relative texture references to resolve correctly
+	 * you must call setResourcePath() explicitly prior to parse.
+	 */
+	parse( text, path ) {
+
+		const lines = text.split( '\n' );
+		let info = {};
+		const delimiter_pattern = /\s+/;
+		const materialsInfo = {};
+
+		for ( let i = 0; i < lines.length; i ++ ) {
+
+			let line = lines[ i ];
+			line = line.trim();
+
+			if ( line.length === 0 || line.charAt( 0 ) === '#' ) {
+
+				// Blank line or comment ignore
+				continue;
+
+			}
+
+			const pos = line.indexOf( ' ' );
+
+			let key = ( pos >= 0 ) ? line.substring( 0, pos ) : line;
+			key = key.toLowerCase();
+
+			let value = ( pos >= 0 ) ? line.substring( pos + 1 ) : '';
+			value = value.trim();
+
+			if ( key === 'newmtl' ) {
+
+				// New material
+
+				info = { name: value };
+				materialsInfo[ value ] = info;
+
+			} else {
+
+				if ( key === 'ka' || key === 'kd' || key === 'ks' || key === 'ke' ) {
+
+					const ss = value.split( delimiter_pattern, 3 );
+					info[ key ] = [ parseFloat( ss[ 0 ] ), parseFloat( ss[ 1 ] ), parseFloat( ss[ 2 ] ) ];
+
+				} else {
+
+					info[ key ] = value;
+
+				}
+
+			}
+
+		}
+
+		const materialCreator = new MaterialCreator( this.resourcePath || path, this.materialOptions );
+		materialCreator.setCrossOrigin( this.crossOrigin );
+		materialCreator.setManager( this.manager );
+		materialCreator.setMaterials( materialsInfo );
+		return materialCreator;
+
+	}
+
+}
+
+/**
+ * Create a new MTLLoader.MaterialCreator
+ * @param baseUrl - Url relative to which textures are loaded
+ * @param options - Set of options on how to construct the materials
+ *                  side: Which side to apply the material
+ *                        FrontSide (default), THREE.BackSide, THREE.DoubleSide
+ *                  wrap: What type of wrapping to apply for textures
+ *                        RepeatWrapping (default), THREE.ClampToEdgeWrapping, THREE.MirroredRepeatWrapping
+ *                  normalizeRGB: RGBs need to be normalized to 0-1 from 0-255
+ *                                Default: false, assumed to be already normalized
+ *                  ignoreZeroRGBs: Ignore values of RGBs (Ka,Kd,Ks) that are all 0's
+ *                                  Default: false
+ * @constructor
+ */
+
+class MaterialCreator {
+
+	constructor( baseUrl = '', options = {} ) {
+
+		this.baseUrl = baseUrl;
+		this.options = options;
+		this.materialsInfo = {};
+		this.materials = {};
+		this.materialsArray = [];
+		this.nameLookup = {};
+
+		this.crossOrigin = 'anonymous';
+
+		this.side = ( this.options.side !== undefined ) ? this.options.side : FrontSide;
+		this.wrap = ( this.options.wrap !== undefined ) ? this.options.wrap : RepeatWrapping;
+
+	}
+
+	setCrossOrigin( value ) {
+
+		this.crossOrigin = value;
+		return this;
+
+	}
+
+	setManager( value ) {
+
+		this.manager = value;
+
+	}
+
+	setMaterials( materialsInfo ) {
+
+		this.materialsInfo = this.convert( materialsInfo );
+		this.materials = {};
+		this.materialsArray = [];
+		this.nameLookup = {};
+
+	}
+
+	convert( materialsInfo ) {
+
+		if ( ! this.options ) return materialsInfo;
+
+		const converted = {};
+
+		for ( const mn in materialsInfo ) {
+
+			// Convert materials info into normalized form based on options
+
+			const mat = materialsInfo[ mn ];
+
+			const covmat = {};
+
+			converted[ mn ] = covmat;
+
+			for ( const prop in mat ) {
+
+				let save = true;
+				let value = mat[ prop ];
+				const lprop = prop.toLowerCase();
+
+				switch ( lprop ) {
+
+					case 'kd':
+					case 'ka':
+					case 'ks':
+
+						// Diffuse color (color under white light) using RGB values
+
+						if ( this.options && this.options.normalizeRGB ) {
+
+							value = [ value[ 0 ] / 255, value[ 1 ] / 255, value[ 2 ] / 255 ];
+
+						}
+
+						if ( this.options && this.options.ignoreZeroRGBs ) {
+
+							if ( value[ 0 ] === 0 && value[ 1 ] === 0 && value[ 2 ] === 0 ) {
+
+								// ignore
+
+								save = false;
+
+							}
+
+						}
+
+						break;
+
+					default:
+
+						break;
+
+				}
+
+				if ( save ) {
+
+					covmat[ lprop ] = value;
+
+				}
+
+			}
+
+		}
+
+		return converted;
+
+	}
+
+	preload() {
+
+		for ( const mn in this.materialsInfo ) {
+
+			this.create( mn );
+
+		}
+
+	}
+
+	getIndex( materialName ) {
+
+		return this.nameLookup[ materialName ];
+
+	}
+
+	getAsArray() {
+
+		let index = 0;
+
+		for ( const mn in this.materialsInfo ) {
+
+			this.materialsArray[ index ] = this.create( mn );
+			this.nameLookup[ mn ] = index;
+			index ++;
+
+		}
+
+		return this.materialsArray;
+
+	}
+
+	create( materialName ) {
+
+		if ( this.materials[ materialName ] === undefined ) {
+
+			this.createMaterial_( materialName );
+
+		}
+
+		return this.materials[ materialName ];
+
+	}
+
+	createMaterial_( materialName ) {
+
+		// Create material
+
+		const scope = this;
+		const mat = this.materialsInfo[ materialName ];
+		const params = {
+
+			name: materialName,
+			side: this.side
+
+		};
+
+		function resolveURL( baseUrl, url ) {
+
+			if ( typeof url !== 'string' || url === '' )
+				return '';
+
+			// Absolute URL
+			if ( /^https?:\/\//i.test( url ) ) return url;
+
+			return baseUrl + url;
+
+		}
+
+		function setMapForType( mapType, value ) {
+
+			if ( params[ mapType ] ) return; // Keep the first encountered texture
+
+			const texParams = scope.getTextureParams( value, params );
+			const map = scope.loadTexture( resolveURL( scope.baseUrl, texParams.url ) );
+
+			map.repeat.copy( texParams.scale );
+			map.offset.copy( texParams.offset );
+
+			map.wrapS = scope.wrap;
+			map.wrapT = scope.wrap;
+
+			if ( mapType === 'map' || mapType === 'emissiveMap' ) {
+
+				map.colorSpace = SRGBColorSpace;
+
+			}
+
+			params[ mapType ] = map;
+
+		}
+
+		for ( const prop in mat ) {
+
+			const value = mat[ prop ];
+			let n;
+
+			if ( value === '' ) continue;
+
+			switch ( prop.toLowerCase() ) {
+
+				// Ns is material specular exponent
+
+				case 'kd':
+
+					// Diffuse color (color under white light) using RGB values
+
+					params.color = new Color().fromArray( value ).convertSRGBToLinear();
+
+					break;
+
+				case 'ks':
+
+					// Specular color (color when light is reflected from shiny surface) using RGB values
+					params.specular = new Color().fromArray( value ).convertSRGBToLinear();
+
+					break;
+
+				case 'ke':
+
+					// Emissive using RGB values
+					params.emissive = new Color().fromArray( value ).convertSRGBToLinear();
+
+					break;
+
+				case 'map_kd':
+
+					// Diffuse texture map
+
+					setMapForType( 'map', value );
+
+					break;
+
+				case 'map_ks':
+
+					// Specular map
+
+					setMapForType( 'specularMap', value );
+
+					break;
+
+				case 'map_ke':
+
+					// Emissive map
+
+					setMapForType( 'emissiveMap', value );
+
+					break;
+
+				case 'norm':
+
+					setMapForType( 'normalMap', value );
+
+					break;
+
+				case 'map_bump':
+				case 'bump':
+
+					// Bump texture map
+
+					setMapForType( 'bumpMap', value );
+
+					break;
+
+				case 'map_d':
+
+					// Alpha map
+
+					setMapForType( 'alphaMap', value );
+					params.transparent = true;
+
+					break;
+
+				case 'ns':
+
+					// The specular exponent (defines the focus of the specular highlight)
+					// A high exponent results in a tight, concentrated highlight. Ns values normally range from 0 to 1000.
+
+					params.shininess = parseFloat( value );
+
+					break;
+
+				case 'd':
+					n = parseFloat( value );
+
+					if ( n < 1 ) {
+
+						params.opacity = n;
+						params.transparent = true;
+
+					}
+
+					break;
+
+				case 'tr':
+					n = parseFloat( value );
+
+					if ( this.options && this.options.invertTrProperty ) n = 1 - n;
+
+					if ( n > 0 ) {
+
+						params.opacity = 1 - n;
+						params.transparent = true;
+
+					}
+
+					break;
+
+				default:
+					break;
+
+			}
+
+		}
+
+		this.materials[ materialName ] = new MeshPhongMaterial( params );
+		return this.materials[ materialName ];
+
+	}
+
+	getTextureParams( value, matParams ) {
+
+		const texParams = {
+
+			scale: new Vector2( 1, 1 ),
+			offset: new Vector2( 0, 0 )
+
+		 };
+
+		const items = value.split( /\s+/ );
+		let pos;
+
+		pos = items.indexOf( '-bm' );
+
+		if ( pos >= 0 ) {
+
+			matParams.bumpScale = parseFloat( items[ pos + 1 ] );
+			items.splice( pos, 2 );
+
+		}
+
+		pos = items.indexOf( '-s' );
+
+		if ( pos >= 0 ) {
+
+			texParams.scale.set( parseFloat( items[ pos + 1 ] ), parseFloat( items[ pos + 2 ] ) );
+			items.splice( pos, 4 ); // we expect 3 parameters here!
+
+		}
+
+		pos = items.indexOf( '-o' );
+
+		if ( pos >= 0 ) {
+
+			texParams.offset.set( parseFloat( items[ pos + 1 ] ), parseFloat( items[ pos + 2 ] ) );
+			items.splice( pos, 4 ); // we expect 3 parameters here!
+
+		}
+
+		texParams.url = items.join( ' ' ).trim();
+		return texParams;
+
+	}
+
+	loadTexture( url, mapping, onLoad, onProgress, onError ) {
+
+		const manager = ( this.manager !== undefined ) ? this.manager : DefaultLoadingManager;
+		let loader = manager.getHandler( url );
+
+		if ( loader === null ) {
+
+			loader = new TextureLoader( manager );
+
+		}
+
+		if ( loader.setCrossOrigin ) loader.setCrossOrigin( this.crossOrigin );
+
+		const texture = loader.load( url, onLoad, onProgress, onError );
+
+		if ( mapping !== undefined ) texture.mapping = mapping;
+
+		return texture;
+
+	}
+
+}
+
+
+
+return MTLLoader;
+})();
+const __BGU = (() => {
+const { BufferAttribute, BufferGeometry, Float32BufferAttribute, InstancedBufferAttribute, InterleavedBuffer, InterleavedBufferAttribute, TriangleFanDrawMode, TriangleStripDrawMode, TrianglesDrawMode, Vector3 } = THREE;
+
+function computeMikkTSpaceTangents( geometry, MikkTSpace, negateSign = true ) {
+
+	if ( ! MikkTSpace || ! MikkTSpace.isReady ) {
+
+		throw new Error( 'BufferGeometryUtils: Initialized MikkTSpace library required.' );
+
+	}
+
+	if ( ! geometry.hasAttribute( 'position' ) || ! geometry.hasAttribute( 'normal' ) || ! geometry.hasAttribute( 'uv' ) ) {
+
+		throw new Error( 'BufferGeometryUtils: Tangents require "position", "normal", and "uv" attributes.' );
+
+	}
+
+	function getAttributeArray( attribute ) {
+
+		if ( attribute.normalized || attribute.isInterleavedBufferAttribute ) {
+
+			const dstArray = new Float32Array( attribute.count * attribute.itemSize );
+
+			for ( let i = 0, j = 0; i < attribute.count; i ++ ) {
+
+				dstArray[ j ++ ] = attribute.getX( i );
+				dstArray[ j ++ ] = attribute.getY( i );
+
+				if ( attribute.itemSize > 2 ) {
+
+					dstArray[ j ++ ] = attribute.getZ( i );
+
+				}
+
+			}
+
+			return dstArray;
+
+		}
+
+		if ( attribute.array instanceof Float32Array ) {
+
+			return attribute.array;
+
+		}
+
+		return new Float32Array( attribute.array );
+
+	}
+
+	// MikkTSpace algorithm requires non-indexed input.
+
+	const _geometry = geometry.index ? geometry.toNonIndexed() : geometry;
+
+	// Compute vertex tangents.
+
+	const tangents = MikkTSpace.generateTangents(
+
+		getAttributeArray( _geometry.attributes.position ),
+		getAttributeArray( _geometry.attributes.normal ),
+		getAttributeArray( _geometry.attributes.uv )
+
+	);
+
+	// Texture coordinate convention of glTF differs from the apparent
+	// default of the MikkTSpace library; .w component must be flipped.
+
+	if ( negateSign ) {
+
+		for ( let i = 3; i < tangents.length; i += 4 ) {
+
+			tangents[ i ] *= - 1;
+
+		}
+
+	}
+
+	//
+
+	_geometry.setAttribute( 'tangent', new BufferAttribute( tangents, 4 ) );
+
+	if ( geometry !== _geometry ) {
+
+		geometry.copy( _geometry );
+
+	}
+
+	return geometry;
+
+}
+
+/**
+ * @param  {Array<BufferGeometry>} geometries
+ * @param  {Boolean} useGroups
+ * @return {BufferGeometry}
+ */
+function mergeGeometries( geometries, useGroups = false ) {
+
+	const isIndexed = geometries[ 0 ].index !== null;
+
+	const attributesUsed = new Set( Object.keys( geometries[ 0 ].attributes ) );
+	const morphAttributesUsed = new Set( Object.keys( geometries[ 0 ].morphAttributes ) );
+
+	const attributes = {};
+	const morphAttributes = {};
+
+	const morphTargetsRelative = geometries[ 0 ].morphTargetsRelative;
+
+	const mergedGeometry = new BufferGeometry();
+
+	let offset = 0;
+
+	for ( let i = 0; i < geometries.length; ++ i ) {
+
+		const geometry = geometries[ i ];
+		let attributesCount = 0;
+
+		// ensure that all geometries are indexed, or none
+
+		if ( isIndexed !== ( geometry.index !== null ) ) {
+
+			console.error( 'THREE.BufferGeometryUtils: .mergeGeometries() failed with geometry at index ' + i + '. All geometries must have compatible attributes; make sure index attribute exists among all geometries, or in none of them.' );
+			return null;
+
+		}
+
+		// gather attributes, exit early if they're different
+
+		for ( const name in geometry.attributes ) {
+
+			if ( ! attributesUsed.has( name ) ) {
+
+				console.error( 'THREE.BufferGeometryUtils: .mergeGeometries() failed with geometry at index ' + i + '. All geometries must have compatible attributes; make sure "' + name + '" attribute exists among all geometries, or in none of them.' );
+				return null;
+
+			}
+
+			if ( attributes[ name ] === undefined ) attributes[ name ] = [];
+
+			attributes[ name ].push( geometry.attributes[ name ] );
+
+			attributesCount ++;
+
+		}
+
+		// ensure geometries have the same number of attributes
+
+		if ( attributesCount !== attributesUsed.size ) {
+
+			console.error( 'THREE.BufferGeometryUtils: .mergeGeometries() failed with geometry at index ' + i + '. Make sure all geometries have the same number of attributes.' );
+			return null;
+
+		}
+
+		// gather morph attributes, exit early if they're different
+
+		if ( morphTargetsRelative !== geometry.morphTargetsRelative ) {
+
+			console.error( 'THREE.BufferGeometryUtils: .mergeGeometries() failed with geometry at index ' + i + '. .morphTargetsRelative must be consistent throughout all geometries.' );
+			return null;
+
+		}
+
+		for ( const name in geometry.morphAttributes ) {
+
+			if ( ! morphAttributesUsed.has( name ) ) {
+
+				console.error( 'THREE.BufferGeometryUtils: .mergeGeometries() failed with geometry at index ' + i + '.  .morphAttributes must be consistent throughout all geometries.' );
+				return null;
+
+			}
+
+			if ( morphAttributes[ name ] === undefined ) morphAttributes[ name ] = [];
+
+			morphAttributes[ name ].push( geometry.morphAttributes[ name ] );
+
+		}
+
+		if ( useGroups ) {
+
+			let count;
+
+			if ( isIndexed ) {
+
+				count = geometry.index.count;
+
+			} else if ( geometry.attributes.position !== undefined ) {
+
+				count = geometry.attributes.position.count;
+
+			} else {
+
+				console.error( 'THREE.BufferGeometryUtils: .mergeGeometries() failed with geometry at index ' + i + '. The geometry must have either an index or a position attribute' );
+				return null;
+
+			}
+
+			mergedGeometry.addGroup( offset, count, i );
+
+			offset += count;
+
+		}
+
+	}
+
+	// merge indices
+
+	if ( isIndexed ) {
+
+		let indexOffset = 0;
+		const mergedIndex = [];
+
+		for ( let i = 0; i < geometries.length; ++ i ) {
+
+			const index = geometries[ i ].index;
+
+			for ( let j = 0; j < index.count; ++ j ) {
+
+				mergedIndex.push( index.getX( j ) + indexOffset );
+
+			}
+
+			indexOffset += geometries[ i ].attributes.position.count;
+
+		}
+
+		mergedGeometry.setIndex( mergedIndex );
+
+	}
+
+	// merge attributes
+
+	for ( const name in attributes ) {
+
+		const mergedAttribute = mergeAttributes( attributes[ name ] );
+
+		if ( ! mergedAttribute ) {
+
+			console.error( 'THREE.BufferGeometryUtils: .mergeGeometries() failed while trying to merge the ' + name + ' attribute.' );
+			return null;
+
+		}
+
+		mergedGeometry.setAttribute( name, mergedAttribute );
+
+	}
+
+	// merge morph attributes
+
+	for ( const name in morphAttributes ) {
+
+		const numMorphTargets = morphAttributes[ name ][ 0 ].length;
+
+		if ( numMorphTargets === 0 ) break;
+
+		mergedGeometry.morphAttributes = mergedGeometry.morphAttributes || {};
+		mergedGeometry.morphAttributes[ name ] = [];
+
+		for ( let i = 0; i < numMorphTargets; ++ i ) {
+
+			const morphAttributesToMerge = [];
+
+			for ( let j = 0; j < morphAttributes[ name ].length; ++ j ) {
+
+				morphAttributesToMerge.push( morphAttributes[ name ][ j ][ i ] );
+
+			}
+
+			const mergedMorphAttribute = mergeAttributes( morphAttributesToMerge );
+
+			if ( ! mergedMorphAttribute ) {
+
+				console.error( 'THREE.BufferGeometryUtils: .mergeGeometries() failed while trying to merge the ' + name + ' morphAttribute.' );
+				return null;
+
+			}
+
+			mergedGeometry.morphAttributes[ name ].push( mergedMorphAttribute );
+
+		}
+
+	}
+
+	return mergedGeometry;
+
+}
+
+/**
+ * @param {Array<BufferAttribute>} attributes
+ * @return {BufferAttribute}
+ */
+function mergeAttributes( attributes ) {
+
+	let TypedArray;
+	let itemSize;
+	let normalized;
+	let gpuType = - 1;
+	let arrayLength = 0;
+
+	for ( let i = 0; i < attributes.length; ++ i ) {
+
+		const attribute = attributes[ i ];
+
+		if ( attribute.isInterleavedBufferAttribute ) {
+
+			console.error( 'THREE.BufferGeometryUtils: .mergeAttributes() failed. InterleavedBufferAttributes are not supported.' );
+			return null;
+
+		}
+
+		if ( TypedArray === undefined ) TypedArray = attribute.array.constructor;
+		if ( TypedArray !== attribute.array.constructor ) {
+
+			console.error( 'THREE.BufferGeometryUtils: .mergeAttributes() failed. BufferAttribute.array must be of consistent array types across matching attributes.' );
+			return null;
+
+		}
+
+		if ( itemSize === undefined ) itemSize = attribute.itemSize;
+		if ( itemSize !== attribute.itemSize ) {
+
+			console.error( 'THREE.BufferGeometryUtils: .mergeAttributes() failed. BufferAttribute.itemSize must be consistent across matching attributes.' );
+			return null;
+
+		}
+
+		if ( normalized === undefined ) normalized = attribute.normalized;
+		if ( normalized !== attribute.normalized ) {
+
+			console.error( 'THREE.BufferGeometryUtils: .mergeAttributes() failed. BufferAttribute.normalized must be consistent across matching attributes.' );
+			return null;
+
+		}
+
+		if ( gpuType === - 1 ) gpuType = attribute.gpuType;
+		if ( gpuType !== attribute.gpuType ) {
+
+			console.error( 'THREE.BufferGeometryUtils: .mergeAttributes() failed. BufferAttribute.gpuType must be consistent across matching attributes.' );
+			return null;
+
+		}
+
+		arrayLength += attribute.array.length;
+
+	}
+
+	const array = new TypedArray( arrayLength );
+	let offset = 0;
+
+	for ( let i = 0; i < attributes.length; ++ i ) {
+
+		array.set( attributes[ i ].array, offset );
+
+		offset += attributes[ i ].array.length;
+
+	}
+
+	const result = new BufferAttribute( array, itemSize, normalized );
+	if ( gpuType !== undefined ) {
+
+		result.gpuType = gpuType;
+
+	}
+
+	return result;
+
+}
+
+/**
+ * @param {BufferAttribute}
+ * @return {BufferAttribute}
+ */
+function deepCloneAttribute( attribute ) {
+
+	if ( attribute.isInstancedInterleavedBufferAttribute || attribute.isInterleavedBufferAttribute ) {
+
+		return deinterleaveAttribute( attribute );
+
+	}
+
+	if ( attribute.isInstancedBufferAttribute ) {
+
+		return new InstancedBufferAttribute().copy( attribute );
+
+	}
+
+	return new BufferAttribute().copy( attribute );
+
+}
+
+/**
+ * @param {Array<BufferAttribute>} attributes
+ * @return {Array<InterleavedBufferAttribute>}
+ */
+function interleaveAttributes( attributes ) {
+
+	// Interleaves the provided attributes into an InterleavedBuffer and returns
+	// a set of InterleavedBufferAttributes for each attribute
+	let TypedArray;
+	let arrayLength = 0;
+	let stride = 0;
+
+	// calculate the length and type of the interleavedBuffer
+	for ( let i = 0, l = attributes.length; i < l; ++ i ) {
+
+		const attribute = attributes[ i ];
+
+		if ( TypedArray === undefined ) TypedArray = attribute.array.constructor;
+		if ( TypedArray !== attribute.array.constructor ) {
+
+			console.error( 'AttributeBuffers of different types cannot be interleaved' );
+			return null;
+
+		}
+
+		arrayLength += attribute.array.length;
+		stride += attribute.itemSize;
+
+	}
+
+	// Create the set of buffer attributes
+	const interleavedBuffer = new InterleavedBuffer( new TypedArray( arrayLength ), stride );
+	let offset = 0;
+	const res = [];
+	const getters = [ 'getX', 'getY', 'getZ', 'getW' ];
+	const setters = [ 'setX', 'setY', 'setZ', 'setW' ];
+
+	for ( let j = 0, l = attributes.length; j < l; j ++ ) {
+
+		const attribute = attributes[ j ];
+		const itemSize = attribute.itemSize;
+		const count = attribute.count;
+		const iba = new InterleavedBufferAttribute( interleavedBuffer, itemSize, offset, attribute.normalized );
+		res.push( iba );
+
+		offset += itemSize;
+
+		// Move the data for each attribute into the new interleavedBuffer
+		// at the appropriate offset
+		for ( let c = 0; c < count; c ++ ) {
+
+			for ( let k = 0; k < itemSize; k ++ ) {
+
+				iba[ setters[ k ] ]( c, attribute[ getters[ k ] ]( c ) );
+
+			}
+
+		}
+
+	}
+
+	return res;
+
+}
+
+// returns a new, non-interleaved version of the provided attribute
+function deinterleaveAttribute( attribute ) {
+
+	const cons = attribute.data.array.constructor;
+	const count = attribute.count;
+	const itemSize = attribute.itemSize;
+	const normalized = attribute.normalized;
+
+	const array = new cons( count * itemSize );
+	let newAttribute;
+	if ( attribute.isInstancedInterleavedBufferAttribute ) {
+
+		newAttribute = new InstancedBufferAttribute( array, itemSize, normalized, attribute.meshPerAttribute );
+
+	} else {
+
+		newAttribute = new BufferAttribute( array, itemSize, normalized );
+
+	}
+
+	for ( let i = 0; i < count; i ++ ) {
+
+		newAttribute.setX( i, attribute.getX( i ) );
+
+		if ( itemSize >= 2 ) {
+
+			newAttribute.setY( i, attribute.getY( i ) );
+
+		}
+
+		if ( itemSize >= 3 ) {
+
+			newAttribute.setZ( i, attribute.getZ( i ) );
+
+		}
+
+		if ( itemSize >= 4 ) {
+
+			newAttribute.setW( i, attribute.getW( i ) );
+
+		}
+
+	}
+
+	return newAttribute;
+
+}
+
+// deinterleaves all attributes on the geometry
+function deinterleaveGeometry( geometry ) {
+
+	const attributes = geometry.attributes;
+	const morphTargets = geometry.morphTargets;
+	const attrMap = new Map();
+
+	for ( const key in attributes ) {
+
+		const attr = attributes[ key ];
+		if ( attr.isInterleavedBufferAttribute ) {
+
+			if ( ! attrMap.has( attr ) ) {
+
+				attrMap.set( attr, deinterleaveAttribute( attr ) );
+
+			}
+
+			attributes[ key ] = attrMap.get( attr );
+
+		}
+
+	}
+
+	for ( const key in morphTargets ) {
+
+		const attr = morphTargets[ key ];
+		if ( attr.isInterleavedBufferAttribute ) {
+
+			if ( ! attrMap.has( attr ) ) {
+
+				attrMap.set( attr, deinterleaveAttribute( attr ) );
+
+			}
+
+			morphTargets[ key ] = attrMap.get( attr );
+
+		}
+
+	}
+
+}
+
+/**
+ * @param {BufferGeometry} geometry
+ * @return {number}
+ */
+function estimateBytesUsed( geometry ) {
+
+	// Return the estimated memory used by this geometry in bytes
+	// Calculate using itemSize, count, and BYTES_PER_ELEMENT to account
+	// for InterleavedBufferAttributes.
+	let mem = 0;
+	for ( const name in geometry.attributes ) {
+
+		const attr = geometry.getAttribute( name );
+		mem += attr.count * attr.itemSize * attr.array.BYTES_PER_ELEMENT;
+
+	}
+
+	const indices = geometry.getIndex();
+	mem += indices ? indices.count * indices.itemSize * indices.array.BYTES_PER_ELEMENT : 0;
+	return mem;
+
+}
+
+/**
+ * @param {BufferGeometry} geometry
+ * @param {number} tolerance
+ * @return {BufferGeometry}
+ */
+function mergeVertices( geometry, tolerance = 1e-4 ) {
+
+	tolerance = Math.max( tolerance, Number.EPSILON );
+
+	// Generate an index buffer if the geometry doesn't have one, or optimize it
+	// if it's already available.
+	const hashToIndex = {};
+	const indices = geometry.getIndex();
+	const positions = geometry.getAttribute( 'position' );
+	const vertexCount = indices ? indices.count : positions.count;
+
+	// next value for triangle indices
+	let nextIndex = 0;
+
+	// attributes and new attribute arrays
+	const attributeNames = Object.keys( geometry.attributes );
+	const tmpAttributes = {};
+	const tmpMorphAttributes = {};
+	const newIndices = [];
+	const getters = [ 'getX', 'getY', 'getZ', 'getW' ];
+	const setters = [ 'setX', 'setY', 'setZ', 'setW' ];
+
+	// Initialize the arrays, allocating space conservatively. Extra
+	// space will be trimmed in the last step.
+	for ( let i = 0, l = attributeNames.length; i < l; i ++ ) {
+
+		const name = attributeNames[ i ];
+		const attr = geometry.attributes[ name ];
+
+		tmpAttributes[ name ] = new BufferAttribute(
+			new attr.array.constructor( attr.count * attr.itemSize ),
+			attr.itemSize,
+			attr.normalized
+		);
+
+		const morphAttr = geometry.morphAttributes[ name ];
+		if ( morphAttr ) {
+
+			tmpMorphAttributes[ name ] = new BufferAttribute(
+				new morphAttr.array.constructor( morphAttr.count * morphAttr.itemSize ),
+				morphAttr.itemSize,
+				morphAttr.normalized
+			);
+
+		}
+
+	}
+
+	// convert the error tolerance to an amount of decimal places to truncate to
+	const halfTolerance = tolerance * 0.5;
+	const exponent = Math.log10( 1 / tolerance );
+	const hashMultiplier = Math.pow( 10, exponent );
+	const hashAdditive = halfTolerance * hashMultiplier;
+	for ( let i = 0; i < vertexCount; i ++ ) {
+
+		const index = indices ? indices.getX( i ) : i;
+
+		// Generate a hash for the vertex attributes at the current index 'i'
+		let hash = '';
+		for ( let j = 0, l = attributeNames.length; j < l; j ++ ) {
+
+			const name = attributeNames[ j ];
+			const attribute = geometry.getAttribute( name );
+			const itemSize = attribute.itemSize;
+
+			for ( let k = 0; k < itemSize; k ++ ) {
+
+				// double tilde truncates the decimal value
+				hash += `${ ~ ~ ( attribute[ getters[ k ] ]( index ) * hashMultiplier + hashAdditive ) },`;
+
+			}
+
+		}
+
+		// Add another reference to the vertex if it's already
+		// used by another index
+		if ( hash in hashToIndex ) {
+
+			newIndices.push( hashToIndex[ hash ] );
+
+		} else {
+
+			// copy data to the new index in the temporary attributes
+			for ( let j = 0, l = attributeNames.length; j < l; j ++ ) {
+
+				const name = attributeNames[ j ];
+				const attribute = geometry.getAttribute( name );
+				const morphAttr = geometry.morphAttributes[ name ];
+				const itemSize = attribute.itemSize;
+				const newarray = tmpAttributes[ name ];
+				const newMorphArrays = tmpMorphAttributes[ name ];
+
+				for ( let k = 0; k < itemSize; k ++ ) {
+
+					const getterFunc = getters[ k ];
+					const setterFunc = setters[ k ];
+					newarray[ setterFunc ]( nextIndex, attribute[ getterFunc ]( index ) );
+
+					if ( morphAttr ) {
+
+						for ( let m = 0, ml = morphAttr.length; m < ml; m ++ ) {
+
+							newMorphArrays[ m ][ setterFunc ]( nextIndex, morphAttr[ m ][ getterFunc ]( index ) );
+
+						}
+
+					}
+
+				}
+
+			}
+
+			hashToIndex[ hash ] = nextIndex;
+			newIndices.push( nextIndex );
+			nextIndex ++;
+
+		}
+
+	}
+
+	// generate result BufferGeometry
+	const result = geometry.clone();
+	for ( const name in geometry.attributes ) {
+
+		const tmpAttribute = tmpAttributes[ name ];
+
+		result.setAttribute( name, new BufferAttribute(
+			tmpAttribute.array.slice( 0, nextIndex * tmpAttribute.itemSize ),
+			tmpAttribute.itemSize,
+			tmpAttribute.normalized,
+		) );
+
+		if ( ! ( name in tmpMorphAttributes ) ) continue;
+
+		for ( let j = 0; j < tmpMorphAttributes[ name ].length; j ++ ) {
+
+			const tmpMorphAttribute = tmpMorphAttributes[ name ][ j ];
+
+			result.morphAttributes[ name ][ j ] = new BufferAttribute(
+				tmpMorphAttribute.array.slice( 0, nextIndex * tmpMorphAttribute.itemSize ),
+				tmpMorphAttribute.itemSize,
+				tmpMorphAttribute.normalized,
+			);
+
+		}
+
+	}
+
+	// indices
+
+	result.setIndex( newIndices );
+
+	return result;
+
+}
+
+/**
+ * @param {BufferGeometry} geometry
+ * @param {number} drawMode
+ * @return {BufferGeometry}
+ */
+function toTrianglesDrawMode( geometry, drawMode ) {
+
+	if ( drawMode === TrianglesDrawMode ) {
+
+		console.warn( 'THREE.BufferGeometryUtils.toTrianglesDrawMode(): Geometry already defined as triangles.' );
+		return geometry;
+
+	}
+
+	if ( drawMode === TriangleFanDrawMode || drawMode === TriangleStripDrawMode ) {
+
+		let index = geometry.getIndex();
+
+		// generate index if not present
+
+		if ( index === null ) {
+
+			const indices = [];
+
+			const position = geometry.getAttribute( 'position' );
+
+			if ( position !== undefined ) {
+
+				for ( let i = 0; i < position.count; i ++ ) {
+
+					indices.push( i );
+
+				}
+
+				geometry.setIndex( indices );
+				index = geometry.getIndex();
+
+			} else {
+
+				console.error( 'THREE.BufferGeometryUtils.toTrianglesDrawMode(): Undefined position attribute. Processing not possible.' );
+				return geometry;
+
+			}
+
+		}
+
+		//
+
+		const numberOfTriangles = index.count - 2;
+		const newIndices = [];
+
+		if ( drawMode === TriangleFanDrawMode ) {
+
+			// gl.TRIANGLE_FAN
+
+			for ( let i = 1; i <= numberOfTriangles; i ++ ) {
+
+				newIndices.push( index.getX( 0 ) );
+				newIndices.push( index.getX( i ) );
+				newIndices.push( index.getX( i + 1 ) );
+
+			}
+
+		} else {
+
+			// gl.TRIANGLE_STRIP
+
+			for ( let i = 0; i < numberOfTriangles; i ++ ) {
+
+				if ( i % 2 === 0 ) {
+
+					newIndices.push( index.getX( i ) );
+					newIndices.push( index.getX( i + 1 ) );
+					newIndices.push( index.getX( i + 2 ) );
+
+				} else {
+
+					newIndices.push( index.getX( i + 2 ) );
+					newIndices.push( index.getX( i + 1 ) );
+					newIndices.push( index.getX( i ) );
+
+				}
+
+			}
+
+		}
+
+		if ( ( newIndices.length / 3 ) !== numberOfTriangles ) {
+
+			console.error( 'THREE.BufferGeometryUtils.toTrianglesDrawMode(): Unable to generate correct amount of triangles.' );
+
+		}
+
+		// build final geometry
+
+		const newGeometry = geometry.clone();
+		newGeometry.setIndex( newIndices );
+		newGeometry.clearGroups();
+
+		return newGeometry;
+
+	} else {
+
+		console.error( 'THREE.BufferGeometryUtils.toTrianglesDrawMode(): Unknown draw mode:', drawMode );
+		return geometry;
+
+	}
+
+}
+
+/**
+ * Calculates the morphed attributes of a morphed/skinned BufferGeometry.
+ * Helpful for Raytracing or Decals.
+ * @param {Mesh | Line | Points} object An instance of Mesh, Line or Points.
+ * @return {Object} An Object with original position/normal attributes and morphed ones.
+ */
+function computeMorphedAttributes( object ) {
+
+	const _vA = new Vector3();
+	const _vB = new Vector3();
+	const _vC = new Vector3();
+
+	const _tempA = new Vector3();
+	const _tempB = new Vector3();
+	const _tempC = new Vector3();
+
+	const _morphA = new Vector3();
+	const _morphB = new Vector3();
+	const _morphC = new Vector3();
+
+	function _calculateMorphedAttributeData(
+		object,
+		attribute,
+		morphAttribute,
+		morphTargetsRelative,
+		a,
+		b,
+		c,
+		modifiedAttributeArray
+	) {
+
+		_vA.fromBufferAttribute( attribute, a );
+		_vB.fromBufferAttribute( attribute, b );
+		_vC.fromBufferAttribute( attribute, c );
+
+		const morphInfluences = object.morphTargetInfluences;
+
+		if ( morphAttribute && morphInfluences ) {
+
+			_morphA.set( 0, 0, 0 );
+			_morphB.set( 0, 0, 0 );
+			_morphC.set( 0, 0, 0 );
+
+			for ( let i = 0, il = morphAttribute.length; i < il; i ++ ) {
+
+				const influence = morphInfluences[ i ];
+				const morph = morphAttribute[ i ];
+
+				if ( influence === 0 ) continue;
+
+				_tempA.fromBufferAttribute( morph, a );
+				_tempB.fromBufferAttribute( morph, b );
+				_tempC.fromBufferAttribute( morph, c );
+
+				if ( morphTargetsRelative ) {
+
+					_morphA.addScaledVector( _tempA, influence );
+					_morphB.addScaledVector( _tempB, influence );
+					_morphC.addScaledVector( _tempC, influence );
+
+				} else {
+
+					_morphA.addScaledVector( _tempA.sub( _vA ), influence );
+					_morphB.addScaledVector( _tempB.sub( _vB ), influence );
+					_morphC.addScaledVector( _tempC.sub( _vC ), influence );
+
+				}
+
+			}
+
+			_vA.add( _morphA );
+			_vB.add( _morphB );
+			_vC.add( _morphC );
+
+		}
+
+		if ( object.isSkinnedMesh ) {
+
+			object.applyBoneTransform( a, _vA );
+			object.applyBoneTransform( b, _vB );
+			object.applyBoneTransform( c, _vC );
+
+		}
+
+		modifiedAttributeArray[ a * 3 + 0 ] = _vA.x;
+		modifiedAttributeArray[ a * 3 + 1 ] = _vA.y;
+		modifiedAttributeArray[ a * 3 + 2 ] = _vA.z;
+		modifiedAttributeArray[ b * 3 + 0 ] = _vB.x;
+		modifiedAttributeArray[ b * 3 + 1 ] = _vB.y;
+		modifiedAttributeArray[ b * 3 + 2 ] = _vB.z;
+		modifiedAttributeArray[ c * 3 + 0 ] = _vC.x;
+		modifiedAttributeArray[ c * 3 + 1 ] = _vC.y;
+		modifiedAttributeArray[ c * 3 + 2 ] = _vC.z;
+
+	}
+
+	const geometry = object.geometry;
+	const material = object.material;
+
+	let a, b, c;
+	const index = geometry.index;
+	const positionAttribute = geometry.attributes.position;
+	const morphPosition = geometry.morphAttributes.position;
+	const morphTargetsRelative = geometry.morphTargetsRelative;
+	const normalAttribute = geometry.attributes.normal;
+	const morphNormal = geometry.morphAttributes.position;
+
+	const groups = geometry.groups;
+	const drawRange = geometry.drawRange;
+	let i, j, il, jl;
+	let group;
+	let start, end;
+
+	const modifiedPosition = new Float32Array( positionAttribute.count * positionAttribute.itemSize );
+	const modifiedNormal = new Float32Array( normalAttribute.count * normalAttribute.itemSize );
+
+	if ( index !== null ) {
+
+		// indexed buffer geometry
+
+		if ( Array.isArray( material ) ) {
+
+			for ( i = 0, il = groups.length; i < il; i ++ ) {
+
+				group = groups[ i ];
+
+				start = Math.max( group.start, drawRange.start );
+				end = Math.min( ( group.start + group.count ), ( drawRange.start + drawRange.count ) );
+
+				for ( j = start, jl = end; j < jl; j += 3 ) {
+
+					a = index.getX( j );
+					b = index.getX( j + 1 );
+					c = index.getX( j + 2 );
+
+					_calculateMorphedAttributeData(
+						object,
+						positionAttribute,
+						morphPosition,
+						morphTargetsRelative,
+						a, b, c,
+						modifiedPosition
+					);
+
+					_calculateMorphedAttributeData(
+						object,
+						normalAttribute,
+						morphNormal,
+						morphTargetsRelative,
+						a, b, c,
+						modifiedNormal
+					);
+
+				}
+
+			}
+
+		} else {
+
+			start = Math.max( 0, drawRange.start );
+			end = Math.min( index.count, ( drawRange.start + drawRange.count ) );
+
+			for ( i = start, il = end; i < il; i += 3 ) {
+
+				a = index.getX( i );
+				b = index.getX( i + 1 );
+				c = index.getX( i + 2 );
+
+				_calculateMorphedAttributeData(
+					object,
+					positionAttribute,
+					morphPosition,
+					morphTargetsRelative,
+					a, b, c,
+					modifiedPosition
+				);
+
+				_calculateMorphedAttributeData(
+					object,
+					normalAttribute,
+					morphNormal,
+					morphTargetsRelative,
+					a, b, c,
+					modifiedNormal
+				);
+
+			}
+
+		}
+
+	} else {
+
+		// non-indexed buffer geometry
+
+		if ( Array.isArray( material ) ) {
+
+			for ( i = 0, il = groups.length; i < il; i ++ ) {
+
+				group = groups[ i ];
+
+				start = Math.max( group.start, drawRange.start );
+				end = Math.min( ( group.start + group.count ), ( drawRange.start + drawRange.count ) );
+
+				for ( j = start, jl = end; j < jl; j += 3 ) {
+
+					a = j;
+					b = j + 1;
+					c = j + 2;
+
+					_calculateMorphedAttributeData(
+						object,
+						positionAttribute,
+						morphPosition,
+						morphTargetsRelative,
+						a, b, c,
+						modifiedPosition
+					);
+
+					_calculateMorphedAttributeData(
+						object,
+						normalAttribute,
+						morphNormal,
+						morphTargetsRelative,
+						a, b, c,
+						modifiedNormal
+					);
+
+				}
+
+			}
+
+		} else {
+
+			start = Math.max( 0, drawRange.start );
+			end = Math.min( positionAttribute.count, ( drawRange.start + drawRange.count ) );
+
+			for ( i = start, il = end; i < il; i += 3 ) {
+
+				a = i;
+				b = i + 1;
+				c = i + 2;
+
+				_calculateMorphedAttributeData(
+					object,
+					positionAttribute,
+					morphPosition,
+					morphTargetsRelative,
+					a, b, c,
+					modifiedPosition
+				);
+
+				_calculateMorphedAttributeData(
+					object,
+					normalAttribute,
+					morphNormal,
+					morphTargetsRelative,
+					a, b, c,
+					modifiedNormal
+				);
+
+			}
+
+		}
+
+	}
+
+	const morphedPositionAttribute = new Float32BufferAttribute( modifiedPosition, 3 );
+	const morphedNormalAttribute = new Float32BufferAttribute( modifiedNormal, 3 );
+
+	return {
+
+		positionAttribute: positionAttribute,
+		normalAttribute: normalAttribute,
+		morphedPositionAttribute: morphedPositionAttribute,
+		morphedNormalAttribute: morphedNormalAttribute
+
+	};
+
+}
+
+function mergeGroups( geometry ) {
+
+	if ( geometry.groups.length === 0 ) {
+
+		console.warn( 'THREE.BufferGeometryUtils.mergeGroups(): No groups are defined. Nothing to merge.' );
+		return geometry;
+
+	}
+
+	let groups = geometry.groups;
+
+	// sort groups by material index
+
+	groups = groups.sort( ( a, b ) => {
+
+		if ( a.materialIndex !== b.materialIndex ) return a.materialIndex - b.materialIndex;
+
+		return a.start - b.start;
+
+	} );
+
+	// create index for non-indexed geometries
+
+	if ( geometry.getIndex() === null ) {
+
+		const positionAttribute = geometry.getAttribute( 'position' );
+		const indices = [];
+
+		for ( let i = 0; i < positionAttribute.count; i += 3 ) {
+
+			indices.push( i, i + 1, i + 2 );
+
+		}
+
+		geometry.setIndex( indices );
+
+	}
+
+	// sort index
+
+	const index = geometry.getIndex();
+
+	const newIndices = [];
+
+	for ( let i = 0; i < groups.length; i ++ ) {
+
+		const group = groups[ i ];
+
+		const groupStart = group.start;
+		const groupLength = groupStart + group.count;
+
+		for ( let j = groupStart; j < groupLength; j ++ ) {
+
+			newIndices.push( index.getX( j ) );
+
+		}
+
+	}
+
+	geometry.dispose(); // Required to force buffer recreation
+	geometry.setIndex( newIndices );
+
+	// update groups indices
+
+	let start = 0;
+
+	for ( let i = 0; i < groups.length; i ++ ) {
+
+		const group = groups[ i ];
+
+		group.start = start;
+		start += group.count;
+
+	}
+
+	// merge groups
+
+	let currentGroup = groups[ 0 ];
+
+	geometry.groups = [ currentGroup ];
+
+	for ( let i = 1; i < groups.length; i ++ ) {
+
+		const group = groups[ i ];
+
+		if ( currentGroup.materialIndex === group.materialIndex ) {
+
+			currentGroup.count += group.count;
+
+		} else {
+
+			currentGroup = group;
+			geometry.groups.push( currentGroup );
+
+		}
+
+	}
+
+	return geometry;
+
+}
+
+
+/**
+ * Modifies the supplied geometry if it is non-indexed, otherwise creates a new,
+ * non-indexed geometry. Returns the geometry with smooth normals everywhere except
+ * faces that meet at an angle greater than the crease angle.
+ *
+ * @param {BufferGeometry} geometry
+ * @param {number} [creaseAngle]
+ * @return {BufferGeometry}
+ */
+function toCreasedNormals( geometry, creaseAngle = Math.PI / 3 /* 60 degrees */ ) {
+
+	const creaseDot = Math.cos( creaseAngle );
+	const hashMultiplier = ( 1 + 1e-10 ) * 1e2;
+
+	// reusable vectors
+	const verts = [ new Vector3(), new Vector3(), new Vector3() ];
+	const tempVec1 = new Vector3();
+	const tempVec2 = new Vector3();
+	const tempNorm = new Vector3();
+	const tempNorm2 = new Vector3();
+
+	// hashes a vector
+	function hashVertex( v ) {
+
+		const x = ~ ~ ( v.x * hashMultiplier );
+		const y = ~ ~ ( v.y * hashMultiplier );
+		const z = ~ ~ ( v.z * hashMultiplier );
+		return `${x},${y},${z}`;
+
+	}
+
+	// BufferGeometry.toNonIndexed() warns if the geometry is non-indexed
+	// and returns the original geometry
+	const resultGeometry = geometry.index ? geometry.toNonIndexed() : geometry;
+	const posAttr = resultGeometry.attributes.position;
+	const vertexMap = {};
+
+	// find all the normals shared by commonly located vertices
+	for ( let i = 0, l = posAttr.count / 3; i < l; i ++ ) {
+
+		const i3 = 3 * i;
+		const a = verts[ 0 ].fromBufferAttribute( posAttr, i3 + 0 );
+		const b = verts[ 1 ].fromBufferAttribute( posAttr, i3 + 1 );
+		const c = verts[ 2 ].fromBufferAttribute( posAttr, i3 + 2 );
+
+		tempVec1.subVectors( c, b );
+		tempVec2.subVectors( a, b );
+
+		// add the normal to the map for all vertices
+		const normal = new Vector3().crossVectors( tempVec1, tempVec2 ).normalize();
+		for ( let n = 0; n < 3; n ++ ) {
+
+			const vert = verts[ n ];
+			const hash = hashVertex( vert );
+			if ( ! ( hash in vertexMap ) ) {
+
+				vertexMap[ hash ] = [];
+
+			}
+
+			vertexMap[ hash ].push( normal );
+
+		}
+
+	}
+
+	// average normals from all vertices that share a common location if they are within the
+	// provided crease threshold
+	const normalArray = new Float32Array( posAttr.count * 3 );
+	const normAttr = new BufferAttribute( normalArray, 3, false );
+	for ( let i = 0, l = posAttr.count / 3; i < l; i ++ ) {
+
+		// get the face normal for this vertex
+		const i3 = 3 * i;
+		const a = verts[ 0 ].fromBufferAttribute( posAttr, i3 + 0 );
+		const b = verts[ 1 ].fromBufferAttribute( posAttr, i3 + 1 );
+		const c = verts[ 2 ].fromBufferAttribute( posAttr, i3 + 2 );
+
+		tempVec1.subVectors( c, b );
+		tempVec2.subVectors( a, b );
+
+		tempNorm.crossVectors( tempVec1, tempVec2 ).normalize();
+
+		// average all normals that meet the threshold and set the normal value
+		for ( let n = 0; n < 3; n ++ ) {
+
+			const vert = verts[ n ];
+			const hash = hashVertex( vert );
+			const otherNormals = vertexMap[ hash ];
+			tempNorm2.set( 0, 0, 0 );
+
+			for ( let k = 0, lk = otherNormals.length; k < lk; k ++ ) {
+
+				const otherNorm = otherNormals[ k ];
+				if ( tempNorm.dot( otherNorm ) > creaseDot ) {
+
+					tempNorm2.add( otherNorm );
+
+				}
+
+			}
+
+			tempNorm2.normalize();
+			normAttr.setXYZ( i3 + n, tempNorm2.x, tempNorm2.y, tempNorm2.z );
+
+		}
+
+	}
+
+	resultGeometry.setAttribute( 'normal', normAttr );
+	return resultGeometry;
+
+}
+
+function mergeBufferGeometries( geometries, useGroups = false ) {
+
+	console.warn( 'THREE.BufferGeometryUtils: mergeBufferGeometries() has been renamed to mergeGeometries().' ); // @deprecated, r151
+	return mergeGeometries( geometries, useGroups );
+
+}
+
+function mergeBufferAttributes( attributes ) {
+
+	console.warn( 'THREE.BufferGeometryUtils: mergeBufferAttributes() has been renamed to mergeAttributes().' ); // @deprecated, r151
+	return mergeAttributes( attributes );
+
+}
+
+
+
+return { toTrianglesDrawMode };
+})();
+const __GLTFLoader = (() => {
+const { AnimationClip, Bone, Box3, BufferAttribute, BufferGeometry, ClampToEdgeWrapping, Color, ColorManagement, DirectionalLight, DoubleSide, FileLoader, FrontSide, Group, ImageBitmapLoader, InstancedMesh, InterleavedBuffer, InterleavedBufferAttribute, Interpolant, InterpolateDiscrete, InterpolateLinear, Line, LineBasicMaterial, LineLoop, LineSegments, LinearFilter, LinearMipmapLinearFilter, LinearMipmapNearestFilter, LinearSRGBColorSpace, Loader, LoaderUtils, Material, MathUtils, Matrix4, Mesh, MeshBasicMaterial, MeshPhysicalMaterial, MeshStandardMaterial, MirroredRepeatWrapping, NearestFilter, NearestMipmapLinearFilter, NearestMipmapNearestFilter, NumberKeyframeTrack, Object3D, OrthographicCamera, PerspectiveCamera, PointLight, Points, PointsMaterial, PropertyBinding, Quaternion, QuaternionKeyframeTrack, RepeatWrapping, Skeleton, SkinnedMesh, Sphere, SpotLight, Texture, TextureLoader, TriangleFanDrawMode, TriangleStripDrawMode, Vector2, Vector3, VectorKeyframeTrack, SRGBColorSpace, InstancedBufferAttribute } = THREE;
+const { toTrianglesDrawMode } = __BGU;
+
+class GLTFLoader extends Loader {
+
+	constructor( manager ) {
+
+		super( manager );
+
+		this.dracoLoader = null;
+		this.ktx2Loader = null;
+		this.meshoptDecoder = null;
+
+		this.pluginCallbacks = [];
+
+		this.register( function ( parser ) {
+
+			return new GLTFMaterialsClearcoatExtension( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFTextureBasisUExtension( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFTextureWebPExtension( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFTextureAVIFExtension( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFMaterialsSheenExtension( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFMaterialsTransmissionExtension( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFMaterialsVolumeExtension( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFMaterialsIorExtension( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFMaterialsEmissiveStrengthExtension( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFMaterialsSpecularExtension( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFMaterialsIridescenceExtension( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFMaterialsAnisotropyExtension( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFMaterialsBumpExtension( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFLightsExtension( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFMeshoptCompression( parser );
+
+		} );
+
+		this.register( function ( parser ) {
+
+			return new GLTFMeshGpuInstancing( parser );
+
+		} );
+
+	}
+
+	load( url, onLoad, onProgress, onError ) {
+
+		const scope = this;
+
+		let resourcePath;
+
+		if ( this.resourcePath !== '' ) {
+
+			resourcePath = this.resourcePath;
+
+		} else if ( this.path !== '' ) {
+
+			// If a base path is set, resources will be relative paths from that plus the relative path of the gltf file
+			// Example  path = 'https://my-cnd-server.com/', url = 'assets/models/model.gltf'
+			// resourcePath = 'https://my-cnd-server.com/assets/models/'
+			// referenced resource 'model.bin' will be loaded from 'https://my-cnd-server.com/assets/models/model.bin'
+			// referenced resource '../textures/texture.png' will be loaded from 'https://my-cnd-server.com/assets/textures/texture.png'
+			const relativeUrl = LoaderUtils.extractUrlBase( url );
+			resourcePath = LoaderUtils.resolveURL( relativeUrl, this.path );
+
+		} else {
+
+			resourcePath = LoaderUtils.extractUrlBase( url );
+
+		}
+
+		// Tells the LoadingManager to track an extra item, which resolves after
+		// the model is fully loaded. This means the count of items loaded will
+		// be incorrect, but ensures manager.onLoad() does not fire early.
+		this.manager.itemStart( url );
+
+		const _onError = function ( e ) {
+
+			if ( onError ) {
+
+				onError( e );
+
+			} else {
+
+				console.error( e );
+
+			}
+
+			scope.manager.itemError( url );
+			scope.manager.itemEnd( url );
+
+		};
+
+		const loader = new FileLoader( this.manager );
+
+		loader.setPath( this.path );
+		loader.setResponseType( 'arraybuffer' );
+		loader.setRequestHeader( this.requestHeader );
+		loader.setWithCredentials( this.withCredentials );
+
+		loader.load( url, function ( data ) {
+
+			try {
+
+				scope.parse( data, resourcePath, function ( gltf ) {
+
+					onLoad( gltf );
+
+					scope.manager.itemEnd( url );
+
+				}, _onError );
+
+			} catch ( e ) {
+
+				_onError( e );
+
+			}
+
+		}, onProgress, _onError );
+
+	}
+
+	setDRACOLoader( dracoLoader ) {
+
+		this.dracoLoader = dracoLoader;
+		return this;
+
+	}
+
+	setDDSLoader() {
+
+		throw new Error(
+
+			'THREE.GLTFLoader: "MSFT_texture_dds" no longer supported. Please update to "KHR_texture_basisu".'
+
+		);
+
+	}
+
+	setKTX2Loader( ktx2Loader ) {
+
+		this.ktx2Loader = ktx2Loader;
+		return this;
+
+	}
+
+	setMeshoptDecoder( meshoptDecoder ) {
+
+		this.meshoptDecoder = meshoptDecoder;
+		return this;
+
+	}
+
+	register( callback ) {
+
+		if ( this.pluginCallbacks.indexOf( callback ) === - 1 ) {
+
+			this.pluginCallbacks.push( callback );
+
+		}
+
+		return this;
+
+	}
+
+	unregister( callback ) {
+
+		if ( this.pluginCallbacks.indexOf( callback ) !== - 1 ) {
+
+			this.pluginCallbacks.splice( this.pluginCallbacks.indexOf( callback ), 1 );
+
+		}
+
+		return this;
+
+	}
+
+	parse( data, path, onLoad, onError ) {
+
+		let json;
+		const extensions = {};
+		const plugins = {};
+		const textDecoder = new TextDecoder();
+
+		if ( typeof data === 'string' ) {
+
+			json = JSON.parse( data );
+
+		} else if ( data instanceof ArrayBuffer ) {
+
+			const magic = textDecoder.decode( new Uint8Array( data, 0, 4 ) );
+
+			if ( magic === BINARY_EXTENSION_HEADER_MAGIC ) {
+
+				try {
+
+					extensions[ EXTENSIONS.KHR_BINARY_GLTF ] = new GLTFBinaryExtension( data );
+
+				} catch ( error ) {
+
+					if ( onError ) onError( error );
+					return;
+
+				}
+
+				json = JSON.parse( extensions[ EXTENSIONS.KHR_BINARY_GLTF ].content );
+
+			} else {
+
+				json = JSON.parse( textDecoder.decode( data ) );
+
+			}
+
+		} else {
+
+			json = data;
+
+		}
+
+		if ( json.asset === undefined || json.asset.version[ 0 ] < 2 ) {
+
+			if ( onError ) onError( new Error( 'THREE.GLTFLoader: Unsupported asset. glTF versions >=2.0 are supported.' ) );
+			return;
+
+		}
+
+		const parser = new GLTFParser( json, {
+
+			path: path || this.resourcePath || '',
+			crossOrigin: this.crossOrigin,
+			requestHeader: this.requestHeader,
+			manager: this.manager,
+			ktx2Loader: this.ktx2Loader,
+			meshoptDecoder: this.meshoptDecoder
+
+		} );
+
+		parser.fileLoader.setRequestHeader( this.requestHeader );
+
+		for ( let i = 0; i < this.pluginCallbacks.length; i ++ ) {
+
+			const plugin = this.pluginCallbacks[ i ]( parser );
+
+			if ( ! plugin.name ) console.error( 'THREE.GLTFLoader: Invalid plugin found: missing name' );
+
+			plugins[ plugin.name ] = plugin;
+
+			// Workaround to avoid determining as unknown extension
+			// in addUnknownExtensionsToUserData().
+			// Remove this workaround if we move all the existing
+			// extension handlers to plugin system
+			extensions[ plugin.name ] = true;
+
+		}
+
+		if ( json.extensionsUsed ) {
+
+			for ( let i = 0; i < json.extensionsUsed.length; ++ i ) {
+
+				const extensionName = json.extensionsUsed[ i ];
+				const extensionsRequired = json.extensionsRequired || [];
+
+				switch ( extensionName ) {
+
+					case EXTENSIONS.KHR_MATERIALS_UNLIT:
+						extensions[ extensionName ] = new GLTFMaterialsUnlitExtension();
+						break;
+
+					case EXTENSIONS.KHR_DRACO_MESH_COMPRESSION:
+						extensions[ extensionName ] = new GLTFDracoMeshCompressionExtension( json, this.dracoLoader );
+						break;
+
+					case EXTENSIONS.KHR_TEXTURE_TRANSFORM:
+						extensions[ extensionName ] = new GLTFTextureTransformExtension();
+						break;
+
+					case EXTENSIONS.KHR_MESH_QUANTIZATION:
+						extensions[ extensionName ] = new GLTFMeshQuantizationExtension();
+						break;
+
+					default:
+
+						if ( extensionsRequired.indexOf( extensionName ) >= 0 && plugins[ extensionName ] === undefined ) {
+
+							console.warn( 'THREE.GLTFLoader: Unknown extension "' + extensionName + '".' );
+
+						}
+
+				}
+
+			}
+
+		}
+
+		parser.setExtensions( extensions );
+		parser.setPlugins( plugins );
+		parser.parse( onLoad, onError );
+
+	}
+
+	parseAsync( data, path ) {
+
+		const scope = this;
+
+		return new Promise( function ( resolve, reject ) {
+
+			scope.parse( data, path, resolve, reject );
+
+		} );
+
+	}
+
+}
+
+/* GLTFREGISTRY */
+
+function GLTFRegistry() {
+
+	let objects = {};
+
+	return	{
+
+		get: function ( key ) {
+
+			return objects[ key ];
+
+		},
+
+		add: function ( key, object ) {
+
+			objects[ key ] = object;
+
+		},
+
+		remove: function ( key ) {
+
+			delete objects[ key ];
+
+		},
+
+		removeAll: function () {
+
+			objects = {};
+
+		}
+
+	};
+
+}
+
+/*********************************/
+/********** EXTENSIONS ***********/
+/*********************************/
+
+const EXTENSIONS = {
+	KHR_BINARY_GLTF: 'KHR_binary_glTF',
+	KHR_DRACO_MESH_COMPRESSION: 'KHR_draco_mesh_compression',
+	KHR_LIGHTS_PUNCTUAL: 'KHR_lights_punctual',
+	KHR_MATERIALS_CLEARCOAT: 'KHR_materials_clearcoat',
+	KHR_MATERIALS_IOR: 'KHR_materials_ior',
+	KHR_MATERIALS_SHEEN: 'KHR_materials_sheen',
+	KHR_MATERIALS_SPECULAR: 'KHR_materials_specular',
+	KHR_MATERIALS_TRANSMISSION: 'KHR_materials_transmission',
+	KHR_MATERIALS_IRIDESCENCE: 'KHR_materials_iridescence',
+	KHR_MATERIALS_ANISOTROPY: 'KHR_materials_anisotropy',
+	KHR_MATERIALS_UNLIT: 'KHR_materials_unlit',
+	KHR_MATERIALS_VOLUME: 'KHR_materials_volume',
+	KHR_TEXTURE_BASISU: 'KHR_texture_basisu',
+	KHR_TEXTURE_TRANSFORM: 'KHR_texture_transform',
+	KHR_MESH_QUANTIZATION: 'KHR_mesh_quantization',
+	KHR_MATERIALS_EMISSIVE_STRENGTH: 'KHR_materials_emissive_strength',
+	EXT_MATERIALS_BUMP: 'EXT_materials_bump',
+	EXT_TEXTURE_WEBP: 'EXT_texture_webp',
+	EXT_TEXTURE_AVIF: 'EXT_texture_avif',
+	EXT_MESHOPT_COMPRESSION: 'EXT_meshopt_compression',
+	EXT_MESH_GPU_INSTANCING: 'EXT_mesh_gpu_instancing'
+};
+
+/**
+ * Punctual Lights Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_lights_punctual
+ */
+class GLTFLightsExtension {
+
+	constructor( parser ) {
+
+		this.parser = parser;
+		this.name = EXTENSIONS.KHR_LIGHTS_PUNCTUAL;
+
+		// Object3D instance caches
+		this.cache = { refs: {}, uses: {} };
+
+	}
+
+	_markDefs() {
+
+		const parser = this.parser;
+		const nodeDefs = this.parser.json.nodes || [];
+
+		for ( let nodeIndex = 0, nodeLength = nodeDefs.length; nodeIndex < nodeLength; nodeIndex ++ ) {
+
+			const nodeDef = nodeDefs[ nodeIndex ];
+
+			if ( nodeDef.extensions
+					&& nodeDef.extensions[ this.name ]
+					&& nodeDef.extensions[ this.name ].light !== undefined ) {
+
+				parser._addNodeRef( this.cache, nodeDef.extensions[ this.name ].light );
+
+			}
+
+		}
+
+	}
+
+	_loadLight( lightIndex ) {
+
+		const parser = this.parser;
+		const cacheKey = 'light:' + lightIndex;
+		let dependency = parser.cache.get( cacheKey );
+
+		if ( dependency ) return dependency;
+
+		const json = parser.json;
+		const extensions = ( json.extensions && json.extensions[ this.name ] ) || {};
+		const lightDefs = extensions.lights || [];
+		const lightDef = lightDefs[ lightIndex ];
+		let lightNode;
+
+		const color = new Color( 0xffffff );
+
+		if ( lightDef.color !== undefined ) color.setRGB( lightDef.color[ 0 ], lightDef.color[ 1 ], lightDef.color[ 2 ], LinearSRGBColorSpace );
+
+		const range = lightDef.range !== undefined ? lightDef.range : 0;
+
+		switch ( lightDef.type ) {
+
+			case 'directional':
+				lightNode = new DirectionalLight( color );
+				lightNode.target.position.set( 0, 0, - 1 );
+				lightNode.add( lightNode.target );
+				break;
+
+			case 'point':
+				lightNode = new PointLight( color );
+				lightNode.distance = range;
+				break;
+
+			case 'spot':
+				lightNode = new SpotLight( color );
+				lightNode.distance = range;
+				// Handle spotlight properties.
+				lightDef.spot = lightDef.spot || {};
+				lightDef.spot.innerConeAngle = lightDef.spot.innerConeAngle !== undefined ? lightDef.spot.innerConeAngle : 0;
+				lightDef.spot.outerConeAngle = lightDef.spot.outerConeAngle !== undefined ? lightDef.spot.outerConeAngle : Math.PI / 4.0;
+				lightNode.angle = lightDef.spot.outerConeAngle;
+				lightNode.penumbra = 1.0 - lightDef.spot.innerConeAngle / lightDef.spot.outerConeAngle;
+				lightNode.target.position.set( 0, 0, - 1 );
+				lightNode.add( lightNode.target );
+				break;
+
+			default:
+				throw new Error( 'THREE.GLTFLoader: Unexpected light type: ' + lightDef.type );
+
+		}
+
+		// Some lights (e.g. spot) default to a position other than the origin. Reset the position
+		// here, because node-level parsing will only override position if explicitly specified.
+		lightNode.position.set( 0, 0, 0 );
+
+		lightNode.decay = 2;
+
+		assignExtrasToUserData( lightNode, lightDef );
+
+		if ( lightDef.intensity !== undefined ) lightNode.intensity = lightDef.intensity;
+
+		lightNode.name = parser.createUniqueName( lightDef.name || ( 'light_' + lightIndex ) );
+
+		dependency = Promise.resolve( lightNode );
+
+		parser.cache.add( cacheKey, dependency );
+
+		return dependency;
+
+	}
+
+	getDependency( type, index ) {
+
+		if ( type !== 'light' ) return;
+
+		return this._loadLight( index );
+
+	}
+
+	createNodeAttachment( nodeIndex ) {
+
+		const self = this;
+		const parser = this.parser;
+		const json = parser.json;
+		const nodeDef = json.nodes[ nodeIndex ];
+		const lightDef = ( nodeDef.extensions && nodeDef.extensions[ this.name ] ) || {};
+		const lightIndex = lightDef.light;
+
+		if ( lightIndex === undefined ) return null;
+
+		return this._loadLight( lightIndex ).then( function ( light ) {
+
+			return parser._getNodeRef( self.cache, lightIndex, light );
+
+		} );
+
+	}
+
+}
+
+/**
+ * Unlit Materials Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_materials_unlit
+ */
+class GLTFMaterialsUnlitExtension {
+
+	constructor() {
+
+		this.name = EXTENSIONS.KHR_MATERIALS_UNLIT;
+
+	}
+
+	getMaterialType() {
+
+		return MeshBasicMaterial;
+
+	}
+
+	extendParams( materialParams, materialDef, parser ) {
+
+		const pending = [];
+
+		materialParams.color = new Color( 1.0, 1.0, 1.0 );
+		materialParams.opacity = 1.0;
+
+		const metallicRoughness = materialDef.pbrMetallicRoughness;
+
+		if ( metallicRoughness ) {
+
+			if ( Array.isArray( metallicRoughness.baseColorFactor ) ) {
+
+				const array = metallicRoughness.baseColorFactor;
+
+				materialParams.color.setRGB( array[ 0 ], array[ 1 ], array[ 2 ], LinearSRGBColorSpace );
+				materialParams.opacity = array[ 3 ];
+
+			}
+
+			if ( metallicRoughness.baseColorTexture !== undefined ) {
+
+				pending.push( parser.assignTexture( materialParams, 'map', metallicRoughness.baseColorTexture, SRGBColorSpace ) );
+
+			}
+
+		}
+
+		return Promise.all( pending );
+
+	}
+
+}
+
+/**
+ * Materials Emissive Strength Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/blob/5768b3ce0ef32bc39cdf1bef10b948586635ead3/extensions/2.0/Khronos/KHR_materials_emissive_strength/README.md
+ */
+class GLTFMaterialsEmissiveStrengthExtension {
+
+	constructor( parser ) {
+
+		this.parser = parser;
+		this.name = EXTENSIONS.KHR_MATERIALS_EMISSIVE_STRENGTH;
+
+	}
+
+	extendMaterialParams( materialIndex, materialParams ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) {
+
+			return Promise.resolve();
+
+		}
+
+		const emissiveStrength = materialDef.extensions[ this.name ].emissiveStrength;
+
+		if ( emissiveStrength !== undefined ) {
+
+			materialParams.emissiveIntensity = emissiveStrength;
+
+		}
+
+		return Promise.resolve();
+
+	}
+
+}
+
+/**
+ * Clearcoat Materials Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_materials_clearcoat
+ */
+class GLTFMaterialsClearcoatExtension {
+
+	constructor( parser ) {
+
+		this.parser = parser;
+		this.name = EXTENSIONS.KHR_MATERIALS_CLEARCOAT;
+
+	}
+
+	getMaterialType( materialIndex ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) return null;
+
+		return MeshPhysicalMaterial;
+
+	}
+
+	extendMaterialParams( materialIndex, materialParams ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) {
+
+			return Promise.resolve();
+
+		}
+
+		const pending = [];
+
+		const extension = materialDef.extensions[ this.name ];
+
+		if ( extension.clearcoatFactor !== undefined ) {
+
+			materialParams.clearcoat = extension.clearcoatFactor;
+
+		}
+
+		if ( extension.clearcoatTexture !== undefined ) {
+
+			pending.push( parser.assignTexture( materialParams, 'clearcoatMap', extension.clearcoatTexture ) );
+
+		}
+
+		if ( extension.clearcoatRoughnessFactor !== undefined ) {
+
+			materialParams.clearcoatRoughness = extension.clearcoatRoughnessFactor;
+
+		}
+
+		if ( extension.clearcoatRoughnessTexture !== undefined ) {
+
+			pending.push( parser.assignTexture( materialParams, 'clearcoatRoughnessMap', extension.clearcoatRoughnessTexture ) );
+
+		}
+
+		if ( extension.clearcoatNormalTexture !== undefined ) {
+
+			pending.push( parser.assignTexture( materialParams, 'clearcoatNormalMap', extension.clearcoatNormalTexture ) );
+
+			if ( extension.clearcoatNormalTexture.scale !== undefined ) {
+
+				const scale = extension.clearcoatNormalTexture.scale;
+
+				materialParams.clearcoatNormalScale = new Vector2( scale, scale );
+
+			}
+
+		}
+
+		return Promise.all( pending );
+
+	}
+
+}
+
+/**
+ * Iridescence Materials Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_materials_iridescence
+ */
+class GLTFMaterialsIridescenceExtension {
+
+	constructor( parser ) {
+
+		this.parser = parser;
+		this.name = EXTENSIONS.KHR_MATERIALS_IRIDESCENCE;
+
+	}
+
+	getMaterialType( materialIndex ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) return null;
+
+		return MeshPhysicalMaterial;
+
+	}
+
+	extendMaterialParams( materialIndex, materialParams ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) {
+
+			return Promise.resolve();
+
+		}
+
+		const pending = [];
+
+		const extension = materialDef.extensions[ this.name ];
+
+		if ( extension.iridescenceFactor !== undefined ) {
+
+			materialParams.iridescence = extension.iridescenceFactor;
+
+		}
+
+		if ( extension.iridescenceTexture !== undefined ) {
+
+			pending.push( parser.assignTexture( materialParams, 'iridescenceMap', extension.iridescenceTexture ) );
+
+		}
+
+		if ( extension.iridescenceIor !== undefined ) {
+
+			materialParams.iridescenceIOR = extension.iridescenceIor;
+
+		}
+
+		if ( materialParams.iridescenceThicknessRange === undefined ) {
+
+			materialParams.iridescenceThicknessRange = [ 100, 400 ];
+
+		}
+
+		if ( extension.iridescenceThicknessMinimum !== undefined ) {
+
+			materialParams.iridescenceThicknessRange[ 0 ] = extension.iridescenceThicknessMinimum;
+
+		}
+
+		if ( extension.iridescenceThicknessMaximum !== undefined ) {
+
+			materialParams.iridescenceThicknessRange[ 1 ] = extension.iridescenceThicknessMaximum;
+
+		}
+
+		if ( extension.iridescenceThicknessTexture !== undefined ) {
+
+			pending.push( parser.assignTexture( materialParams, 'iridescenceThicknessMap', extension.iridescenceThicknessTexture ) );
+
+		}
+
+		return Promise.all( pending );
+
+	}
+
+}
+
+/**
+ * Sheen Materials Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/main/extensions/2.0/Khronos/KHR_materials_sheen
+ */
+class GLTFMaterialsSheenExtension {
+
+	constructor( parser ) {
+
+		this.parser = parser;
+		this.name = EXTENSIONS.KHR_MATERIALS_SHEEN;
+
+	}
+
+	getMaterialType( materialIndex ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) return null;
+
+		return MeshPhysicalMaterial;
+
+	}
+
+	extendMaterialParams( materialIndex, materialParams ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) {
+
+			return Promise.resolve();
+
+		}
+
+		const pending = [];
+
+		materialParams.sheenColor = new Color( 0, 0, 0 );
+		materialParams.sheenRoughness = 0;
+		materialParams.sheen = 1;
+
+		const extension = materialDef.extensions[ this.name ];
+
+		if ( extension.sheenColorFactor !== undefined ) {
+
+			const colorFactor = extension.sheenColorFactor;
+			materialParams.sheenColor.setRGB( colorFactor[ 0 ], colorFactor[ 1 ], colorFactor[ 2 ], LinearSRGBColorSpace );
+
+		}
+
+		if ( extension.sheenRoughnessFactor !== undefined ) {
+
+			materialParams.sheenRoughness = extension.sheenRoughnessFactor;
+
+		}
+
+		if ( extension.sheenColorTexture !== undefined ) {
+
+			pending.push( parser.assignTexture( materialParams, 'sheenColorMap', extension.sheenColorTexture, SRGBColorSpace ) );
+
+		}
+
+		if ( extension.sheenRoughnessTexture !== undefined ) {
+
+			pending.push( parser.assignTexture( materialParams, 'sheenRoughnessMap', extension.sheenRoughnessTexture ) );
+
+		}
+
+		return Promise.all( pending );
+
+	}
+
+}
+
+/**
+ * Transmission Materials Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_materials_transmission
+ * Draft: https://github.com/KhronosGroup/glTF/pull/1698
+ */
+class GLTFMaterialsTransmissionExtension {
+
+	constructor( parser ) {
+
+		this.parser = parser;
+		this.name = EXTENSIONS.KHR_MATERIALS_TRANSMISSION;
+
+	}
+
+	getMaterialType( materialIndex ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) return null;
+
+		return MeshPhysicalMaterial;
+
+	}
+
+	extendMaterialParams( materialIndex, materialParams ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) {
+
+			return Promise.resolve();
+
+		}
+
+		const pending = [];
+
+		const extension = materialDef.extensions[ this.name ];
+
+		if ( extension.transmissionFactor !== undefined ) {
+
+			materialParams.transmission = extension.transmissionFactor;
+
+		}
+
+		if ( extension.transmissionTexture !== undefined ) {
+
+			pending.push( parser.assignTexture( materialParams, 'transmissionMap', extension.transmissionTexture ) );
+
+		}
+
+		return Promise.all( pending );
+
+	}
+
+}
+
+/**
+ * Materials Volume Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_materials_volume
+ */
+class GLTFMaterialsVolumeExtension {
+
+	constructor( parser ) {
+
+		this.parser = parser;
+		this.name = EXTENSIONS.KHR_MATERIALS_VOLUME;
+
+	}
+
+	getMaterialType( materialIndex ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) return null;
+
+		return MeshPhysicalMaterial;
+
+	}
+
+	extendMaterialParams( materialIndex, materialParams ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) {
+
+			return Promise.resolve();
+
+		}
+
+		const pending = [];
+
+		const extension = materialDef.extensions[ this.name ];
+
+		materialParams.thickness = extension.thicknessFactor !== undefined ? extension.thicknessFactor : 0;
+
+		if ( extension.thicknessTexture !== undefined ) {
+
+			pending.push( parser.assignTexture( materialParams, 'thicknessMap', extension.thicknessTexture ) );
+
+		}
+
+		materialParams.attenuationDistance = extension.attenuationDistance || Infinity;
+
+		const colorArray = extension.attenuationColor || [ 1, 1, 1 ];
+		materialParams.attenuationColor = new Color().setRGB( colorArray[ 0 ], colorArray[ 1 ], colorArray[ 2 ], LinearSRGBColorSpace );
+
+		return Promise.all( pending );
+
+	}
+
+}
+
+/**
+ * Materials ior Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_materials_ior
+ */
+class GLTFMaterialsIorExtension {
+
+	constructor( parser ) {
+
+		this.parser = parser;
+		this.name = EXTENSIONS.KHR_MATERIALS_IOR;
+
+	}
+
+	getMaterialType( materialIndex ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) return null;
+
+		return MeshPhysicalMaterial;
+
+	}
+
+	extendMaterialParams( materialIndex, materialParams ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) {
+
+			return Promise.resolve();
+
+		}
+
+		const extension = materialDef.extensions[ this.name ];
+
+		materialParams.ior = extension.ior !== undefined ? extension.ior : 1.5;
+
+		return Promise.resolve();
+
+	}
+
+}
+
+/**
+ * Materials specular Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_materials_specular
+ */
+class GLTFMaterialsSpecularExtension {
+
+	constructor( parser ) {
+
+		this.parser = parser;
+		this.name = EXTENSIONS.KHR_MATERIALS_SPECULAR;
+
+	}
+
+	getMaterialType( materialIndex ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) return null;
+
+		return MeshPhysicalMaterial;
+
+	}
+
+	extendMaterialParams( materialIndex, materialParams ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) {
+
+			return Promise.resolve();
+
+		}
+
+		const pending = [];
+
+		const extension = materialDef.extensions[ this.name ];
+
+		materialParams.specularIntensity = extension.specularFactor !== undefined ? extension.specularFactor : 1.0;
+
+		if ( extension.specularTexture !== undefined ) {
+
+			pending.push( parser.assignTexture( materialParams, 'specularIntensityMap', extension.specularTexture ) );
+
+		}
+
+		const colorArray = extension.specularColorFactor || [ 1, 1, 1 ];
+		materialParams.specularColor = new Color().setRGB( colorArray[ 0 ], colorArray[ 1 ], colorArray[ 2 ], LinearSRGBColorSpace );
+
+		if ( extension.specularColorTexture !== undefined ) {
+
+			pending.push( parser.assignTexture( materialParams, 'specularColorMap', extension.specularColorTexture, SRGBColorSpace ) );
+
+		}
+
+		return Promise.all( pending );
+
+	}
+
+}
+
+
+/**
+ * Materials bump Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/EXT_materials_bump
+ */
+class GLTFMaterialsBumpExtension {
+
+	constructor( parser ) {
+
+		this.parser = parser;
+		this.name = EXTENSIONS.EXT_MATERIALS_BUMP;
+
+	}
+
+	getMaterialType( materialIndex ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) return null;
+
+		return MeshPhysicalMaterial;
+
+	}
+
+	extendMaterialParams( materialIndex, materialParams ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) {
+
+			return Promise.resolve();
+
+		}
+
+		const pending = [];
+
+		const extension = materialDef.extensions[ this.name ];
+
+		materialParams.bumpScale = extension.bumpFactor !== undefined ? extension.bumpFactor : 1.0;
+
+		if ( extension.bumpTexture !== undefined ) {
+
+			pending.push( parser.assignTexture( materialParams, 'bumpMap', extension.bumpTexture ) );
+
+		}
+
+		return Promise.all( pending );
+
+	}
+
+}
+
+/**
+ * Materials anisotropy Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_materials_anisotropy
+ */
+class GLTFMaterialsAnisotropyExtension {
+
+	constructor( parser ) {
+
+		this.parser = parser;
+		this.name = EXTENSIONS.KHR_MATERIALS_ANISOTROPY;
+
+	}
+
+	getMaterialType( materialIndex ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) return null;
+
+		return MeshPhysicalMaterial;
+
+	}
+
+	extendMaterialParams( materialIndex, materialParams ) {
+
+		const parser = this.parser;
+		const materialDef = parser.json.materials[ materialIndex ];
+
+		if ( ! materialDef.extensions || ! materialDef.extensions[ this.name ] ) {
+
+			return Promise.resolve();
+
+		}
+
+		const pending = [];
+
+		const extension = materialDef.extensions[ this.name ];
+
+		if ( extension.anisotropyStrength !== undefined ) {
+
+			materialParams.anisotropy = extension.anisotropyStrength;
+
+		}
+
+		if ( extension.anisotropyRotation !== undefined ) {
+
+			materialParams.anisotropyRotation = extension.anisotropyRotation;
+
+		}
+
+		if ( extension.anisotropyTexture !== undefined ) {
+
+			pending.push( parser.assignTexture( materialParams, 'anisotropyMap', extension.anisotropyTexture ) );
+
+		}
+
+		return Promise.all( pending );
+
+	}
+
+}
+
+/**
+ * BasisU Texture Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_texture_basisu
+ */
+class GLTFTextureBasisUExtension {
+
+	constructor( parser ) {
+
+		this.parser = parser;
+		this.name = EXTENSIONS.KHR_TEXTURE_BASISU;
+
+	}
+
+	loadTexture( textureIndex ) {
+
+		const parser = this.parser;
+		const json = parser.json;
+
+		const textureDef = json.textures[ textureIndex ];
+
+		if ( ! textureDef.extensions || ! textureDef.extensions[ this.name ] ) {
+
+			return null;
+
+		}
+
+		const extension = textureDef.extensions[ this.name ];
+		const loader = parser.options.ktx2Loader;
+
+		if ( ! loader ) {
+
+			if ( json.extensionsRequired && json.extensionsRequired.indexOf( this.name ) >= 0 ) {
+
+				throw new Error( 'THREE.GLTFLoader: setKTX2Loader must be called before loading KTX2 textures' );
+
+			} else {
+
+				// Assumes that the extension is optional and that a fallback texture is present
+				return null;
+
+			}
+
+		}
+
+		return parser.loadTextureImage( textureIndex, extension.source, loader );
+
+	}
+
+}
+
+/**
+ * WebP Texture Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Vendor/EXT_texture_webp
+ */
+class GLTFTextureWebPExtension {
+
+	constructor( parser ) {
+
+		this.parser = parser;
+		this.name = EXTENSIONS.EXT_TEXTURE_WEBP;
+		this.isSupported = null;
+
+	}
+
+	loadTexture( textureIndex ) {
+
+		const name = this.name;
+		const parser = this.parser;
+		const json = parser.json;
+
+		const textureDef = json.textures[ textureIndex ];
+
+		if ( ! textureDef.extensions || ! textureDef.extensions[ name ] ) {
+
+			return null;
+
+		}
+
+		const extension = textureDef.extensions[ name ];
+		const source = json.images[ extension.source ];
+
+		let loader = parser.textureLoader;
+		if ( source.uri ) {
+
+			const handler = parser.options.manager.getHandler( source.uri );
+			if ( handler !== null ) loader = handler;
+
+		}
+
+		return this.detectSupport().then( function ( isSupported ) {
+
+			if ( isSupported ) return parser.loadTextureImage( textureIndex, extension.source, loader );
+
+			if ( json.extensionsRequired && json.extensionsRequired.indexOf( name ) >= 0 ) {
+
+				throw new Error( 'THREE.GLTFLoader: WebP required by asset but unsupported.' );
+
+			}
+
+			// Fall back to PNG or JPEG.
+			return parser.loadTexture( textureIndex );
+
+		} );
+
+	}
+
+	detectSupport() {
+
+		if ( ! this.isSupported ) {
+
+			this.isSupported = new Promise( function ( resolve ) {
+
+				const image = new Image();
+
+				// Lossy test image. Support for lossy images doesn't guarantee support for all
+				// WebP images, unfortunately.
+				image.src = 'data:image/webp;base64,UklGRiIAAABXRUJQVlA4IBYAAAAwAQCdASoBAAEADsD+JaQAA3AAAAAA';
+
+				image.onload = image.onerror = function () {
+
+					resolve( image.height === 1 );
+
+				};
+
+			} );
+
+		}
+
+		return this.isSupported;
+
+	}
+
+}
+
+/**
+ * AVIF Texture Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Vendor/EXT_texture_avif
+ */
+class GLTFTextureAVIFExtension {
+
+	constructor( parser ) {
+
+		this.parser = parser;
+		this.name = EXTENSIONS.EXT_TEXTURE_AVIF;
+		this.isSupported = null;
+
+	}
+
+	loadTexture( textureIndex ) {
+
+		const name = this.name;
+		const parser = this.parser;
+		const json = parser.json;
+
+		const textureDef = json.textures[ textureIndex ];
+
+		if ( ! textureDef.extensions || ! textureDef.extensions[ name ] ) {
+
+			return null;
+
+		}
+
+		const extension = textureDef.extensions[ name ];
+		const source = json.images[ extension.source ];
+
+		let loader = parser.textureLoader;
+		if ( source.uri ) {
+
+			const handler = parser.options.manager.getHandler( source.uri );
+			if ( handler !== null ) loader = handler;
+
+		}
+
+		return this.detectSupport().then( function ( isSupported ) {
+
+			if ( isSupported ) return parser.loadTextureImage( textureIndex, extension.source, loader );
+
+			if ( json.extensionsRequired && json.extensionsRequired.indexOf( name ) >= 0 ) {
+
+				throw new Error( 'THREE.GLTFLoader: AVIF required by asset but unsupported.' );
+
+			}
+
+			// Fall back to PNG or JPEG.
+			return parser.loadTexture( textureIndex );
+
+		} );
+
+	}
+
+	detectSupport() {
+
+		if ( ! this.isSupported ) {
+
+			this.isSupported = new Promise( function ( resolve ) {
+
+				const image = new Image();
+
+				// Lossy test image.
+				image.src = 'data:image/avif;base64,AAAAIGZ0eXBhdmlmAAAAAGF2aWZtaWYxbWlhZk1BMUIAAADybWV0YQAAAAAAAAAoaGRscgAAAAAAAAAAcGljdAAAAAAAAAAAAAAAAGxpYmF2aWYAAAAADnBpdG0AAAAAAAEAAAAeaWxvYwAAAABEAAABAAEAAAABAAABGgAAABcAAAAoaWluZgAAAAAAAQAAABppbmZlAgAAAAABAABhdjAxQ29sb3IAAAAAamlwcnAAAABLaXBjbwAAABRpc3BlAAAAAAAAAAEAAAABAAAAEHBpeGkAAAAAAwgICAAAAAxhdjFDgQAMAAAAABNjb2xybmNseAACAAIABoAAAAAXaXBtYQAAAAAAAAABAAEEAQKDBAAAAB9tZGF0EgAKCBgABogQEDQgMgkQAAAAB8dSLfI=';
+				image.onload = image.onerror = function () {
+
+					resolve( image.height === 1 );
+
+				};
+
+			} );
+
+		}
+
+		return this.isSupported;
+
+	}
+
+}
+
+/**
+ * meshopt BufferView Compression Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Vendor/EXT_meshopt_compression
+ */
+class GLTFMeshoptCompression {
+
+	constructor( parser ) {
+
+		this.name = EXTENSIONS.EXT_MESHOPT_COMPRESSION;
+		this.parser = parser;
+
+	}
+
+	loadBufferView( index ) {
+
+		const json = this.parser.json;
+		const bufferView = json.bufferViews[ index ];
+
+		if ( bufferView.extensions && bufferView.extensions[ this.name ] ) {
+
+			const extensionDef = bufferView.extensions[ this.name ];
+
+			const buffer = this.parser.getDependency( 'buffer', extensionDef.buffer );
+			const decoder = this.parser.options.meshoptDecoder;
+
+			if ( ! decoder || ! decoder.supported ) {
+
+				if ( json.extensionsRequired && json.extensionsRequired.indexOf( this.name ) >= 0 ) {
+
+					throw new Error( 'THREE.GLTFLoader: setMeshoptDecoder must be called before loading compressed files' );
+
+				} else {
+
+					// Assumes that the extension is optional and that fallback buffer data is present
+					return null;
+
+				}
+
+			}
+
+			return buffer.then( function ( res ) {
+
+				const byteOffset = extensionDef.byteOffset || 0;
+				const byteLength = extensionDef.byteLength || 0;
+
+				const count = extensionDef.count;
+				const stride = extensionDef.byteStride;
+
+				const source = new Uint8Array( res, byteOffset, byteLength );
+
+				if ( decoder.decodeGltfBufferAsync ) {
+
+					return decoder.decodeGltfBufferAsync( count, stride, source, extensionDef.mode, extensionDef.filter ).then( function ( res ) {
+
+						return res.buffer;
+
+					} );
+
+				} else {
+
+					// Support for MeshoptDecoder 0.18 or earlier, without decodeGltfBufferAsync
+					return decoder.ready.then( function () {
+
+						const result = new ArrayBuffer( count * stride );
+						decoder.decodeGltfBuffer( new Uint8Array( result ), count, stride, source, extensionDef.mode, extensionDef.filter );
+						return result;
+
+					} );
+
+				}
+
+			} );
+
+		} else {
+
+			return null;
+
+		}
+
+	}
+
+}
+
+/**
+ * GPU Instancing Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Vendor/EXT_mesh_gpu_instancing
+ *
+ */
+class GLTFMeshGpuInstancing {
+
+	constructor( parser ) {
+
+		this.name = EXTENSIONS.EXT_MESH_GPU_INSTANCING;
+		this.parser = parser;
+
+	}
+
+	createNodeMesh( nodeIndex ) {
+
+		const json = this.parser.json;
+		const nodeDef = json.nodes[ nodeIndex ];
+
+		if ( ! nodeDef.extensions || ! nodeDef.extensions[ this.name ] ||
+			nodeDef.mesh === undefined ) {
+
+			return null;
+
+		}
+
+		const meshDef = json.meshes[ nodeDef.mesh ];
+
+		// No Points or Lines + Instancing support yet
+
+		for ( const primitive of meshDef.primitives ) {
+
+			if ( primitive.mode !== WEBGL_CONSTANTS.TRIANGLES &&
+				 primitive.mode !== WEBGL_CONSTANTS.TRIANGLE_STRIP &&
+				 primitive.mode !== WEBGL_CONSTANTS.TRIANGLE_FAN &&
+				 primitive.mode !== undefined ) {
+
+				return null;
+
+			}
+
+		}
+
+		const extensionDef = nodeDef.extensions[ this.name ];
+		const attributesDef = extensionDef.attributes;
+
+		// @TODO: Can we support InstancedMesh + SkinnedMesh?
+
+		const pending = [];
+		const attributes = {};
+
+		for ( const key in attributesDef ) {
+
+			pending.push( this.parser.getDependency( 'accessor', attributesDef[ key ] ).then( accessor => {
+
+				attributes[ key ] = accessor;
+				return attributes[ key ];
+
+			} ) );
+
+		}
+
+		if ( pending.length < 1 ) {
+
+			return null;
+
+		}
+
+		pending.push( this.parser.createNodeMesh( nodeIndex ) );
+
+		return Promise.all( pending ).then( results => {
+
+			const nodeObject = results.pop();
+			const meshes = nodeObject.isGroup ? nodeObject.children : [ nodeObject ];
+			const count = results[ 0 ].count; // All attribute counts should be same
+			const instancedMeshes = [];
+
+			for ( const mesh of meshes ) {
+
+				// Temporal variables
+				const m = new Matrix4();
+				const p = new Vector3();
+				const q = new Quaternion();
+				const s = new Vector3( 1, 1, 1 );
+
+				const instancedMesh = new InstancedMesh( mesh.geometry, mesh.material, count );
+
+				for ( let i = 0; i < count; i ++ ) {
+
+					if ( attributes.TRANSLATION ) {
+
+						p.fromBufferAttribute( attributes.TRANSLATION, i );
+
+					}
+
+					if ( attributes.ROTATION ) {
+
+						q.fromBufferAttribute( attributes.ROTATION, i );
+
+					}
+
+					if ( attributes.SCALE ) {
+
+						s.fromBufferAttribute( attributes.SCALE, i );
+
+					}
+
+					instancedMesh.setMatrixAt( i, m.compose( p, q, s ) );
+
+				}
+
+				// Add instance attributes to the geometry, excluding TRS.
+				for ( const attributeName in attributes ) {
+
+					if ( attributeName === '_COLOR_0' ) {
+
+						const attr = attributes[ attributeName ];
+						instancedMesh.instanceColor = new InstancedBufferAttribute( attr.array, attr.itemSize, attr.normalized );
+
+					} else if ( attributeName !== 'TRANSLATION' &&
+						 attributeName !== 'ROTATION' &&
+						 attributeName !== 'SCALE' ) {
+
+						mesh.geometry.setAttribute( attributeName, attributes[ attributeName ] );
+
+					}
+
+				}
+
+				// Just in case
+				Object3D.prototype.copy.call( instancedMesh, mesh );
+
+				this.parser.assignFinalMaterial( instancedMesh );
+
+				instancedMeshes.push( instancedMesh );
+
+			}
+
+			if ( nodeObject.isGroup ) {
+
+				nodeObject.clear();
+
+				nodeObject.add( ... instancedMeshes );
+
+				return nodeObject;
+
+			}
+
+			return instancedMeshes[ 0 ];
+
+		} );
+
+	}
+
+}
+
+/* BINARY EXTENSION */
+const BINARY_EXTENSION_HEADER_MAGIC = 'glTF';
+const BINARY_EXTENSION_HEADER_LENGTH = 12;
+const BINARY_EXTENSION_CHUNK_TYPES = { JSON: 0x4E4F534A, BIN: 0x004E4942 };
+
+class GLTFBinaryExtension {
+
+	constructor( data ) {
+
+		this.name = EXTENSIONS.KHR_BINARY_GLTF;
+		this.content = null;
+		this.body = null;
+
+		const headerView = new DataView( data, 0, BINARY_EXTENSION_HEADER_LENGTH );
+		const textDecoder = new TextDecoder();
+
+		this.header = {
+			magic: textDecoder.decode( new Uint8Array( data.slice( 0, 4 ) ) ),
+			version: headerView.getUint32( 4, true ),
+			length: headerView.getUint32( 8, true )
+		};
+
+		if ( this.header.magic !== BINARY_EXTENSION_HEADER_MAGIC ) {
+
+			throw new Error( 'THREE.GLTFLoader: Unsupported glTF-Binary header.' );
+
+		} else if ( this.header.version < 2.0 ) {
+
+			throw new Error( 'THREE.GLTFLoader: Legacy binary file detected.' );
+
+		}
+
+		const chunkContentsLength = this.header.length - BINARY_EXTENSION_HEADER_LENGTH;
+		const chunkView = new DataView( data, BINARY_EXTENSION_HEADER_LENGTH );
+		let chunkIndex = 0;
+
+		while ( chunkIndex < chunkContentsLength ) {
+
+			const chunkLength = chunkView.getUint32( chunkIndex, true );
+			chunkIndex += 4;
+
+			const chunkType = chunkView.getUint32( chunkIndex, true );
+			chunkIndex += 4;
+
+			if ( chunkType === BINARY_EXTENSION_CHUNK_TYPES.JSON ) {
+
+				const contentArray = new Uint8Array( data, BINARY_EXTENSION_HEADER_LENGTH + chunkIndex, chunkLength );
+				this.content = textDecoder.decode( contentArray );
+
+			} else if ( chunkType === BINARY_EXTENSION_CHUNK_TYPES.BIN ) {
+
+				const byteOffset = BINARY_EXTENSION_HEADER_LENGTH + chunkIndex;
+				this.body = data.slice( byteOffset, byteOffset + chunkLength );
+
+			}
+
+			// Clients must ignore chunks with unknown types.
+
+			chunkIndex += chunkLength;
+
+		}
+
+		if ( this.content === null ) {
+
+			throw new Error( 'THREE.GLTFLoader: JSON content not found.' );
+
+		}
+
+	}
+
+}
+
+/**
+ * DRACO Mesh Compression Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_draco_mesh_compression
+ */
+class GLTFDracoMeshCompressionExtension {
+
+	constructor( json, dracoLoader ) {
+
+		if ( ! dracoLoader ) {
+
+			throw new Error( 'THREE.GLTFLoader: No DRACOLoader instance provided.' );
+
+		}
+
+		this.name = EXTENSIONS.KHR_DRACO_MESH_COMPRESSION;
+		this.json = json;
+		this.dracoLoader = dracoLoader;
+		this.dracoLoader.preload();
+
+	}
+
+	decodePrimitive( primitive, parser ) {
+
+		const json = this.json;
+		const dracoLoader = this.dracoLoader;
+		const bufferViewIndex = primitive.extensions[ this.name ].bufferView;
+		const gltfAttributeMap = primitive.extensions[ this.name ].attributes;
+		const threeAttributeMap = {};
+		const attributeNormalizedMap = {};
+		const attributeTypeMap = {};
+
+		for ( const attributeName in gltfAttributeMap ) {
+
+			const threeAttributeName = ATTRIBUTES[ attributeName ] || attributeName.toLowerCase();
+
+			threeAttributeMap[ threeAttributeName ] = gltfAttributeMap[ attributeName ];
+
+		}
+
+		for ( const attributeName in primitive.attributes ) {
+
+			const threeAttributeName = ATTRIBUTES[ attributeName ] || attributeName.toLowerCase();
+
+			if ( gltfAttributeMap[ attributeName ] !== undefined ) {
+
+				const accessorDef = json.accessors[ primitive.attributes[ attributeName ] ];
+				const componentType = WEBGL_COMPONENT_TYPES[ accessorDef.componentType ];
+
+				attributeTypeMap[ threeAttributeName ] = componentType.name;
+				attributeNormalizedMap[ threeAttributeName ] = accessorDef.normalized === true;
+
+			}
+
+		}
+
+		return parser.getDependency( 'bufferView', bufferViewIndex ).then( function ( bufferView ) {
+
+			return new Promise( function ( resolve, reject ) {
+
+				dracoLoader.decodeDracoFile( bufferView, function ( geometry ) {
+
+					for ( const attributeName in geometry.attributes ) {
+
+						const attribute = geometry.attributes[ attributeName ];
+						const normalized = attributeNormalizedMap[ attributeName ];
+
+						if ( normalized !== undefined ) attribute.normalized = normalized;
+
+					}
+
+					resolve( geometry );
+
+				}, threeAttributeMap, attributeTypeMap, LinearSRGBColorSpace, reject );
+
+			} );
+
+		} );
+
+	}
+
+}
+
+/**
+ * Texture Transform Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_texture_transform
+ */
+class GLTFTextureTransformExtension {
+
+	constructor() {
+
+		this.name = EXTENSIONS.KHR_TEXTURE_TRANSFORM;
+
+	}
+
+	extendTexture( texture, transform ) {
+
+		if ( ( transform.texCoord === undefined || transform.texCoord === texture.channel )
+			&& transform.offset === undefined
+			&& transform.rotation === undefined
+			&& transform.scale === undefined ) {
+
+			// See https://github.com/mrdoob/three.js/issues/21819.
+			return texture;
+
+		}
+
+		texture = texture.clone();
+
+		if ( transform.texCoord !== undefined ) {
+
+			texture.channel = transform.texCoord;
+
+		}
+
+		if ( transform.offset !== undefined ) {
+
+			texture.offset.fromArray( transform.offset );
+
+		}
+
+		if ( transform.rotation !== undefined ) {
+
+			texture.rotation = transform.rotation;
+
+		}
+
+		if ( transform.scale !== undefined ) {
+
+			texture.repeat.fromArray( transform.scale );
+
+		}
+
+		texture.needsUpdate = true;
+
+		return texture;
+
+	}
+
+}
+
+/**
+ * Mesh Quantization Extension
+ *
+ * Specification: https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_mesh_quantization
+ */
+class GLTFMeshQuantizationExtension {
+
+	constructor() {
+
+		this.name = EXTENSIONS.KHR_MESH_QUANTIZATION;
+
+	}
+
+}
+
+/*********************************/
+/********** INTERPOLATION ********/
+/*********************************/
+
+// Spline Interpolation
+// Specification: https://github.com/KhronosGroup/glTF/blob/master/specification/2.0/README.md#appendix-c-spline-interpolation
+class GLTFCubicSplineInterpolant extends Interpolant {
+
+	constructor( parameterPositions, sampleValues, sampleSize, resultBuffer ) {
+
+		super( parameterPositions, sampleValues, sampleSize, resultBuffer );
+
+	}
+
+	copySampleValue_( index ) {
+
+		// Copies a sample value to the result buffer. See description of glTF
+		// CUBICSPLINE values layout in interpolate_() function below.
+
+		const result = this.resultBuffer,
+			values = this.sampleValues,
+			valueSize = this.valueSize,
+			offset = index * valueSize * 3 + valueSize;
+
+		for ( let i = 0; i !== valueSize; i ++ ) {
+
+			result[ i ] = values[ offset + i ];
+
+		}
+
+		return result;
+
+	}
+
+	interpolate_( i1, t0, t, t1 ) {
+
+		const result = this.resultBuffer;
+		const values = this.sampleValues;
+		const stride = this.valueSize;
+
+		const stride2 = stride * 2;
+		const stride3 = stride * 3;
+
+		const td = t1 - t0;
+
+		const p = ( t - t0 ) / td;
+		const pp = p * p;
+		const ppp = pp * p;
+
+		const offset1 = i1 * stride3;
+		const offset0 = offset1 - stride3;
+
+		const s2 = - 2 * ppp + 3 * pp;
+		const s3 = ppp - pp;
+		const s0 = 1 - s2;
+		const s1 = s3 - pp + p;
+
+		// Layout of keyframe output values for CUBICSPLINE animations:
+		//   [ inTangent_1, splineVertex_1, outTangent_1, inTangent_2, splineVertex_2, ... ]
+		for ( let i = 0; i !== stride; i ++ ) {
+
+			const p0 = values[ offset0 + i + stride ]; // splineVertex_k
+			const m0 = values[ offset0 + i + stride2 ] * td; // outTangent_k * (t_k+1 - t_k)
+			const p1 = values[ offset1 + i + stride ]; // splineVertex_k+1
+			const m1 = values[ offset1 + i ] * td; // inTangent_k+1 * (t_k+1 - t_k)
+
+			result[ i ] = s0 * p0 + s1 * m0 + s2 * p1 + s3 * m1;
+
+		}
+
+		return result;
+
+	}
+
+}
+
+const _q = new Quaternion();
+
+class GLTFCubicSplineQuaternionInterpolant extends GLTFCubicSplineInterpolant {
+
+	interpolate_( i1, t0, t, t1 ) {
+
+		const result = super.interpolate_( i1, t0, t, t1 );
+
+		_q.fromArray( result ).normalize().toArray( result );
+
+		return result;
+
+	}
+
+}
+
+
+/*********************************/
+/********** INTERNALS ************/
+/*********************************/
+
+/* CONSTANTS */
+
+const WEBGL_CONSTANTS = {
+	FLOAT: 5126,
+	//FLOAT_MAT2: 35674,
+	FLOAT_MAT3: 35675,
+	FLOAT_MAT4: 35676,
+	FLOAT_VEC2: 35664,
+	FLOAT_VEC3: 35665,
+	FLOAT_VEC4: 35666,
+	LINEAR: 9729,
+	REPEAT: 10497,
+	SAMPLER_2D: 35678,
+	POINTS: 0,
+	LINES: 1,
+	LINE_LOOP: 2,
+	LINE_STRIP: 3,
+	TRIANGLES: 4,
+	TRIANGLE_STRIP: 5,
+	TRIANGLE_FAN: 6,
+	UNSIGNED_BYTE: 5121,
+	UNSIGNED_SHORT: 5123
+};
+
+const WEBGL_COMPONENT_TYPES = {
+	5120: Int8Array,
+	5121: Uint8Array,
+	5122: Int16Array,
+	5123: Uint16Array,
+	5125: Uint32Array,
+	5126: Float32Array
+};
+
+const WEBGL_FILTERS = {
+	9728: NearestFilter,
+	9729: LinearFilter,
+	9984: NearestMipmapNearestFilter,
+	9985: LinearMipmapNearestFilter,
+	9986: NearestMipmapLinearFilter,
+	9987: LinearMipmapLinearFilter
+};
+
+const WEBGL_WRAPPINGS = {
+	33071: ClampToEdgeWrapping,
+	33648: MirroredRepeatWrapping,
+	10497: RepeatWrapping
+};
+
+const WEBGL_TYPE_SIZES = {
+	'SCALAR': 1,
+	'VEC2': 2,
+	'VEC3': 3,
+	'VEC4': 4,
+	'MAT2': 4,
+	'MAT3': 9,
+	'MAT4': 16
+};
+
+const ATTRIBUTES = {
+	POSITION: 'position',
+	NORMAL: 'normal',
+	TANGENT: 'tangent',
+	TEXCOORD_0: 'uv',
+	TEXCOORD_1: 'uv1',
+	TEXCOORD_2: 'uv2',
+	TEXCOORD_3: 'uv3',
+	COLOR_0: 'color',
+	WEIGHTS_0: 'skinWeight',
+	JOINTS_0: 'skinIndex',
+};
+
+const PATH_PROPERTIES = {
+	scale: 'scale',
+	translation: 'position',
+	rotation: 'quaternion',
+	weights: 'morphTargetInfluences'
+};
+
+const INTERPOLATION = {
+	CUBICSPLINE: undefined, // We use a custom interpolant (GLTFCubicSplineInterpolation) for CUBICSPLINE tracks. Each
+		                        // keyframe track will be initialized with a default interpolation type, then modified.
+	LINEAR: InterpolateLinear,
+	STEP: InterpolateDiscrete
+};
+
+const ALPHA_MODES = {
+	OPAQUE: 'OPAQUE',
+	MASK: 'MASK',
+	BLEND: 'BLEND'
+};
+
+/**
+ * Specification: https://github.com/KhronosGroup/glTF/blob/master/specification/2.0/README.md#default-material
+ */
+function createDefaultMaterial( cache ) {
+
+	if ( cache[ 'DefaultMaterial' ] === undefined ) {
+
+		cache[ 'DefaultMaterial' ] = new MeshStandardMaterial( {
+			color: 0xFFFFFF,
+			emissive: 0x000000,
+			metalness: 1,
+			roughness: 1,
+			transparent: false,
+			depthTest: true,
+			side: FrontSide
+		} );
+
+	}
+
+	return cache[ 'DefaultMaterial' ];
+
+}
+
+function addUnknownExtensionsToUserData( knownExtensions, object, objectDef ) {
+
+	// Add unknown glTF extensions to an object's userData.
+
+	for ( const name in objectDef.extensions ) {
+
+		if ( knownExtensions[ name ] === undefined ) {
+
+			object.userData.gltfExtensions = object.userData.gltfExtensions || {};
+			object.userData.gltfExtensions[ name ] = objectDef.extensions[ name ];
+
+		}
+
+	}
+
+}
+
+/**
+ * @param {Object3D|Material|BufferGeometry} object
+ * @param {GLTF.definition} gltfDef
+ */
+function assignExtrasToUserData( object, gltfDef ) {
+
+	if ( gltfDef.extras !== undefined ) {
+
+		if ( typeof gltfDef.extras === 'object' ) {
+
+			Object.assign( object.userData, gltfDef.extras );
+
+		} else {
+
+			console.warn( 'THREE.GLTFLoader: Ignoring primitive type .extras, ' + gltfDef.extras );
+
+		}
+
+	}
+
+}
+
+/**
+ * Specification: https://github.com/KhronosGroup/glTF/blob/master/specification/2.0/README.md#morph-targets
+ *
+ * @param {BufferGeometry} geometry
+ * @param {Array<GLTF.Target>} targets
+ * @param {GLTFParser} parser
+ * @return {Promise<BufferGeometry>}
+ */
+function addMorphTargets( geometry, targets, parser ) {
+
+	let hasMorphPosition = false;
+	let hasMorphNormal = false;
+	let hasMorphColor = false;
+
+	for ( let i = 0, il = targets.length; i < il; i ++ ) {
+
+		const target = targets[ i ];
+
+		if ( target.POSITION !== undefined ) hasMorphPosition = true;
+		if ( target.NORMAL !== undefined ) hasMorphNormal = true;
+		if ( target.COLOR_0 !== undefined ) hasMorphColor = true;
+
+		if ( hasMorphPosition && hasMorphNormal && hasMorphColor ) break;
+
+	}
+
+	if ( ! hasMorphPosition && ! hasMorphNormal && ! hasMorphColor ) return Promise.resolve( geometry );
+
+	const pendingPositionAccessors = [];
+	const pendingNormalAccessors = [];
+	const pendingColorAccessors = [];
+
+	for ( let i = 0, il = targets.length; i < il; i ++ ) {
+
+		const target = targets[ i ];
+
+		if ( hasMorphPosition ) {
+
+			const pendingAccessor = target.POSITION !== undefined
+				? parser.getDependency( 'accessor', target.POSITION )
+				: geometry.attributes.position;
+
+			pendingPositionAccessors.push( pendingAccessor );
+
+		}
+
+		if ( hasMorphNormal ) {
+
+			const pendingAccessor = target.NORMAL !== undefined
+				? parser.getDependency( 'accessor', target.NORMAL )
+				: geometry.attributes.normal;
+
+			pendingNormalAccessors.push( pendingAccessor );
+
+		}
+
+		if ( hasMorphColor ) {
+
+			const pendingAccessor = target.COLOR_0 !== undefined
+				? parser.getDependency( 'accessor', target.COLOR_0 )
+				: geometry.attributes.color;
+
+			pendingColorAccessors.push( pendingAccessor );
+
+		}
+
+	}
+
+	return Promise.all( [
+		Promise.all( pendingPositionAccessors ),
+		Promise.all( pendingNormalAccessors ),
+		Promise.all( pendingColorAccessors )
+	] ).then( function ( accessors ) {
+
+		const morphPositions = accessors[ 0 ];
+		const morphNormals = accessors[ 1 ];
+		const morphColors = accessors[ 2 ];
+
+		if ( hasMorphPosition ) geometry.morphAttributes.position = morphPositions;
+		if ( hasMorphNormal ) geometry.morphAttributes.normal = morphNormals;
+		if ( hasMorphColor ) geometry.morphAttributes.color = morphColors;
+		geometry.morphTargetsRelative = true;
+
+		return geometry;
+
+	} );
+
+}
+
+/**
+ * @param {Mesh} mesh
+ * @param {GLTF.Mesh} meshDef
+ */
+function updateMorphTargets( mesh, meshDef ) {
+
+	mesh.updateMorphTargets();
+
+	if ( meshDef.weights !== undefined ) {
+
+		for ( let i = 0, il = meshDef.weights.length; i < il; i ++ ) {
+
+			mesh.morphTargetInfluences[ i ] = meshDef.weights[ i ];
+
+		}
+
+	}
+
+	// .extras has user-defined data, so check that .extras.targetNames is an array.
+	if ( meshDef.extras && Array.isArray( meshDef.extras.targetNames ) ) {
+
+		const targetNames = meshDef.extras.targetNames;
+
+		if ( mesh.morphTargetInfluences.length === targetNames.length ) {
+
+			mesh.morphTargetDictionary = {};
+
+			for ( let i = 0, il = targetNames.length; i < il; i ++ ) {
+
+				mesh.morphTargetDictionary[ targetNames[ i ] ] = i;
+
+			}
+
+		} else {
+
+			console.warn( 'THREE.GLTFLoader: Invalid extras.targetNames length. Ignoring names.' );
+
+		}
+
+	}
+
+}
+
+function createPrimitiveKey( primitiveDef ) {
+
+	let geometryKey;
+
+	const dracoExtension = primitiveDef.extensions && primitiveDef.extensions[ EXTENSIONS.KHR_DRACO_MESH_COMPRESSION ];
+
+	if ( dracoExtension ) {
+
+		geometryKey = 'draco:' + dracoExtension.bufferView
+				+ ':' + dracoExtension.indices
+				+ ':' + createAttributesKey( dracoExtension.attributes );
+
+	} else {
+
+		geometryKey = primitiveDef.indices + ':' + createAttributesKey( primitiveDef.attributes ) + ':' + primitiveDef.mode;
+
+	}
+
+	if ( primitiveDef.targets !== undefined ) {
+
+		for ( let i = 0, il = primitiveDef.targets.length; i < il; i ++ ) {
+
+			geometryKey += ':' + createAttributesKey( primitiveDef.targets[ i ] );
+
+		}
+
+	}
+
+	return geometryKey;
+
+}
+
+function createAttributesKey( attributes ) {
+
+	let attributesKey = '';
+
+	const keys = Object.keys( attributes ).sort();
+
+	for ( let i = 0, il = keys.length; i < il; i ++ ) {
+
+		attributesKey += keys[ i ] + ':' + attributes[ keys[ i ] ] + ';';
+
+	}
+
+	return attributesKey;
+
+}
+
+function getNormalizedComponentScale( constructor ) {
+
+	// Reference:
+	// https://github.com/KhronosGroup/glTF/tree/master/extensions/2.0/Khronos/KHR_mesh_quantization#encoding-quantized-data
+
+	switch ( constructor ) {
+
+		case Int8Array:
+			return 1 / 127;
+
+		case Uint8Array:
+			return 1 / 255;
+
+		case Int16Array:
+			return 1 / 32767;
+
+		case Uint16Array:
+			return 1 / 65535;
+
+		default:
+			throw new Error( 'THREE.GLTFLoader: Unsupported normalized accessor component type.' );
+
+	}
+
+}
+
+function getImageURIMimeType( uri ) {
+
+	if ( uri.search( /\.jpe?g($|\?)/i ) > 0 || uri.search( /^data\:image\/jpeg/ ) === 0 ) return 'image/jpeg';
+	if ( uri.search( /\.webp($|\?)/i ) > 0 || uri.search( /^data\:image\/webp/ ) === 0 ) return 'image/webp';
+
+	return 'image/png';
+
+}
+
+const _identityMatrix = new Matrix4();
+
+/* GLTF PARSER */
+
+class GLTFParser {
+
+	constructor( json = {}, options = {} ) {
+
+		this.json = json;
+		this.extensions = {};
+		this.plugins = {};
+		this.options = options;
+
+		// loader object cache
+		this.cache = new GLTFRegistry();
+
+		// associations between Three.js objects and glTF elements
+		this.associations = new Map();
+
+		// BufferGeometry caching
+		this.primitiveCache = {};
+
+		// Node cache
+		this.nodeCache = {};
+
+		// Object3D instance caches
+		this.meshCache = { refs: {}, uses: {} };
+		this.cameraCache = { refs: {}, uses: {} };
+		this.lightCache = { refs: {}, uses: {} };
+
+		this.sourceCache = {};
+		this.textureCache = {};
+
+		// Track node names, to ensure no duplicates
+		this.nodeNamesUsed = {};
+
+		// Use an ImageBitmapLoader if imageBitmaps are supported. Moves much of the
+		// expensive work of uploading a texture to the GPU off the main thread.
+
+		let isSafari = false;
+		let isFirefox = false;
+		let firefoxVersion = - 1;
+
+		if ( typeof navigator !== 'undefined' ) {
+
+			isSafari = /^((?!chrome|android).)*safari/i.test( navigator.userAgent ) === true;
+			isFirefox = navigator.userAgent.indexOf( 'Firefox' ) > - 1;
+			firefoxVersion = isFirefox ? navigator.userAgent.match( /Firefox\/([0-9]+)\./ )[ 1 ] : - 1;
+
+		}
+
+		if ( typeof createImageBitmap === 'undefined' || isSafari || ( isFirefox && firefoxVersion < 98 ) ) {
+
+			this.textureLoader = new TextureLoader( this.options.manager );
+
+		} else {
+
+			this.textureLoader = new ImageBitmapLoader( this.options.manager );
+
+		}
+
+		this.textureLoader.setCrossOrigin( this.options.crossOrigin );
+		this.textureLoader.setRequestHeader( this.options.requestHeader );
+
+		this.fileLoader = new FileLoader( this.options.manager );
+		this.fileLoader.setResponseType( 'arraybuffer' );
+
+		if ( this.options.crossOrigin === 'use-credentials' ) {
+
+			this.fileLoader.setWithCredentials( true );
+
+		}
+
+	}
+
+	setExtensions( extensions ) {
+
+		this.extensions = extensions;
+
+	}
+
+	setPlugins( plugins ) {
+
+		this.plugins = plugins;
+
+	}
+
+	parse( onLoad, onError ) {
+
+		const parser = this;
+		const json = this.json;
+		const extensions = this.extensions;
+
+		// Clear the loader cache
+		this.cache.removeAll();
+		this.nodeCache = {};
+
+		// Mark the special nodes/meshes in json for efficient parse
+		this._invokeAll( function ( ext ) {
+
+			return ext._markDefs && ext._markDefs();
+
+		} );
+
+		Promise.all( this._invokeAll( function ( ext ) {
+
+			return ext.beforeRoot && ext.beforeRoot();
+
+		} ) ).then( function () {
+
+			return Promise.all( [
+
+				parser.getDependencies( 'scene' ),
+				parser.getDependencies( 'animation' ),
+				parser.getDependencies( 'camera' ),
+
+			] );
+
+		} ).then( function ( dependencies ) {
+
+			const result = {
+				scene: dependencies[ 0 ][ json.scene || 0 ],
+				scenes: dependencies[ 0 ],
+				animations: dependencies[ 1 ],
+				cameras: dependencies[ 2 ],
+				asset: json.asset,
+				parser: parser,
+				userData: {}
+			};
+
+			addUnknownExtensionsToUserData( extensions, result, json );
+
+			assignExtrasToUserData( result, json );
+
+			return Promise.all( parser._invokeAll( function ( ext ) {
+
+				return ext.afterRoot && ext.afterRoot( result );
+
+			} ) ).then( function () {
+
+				onLoad( result );
+
+			} );
+
+		} ).catch( onError );
+
+	}
+
+	/**
+	 * Marks the special nodes/meshes in json for efficient parse.
+	 */
+	_markDefs() {
+
+		const nodeDefs = this.json.nodes || [];
+		const skinDefs = this.json.skins || [];
+		const meshDefs = this.json.meshes || [];
+
+		// Nothing in the node definition indicates whether it is a Bone or an
+		// Object3D. Use the skins' joint references to mark bones.
+		for ( let skinIndex = 0, skinLength = skinDefs.length; skinIndex < skinLength; skinIndex ++ ) {
+
+			const joints = skinDefs[ skinIndex ].joints;
+
+			for ( let i = 0, il = joints.length; i < il; i ++ ) {
+
+				nodeDefs[ joints[ i ] ].isBone = true;
+
+			}
+
+		}
+
+		// Iterate over all nodes, marking references to shared resources,
+		// as well as skeleton joints.
+		for ( let nodeIndex = 0, nodeLength = nodeDefs.length; nodeIndex < nodeLength; nodeIndex ++ ) {
+
+			const nodeDef = nodeDefs[ nodeIndex ];
+
+			if ( nodeDef.mesh !== undefined ) {
+
+				this._addNodeRef( this.meshCache, nodeDef.mesh );
+
+				// Nothing in the mesh definition indicates whether it is
+				// a SkinnedMesh or Mesh. Use the node's mesh reference
+				// to mark SkinnedMesh if node has skin.
+				if ( nodeDef.skin !== undefined ) {
+
+					meshDefs[ nodeDef.mesh ].isSkinnedMesh = true;
+
+				}
+
+			}
+
+			if ( nodeDef.camera !== undefined ) {
+
+				this._addNodeRef( this.cameraCache, nodeDef.camera );
+
+			}
+
+		}
+
+	}
+
+	/**
+	 * Counts references to shared node / Object3D resources. These resources
+	 * can be reused, or "instantiated", at multiple nodes in the scene
+	 * hierarchy. Mesh, Camera, and Light instances are instantiated and must
+	 * be marked. Non-scenegraph resources (like Materials, Geometries, and
+	 * Textures) can be reused directly and are not marked here.
+	 *
+	 * Example: CesiumMilkTruck sample model reuses "Wheel" meshes.
+	 */
+	_addNodeRef( cache, index ) {
+
+		if ( index === undefined ) return;
+
+		if ( cache.refs[ index ] === undefined ) {
+
+			cache.refs[ index ] = cache.uses[ index ] = 0;
+
+		}
+
+		cache.refs[ index ] ++;
+
+	}
+
+	/** Returns a reference to a shared resource, cloning it if necessary. */
+	_getNodeRef( cache, index, object ) {
+
+		if ( cache.refs[ index ] <= 1 ) return object;
+
+		const ref = object.clone();
+
+		// Propagates mappings to the cloned object, prevents mappings on the
+		// original object from being lost.
+		const updateMappings = ( original, clone ) => {
+
+			const mappings = this.associations.get( original );
+			if ( mappings != null ) {
+
+				this.associations.set( clone, mappings );
+
+			}
+
+			for ( const [ i, child ] of original.children.entries() ) {
+
+				updateMappings( child, clone.children[ i ] );
+
+			}
+
+		};
+
+		updateMappings( object, ref );
+
+		ref.name += '_instance_' + ( cache.uses[ index ] ++ );
+
+		return ref;
+
+	}
+
+	_invokeOne( func ) {
+
+		const extensions = Object.values( this.plugins );
+		extensions.push( this );
+
+		for ( let i = 0; i < extensions.length; i ++ ) {
+
+			const result = func( extensions[ i ] );
+
+			if ( result ) return result;
+
+		}
+
+		return null;
+
+	}
+
+	_invokeAll( func ) {
+
+		const extensions = Object.values( this.plugins );
+		extensions.unshift( this );
+
+		const pending = [];
+
+		for ( let i = 0; i < extensions.length; i ++ ) {
+
+			const result = func( extensions[ i ] );
+
+			if ( result ) pending.push( result );
+
+		}
+
+		return pending;
+
+	}
+
+	/**
+	 * Requests the specified dependency asynchronously, with caching.
+	 * @param {string} type
+	 * @param {number} index
+	 * @return {Promise<Object3D|Material|THREE.Texture|AnimationClip|ArrayBuffer|Object>}
+	 */
+	getDependency( type, index ) {
+
+		const cacheKey = type + ':' + index;
+		let dependency = this.cache.get( cacheKey );
+
+		if ( ! dependency ) {
+
+			switch ( type ) {
+
+				case 'scene':
+					dependency = this.loadScene( index );
+					break;
+
+				case 'node':
+					dependency = this._invokeOne( function ( ext ) {
+
+						return ext.loadNode && ext.loadNode( index );
+
+					} );
+					break;
+
+				case 'mesh':
+					dependency = this._invokeOne( function ( ext ) {
+
+						return ext.loadMesh && ext.loadMesh( index );
+
+					} );
+					break;
+
+				case 'accessor':
+					dependency = this.loadAccessor( index );
+					break;
+
+				case 'bufferView':
+					dependency = this._invokeOne( function ( ext ) {
+
+						return ext.loadBufferView && ext.loadBufferView( index );
+
+					} );
+					break;
+
+				case 'buffer':
+					dependency = this.loadBuffer( index );
+					break;
+
+				case 'material':
+					dependency = this._invokeOne( function ( ext ) {
+
+						return ext.loadMaterial && ext.loadMaterial( index );
+
+					} );
+					break;
+
+				case 'texture':
+					dependency = this._invokeOne( function ( ext ) {
+
+						return ext.loadTexture && ext.loadTexture( index );
+
+					} );
+					break;
+
+				case 'skin':
+					dependency = this.loadSkin( index );
+					break;
+
+				case 'animation':
+					dependency = this._invokeOne( function ( ext ) {
+
+						return ext.loadAnimation && ext.loadAnimation( index );
+
+					} );
+					break;
+
+				case 'camera':
+					dependency = this.loadCamera( index );
+					break;
+
+				default:
+					dependency = this._invokeOne( function ( ext ) {
+
+						return ext != this && ext.getDependency && ext.getDependency( type, index );
+
+					} );
+
+					if ( ! dependency ) {
+
+						throw new Error( 'Unknown type: ' + type );
+
+					}
+
+					break;
+
+			}
+
+			this.cache.add( cacheKey, dependency );
+
+		}
+
+		return dependency;
+
+	}
+
+	/**
+	 * Requests all dependencies of the specified type asynchronously, with caching.
+	 * @param {string} type
+	 * @return {Promise<Array<Object>>}
+	 */
+	getDependencies( type ) {
+
+		let dependencies = this.cache.get( type );
+
+		if ( ! dependencies ) {
+
+			const parser = this;
+			const defs = this.json[ type + ( type === 'mesh' ? 'es' : 's' ) ] || [];
+
+			dependencies = Promise.all( defs.map( function ( def, index ) {
+
+				return parser.getDependency( type, index );
+
+			} ) );
+
+			this.cache.add( type, dependencies );
+
+		}
+
+		return dependencies;
+
+	}
+
+	/**
+	 * Specification: https://github.com/KhronosGroup/glTF/blob/master/specification/2.0/README.md#buffers-and-buffer-views
+	 * @param {number} bufferIndex
+	 * @return {Promise<ArrayBuffer>}
+	 */
+	loadBuffer( bufferIndex ) {
+
+		const bufferDef = this.json.buffers[ bufferIndex ];
+		const loader = this.fileLoader;
+
+		if ( bufferDef.type && bufferDef.type !== 'arraybuffer' ) {
+
+			throw new Error( 'THREE.GLTFLoader: ' + bufferDef.type + ' buffer type is not supported.' );
+
+		}
+
+		// If present, GLB container is required to be the first buffer.
+		if ( bufferDef.uri === undefined && bufferIndex === 0 ) {
+
+			return Promise.resolve( this.extensions[ EXTENSIONS.KHR_BINARY_GLTF ].body );
+
+		}
+
+		const options = this.options;
+
+		return new Promise( function ( resolve, reject ) {
+
+			loader.load( LoaderUtils.resolveURL( bufferDef.uri, options.path ), resolve, undefined, function () {
+
+				reject( new Error( 'THREE.GLTFLoader: Failed to load buffer "' + bufferDef.uri + '".' ) );
+
+			} );
+
+		} );
+
+	}
+
+	/**
+	 * Specification: https://github.com/KhronosGroup/glTF/blob/master/specification/2.0/README.md#buffers-and-buffer-views
+	 * @param {number} bufferViewIndex
+	 * @return {Promise<ArrayBuffer>}
+	 */
+	loadBufferView( bufferViewIndex ) {
+
+		const bufferViewDef = this.json.bufferViews[ bufferViewIndex ];
+
+		return this.getDependency( 'buffer', bufferViewDef.buffer ).then( function ( buffer ) {
+
+			const byteLength = bufferViewDef.byteLength || 0;
+			const byteOffset = bufferViewDef.byteOffset || 0;
+			return buffer.slice( byteOffset, byteOffset + byteLength );
+
+		} );
+
+	}
+
+	/**
+	 * Specification: https://github.com/KhronosGroup/glTF/blob/master/specification/2.0/README.md#accessors
+	 * @param {number} accessorIndex
+	 * @return {Promise<BufferAttribute|InterleavedBufferAttribute>}
+	 */
+	loadAccessor( accessorIndex ) {
+
+		const parser = this;
+		const json = this.json;
+
+		const accessorDef = this.json.accessors[ accessorIndex ];
+
+		if ( accessorDef.bufferView === undefined && accessorDef.sparse === undefined ) {
+
+			const itemSize = WEBGL_TYPE_SIZES[ accessorDef.type ];
+			const TypedArray = WEBGL_COMPONENT_TYPES[ accessorDef.componentType ];
+			const normalized = accessorDef.normalized === true;
+
+			const array = new TypedArray( accessorDef.count * itemSize );
+			return Promise.resolve( new BufferAttribute( array, itemSize, normalized ) );
+
+		}
+
+		const pendingBufferViews = [];
+
+		if ( accessorDef.bufferView !== undefined ) {
+
+			pendingBufferViews.push( this.getDependency( 'bufferView', accessorDef.bufferView ) );
+
+		} else {
+
+			pendingBufferViews.push( null );
+
+		}
+
+		if ( accessorDef.sparse !== undefined ) {
+
+			pendingBufferViews.push( this.getDependency( 'bufferView', accessorDef.sparse.indices.bufferView ) );
+			pendingBufferViews.push( this.getDependency( 'bufferView', accessorDef.sparse.values.bufferView ) );
+
+		}
+
+		return Promise.all( pendingBufferViews ).then( function ( bufferViews ) {
+
+			const bufferView = bufferViews[ 0 ];
+
+			const itemSize = WEBGL_TYPE_SIZES[ accessorDef.type ];
+			const TypedArray = WEBGL_COMPONENT_TYPES[ accessorDef.componentType ];
+
+			// For VEC3: itemSize is 3, elementBytes is 4, itemBytes is 12.
+			const elementBytes = TypedArray.BYTES_PER_ELEMENT;
+			const itemBytes = elementBytes * itemSize;
+			const byteOffset = accessorDef.byteOffset || 0;
+			const byteStride = accessorDef.bufferView !== undefined ? json.bufferViews[ accessorDef.bufferView ].byteStride : undefined;
+			const normalized = accessorDef.normalized === true;
+			let array, bufferAttribute;
+
+			// The buffer is not interleaved if the stride is the item size in bytes.
+			if ( byteStride && byteStride !== itemBytes ) {
+
+				// Each "slice" of the buffer, as defined by 'count' elements of 'byteStride' bytes, gets its own InterleavedBuffer
+				// This makes sure that IBA.count reflects accessor.count properly
+				const ibSlice = Math.floor( byteOffset / byteStride );
+				const ibCacheKey = 'InterleavedBuffer:' + accessorDef.bufferView + ':' + accessorDef.componentType + ':' + ibSlice + ':' + accessorDef.count;
+				let ib = parser.cache.get( ibCacheKey );
+
+				if ( ! ib ) {
+
+					array = new TypedArray( bufferView, ibSlice * byteStride, accessorDef.count * byteStride / elementBytes );
+
+					// Integer parameters to IB/IBA are in array elements, not bytes.
+					ib = new InterleavedBuffer( array, byteStride / elementBytes );
+
+					parser.cache.add( ibCacheKey, ib );
+
+				}
+
+				bufferAttribute = new InterleavedBufferAttribute( ib, itemSize, ( byteOffset % byteStride ) / elementBytes, normalized );
+
+			} else {
+
+				if ( bufferView === null ) {
+
+					array = new TypedArray( accessorDef.count * itemSize );
+
+				} else {
+
+					array = new TypedArray( bufferView, byteOffset, accessorDef.count * itemSize );
+
+				}
+
+				bufferAttribute = new BufferAttribute( array, itemSize, normalized );
+
+			}
+
+			// https://github.com/KhronosGroup/glTF/blob/master/specification/2.0/README.md#sparse-accessors
+			if ( accessorDef.sparse !== undefined ) {
+
+				const itemSizeIndices = WEBGL_TYPE_SIZES.SCALAR;
+				const TypedArrayIndices = WEBGL_COMPONENT_TYPES[ accessorDef.sparse.indices.componentType ];
+
+				const byteOffsetIndices = accessorDef.sparse.indices.byteOffset || 0;
+				const byteOffsetValues = accessorDef.sparse.values.byteOffset || 0;
+
+				const sparseIndices = new TypedArrayIndices( bufferViews[ 1 ], byteOffsetIndices, accessorDef.sparse.count * itemSizeIndices );
+				const sparseValues = new TypedArray( bufferViews[ 2 ], byteOffsetValues, accessorDef.sparse.count * itemSize );
+
+				if ( bufferView !== null ) {
+
+					// Avoid modifying the original ArrayBuffer, if the bufferView wasn't initialized with zeroes.
+					bufferAttribute = new BufferAttribute( bufferAttribute.array.slice(), bufferAttribute.itemSize, bufferAttribute.normalized );
+
+				}
+
+				for ( let i = 0, il = sparseIndices.length; i < il; i ++ ) {
+
+					const index = sparseIndices[ i ];
+
+					bufferAttribute.setX( index, sparseValues[ i * itemSize ] );
+					if ( itemSize >= 2 ) bufferAttribute.setY( index, sparseValues[ i * itemSize + 1 ] );
+					if ( itemSize >= 3 ) bufferAttribute.setZ( index, sparseValues[ i * itemSize + 2 ] );
+					if ( itemSize >= 4 ) bufferAttribute.setW( index, sparseValues[ i * itemSize + 3 ] );
+					if ( itemSize >= 5 ) throw new Error( 'THREE.GLTFLoader: Unsupported itemSize in sparse BufferAttribute.' );
+
+				}
+
+			}
+
+			return bufferAttribute;
+
+		} );
+
+	}
+
+	/**
+	 * Specification: https://github.com/KhronosGroup/glTF/tree/master/specification/2.0#textures
+	 * @param {number} textureIndex
+	 * @return {Promise<THREE.Texture|null>}
+	 */
+	loadTexture( textureIndex ) {
+
+		const json = this.json;
+		const options = this.options;
+		const textureDef = json.textures[ textureIndex ];
+		const sourceIndex = textureDef.source;
+		const sourceDef = json.images[ sourceIndex ];
+
+		let loader = this.textureLoader;
+
+		if ( sourceDef.uri ) {
+
+			const handler = options.manager.getHandler( sourceDef.uri );
+			if ( handler !== null ) loader = handler;
+
+		}
+
+		return this.loadTextureImage( textureIndex, sourceIndex, loader );
+
+	}
+
+	loadTextureImage( textureIndex, sourceIndex, loader ) {
+
+		const parser = this;
+		const json = this.json;
+
+		const textureDef = json.textures[ textureIndex ];
+		const sourceDef = json.images[ sourceIndex ];
+
+		const cacheKey = ( sourceDef.uri || sourceDef.bufferView ) + ':' + textureDef.sampler;
+
+		if ( this.textureCache[ cacheKey ] ) {
+
+			// See https://github.com/mrdoob/three.js/issues/21559.
+			return this.textureCache[ cacheKey ];
+
+		}
+
+		const promise = this.loadImageSource( sourceIndex, loader ).then( function ( texture ) {
+
+			texture.flipY = false;
+
+			texture.name = textureDef.name || sourceDef.name || '';
+
+			if ( texture.name === '' && typeof sourceDef.uri === 'string' && sourceDef.uri.startsWith( 'data:image/' ) === false ) {
+
+				texture.name = sourceDef.uri;
+
+			}
+
+			const samplers = json.samplers || {};
+			const sampler = samplers[ textureDef.sampler ] || {};
+
+			texture.magFilter = WEBGL_FILTERS[ sampler.magFilter ] || LinearFilter;
+			texture.minFilter = WEBGL_FILTERS[ sampler.minFilter ] || LinearMipmapLinearFilter;
+			texture.wrapS = WEBGL_WRAPPINGS[ sampler.wrapS ] || RepeatWrapping;
+			texture.wrapT = WEBGL_WRAPPINGS[ sampler.wrapT ] || RepeatWrapping;
+
+			parser.associations.set( texture, { textures: textureIndex } );
+
+			return texture;
+
+		} ).catch( function () {
+
+			return null;
+
+		} );
+
+		this.textureCache[ cacheKey ] = promise;
+
+		return promise;
+
+	}
+
+	loadImageSource( sourceIndex, loader ) {
+
+		const parser = this;
+		const json = this.json;
+		const options = this.options;
+
+		if ( this.sourceCache[ sourceIndex ] !== undefined ) {
+
+			return this.sourceCache[ sourceIndex ].then( ( texture ) => texture.clone() );
+
+		}
+
+		const sourceDef = json.images[ sourceIndex ];
+
+		const URL = self.URL || self.webkitURL;
+
+		let sourceURI = sourceDef.uri || '';
+		let isObjectURL = false;
+
+		if ( sourceDef.bufferView !== undefined ) {
+
+			// Load binary image data from bufferView, if provided.
+
+			sourceURI = parser.getDependency( 'bufferView', sourceDef.bufferView ).then( function ( bufferView ) {
+
+				isObjectURL = true;
+				const blob = new Blob( [ bufferView ], { type: sourceDef.mimeType } );
+				sourceURI = URL.createObjectURL( blob );
+				return sourceURI;
+
+			} );
+
+		} else if ( sourceDef.uri === undefined ) {
+
+			throw new Error( 'THREE.GLTFLoader: Image ' + sourceIndex + ' is missing URI and bufferView' );
+
+		}
+
+		const promise = Promise.resolve( sourceURI ).then( function ( sourceURI ) {
+
+			return new Promise( function ( resolve, reject ) {
+
+				let onLoad = resolve;
+
+				if ( loader.isImageBitmapLoader === true ) {
+
+					onLoad = function ( imageBitmap ) {
+
+						const texture = new Texture( imageBitmap );
+						texture.needsUpdate = true;
+
+						resolve( texture );
+
+					};
+
+				}
+
+				loader.load( LoaderUtils.resolveURL( sourceURI, options.path ), onLoad, undefined, reject );
+
+			} );
+
+		} ).then( function ( texture ) {
+
+			// Clean up resources and configure Texture.
+
+			if ( isObjectURL === true ) {
+
+				URL.revokeObjectURL( sourceURI );
+
+			}
+
+			texture.userData.mimeType = sourceDef.mimeType || getImageURIMimeType( sourceDef.uri );
+
+			return texture;
+
+		} ).catch( function ( error ) {
+
+			console.error( 'THREE.GLTFLoader: Couldn\'t load texture', sourceURI );
+			throw error;
+
+		} );
+
+		this.sourceCache[ sourceIndex ] = promise;
+		return promise;
+
+	}
+
+	/**
+	 * Asynchronously assigns a texture to the given material parameters.
+	 * @param {Object} materialParams
+	 * @param {string} mapName
+	 * @param {Object} mapDef
+	 * @return {Promise<Texture>}
+	 */
+	assignTexture( materialParams, mapName, mapDef, colorSpace ) {
+
+		const parser = this;
+
+		return this.getDependency( 'texture', mapDef.index ).then( function ( texture ) {
+
+			if ( ! texture ) return null;
+
+			if ( mapDef.texCoord !== undefined && mapDef.texCoord > 0 ) {
+
+				texture = texture.clone();
+				texture.channel = mapDef.texCoord;
+
+			}
+
+			if ( parser.extensions[ EXTENSIONS.KHR_TEXTURE_TRANSFORM ] ) {
+
+				const transform = mapDef.extensions !== undefined ? mapDef.extensions[ EXTENSIONS.KHR_TEXTURE_TRANSFORM ] : undefined;
+
+				if ( transform ) {
+
+					const gltfReference = parser.associations.get( texture );
+					texture = parser.extensions[ EXTENSIONS.KHR_TEXTURE_TRANSFORM ].extendTexture( texture, transform );
+					parser.associations.set( texture, gltfReference );
+
+				}
+
+			}
+
+			if ( colorSpace !== undefined ) {
+
+				texture.colorSpace = colorSpace;
+
+			}
+
+			materialParams[ mapName ] = texture;
+
+			return texture;
+
+		} );
+
+	}
+
+	/**
+	 * Assigns final material to a Mesh, Line, or Points instance. The instance
+	 * already has a material (generated from the glTF material options alone)
+	 * but reuse of the same glTF material may require multiple threejs materials
+	 * to accommodate different primitive types, defines, etc. New materials will
+	 * be created if necessary, and reused from a cache.
+	 * @param  {Object3D} mesh Mesh, Line, or Points instance.
+	 */
+	assignFinalMaterial( mesh ) {
+
+		const geometry = mesh.geometry;
+		let material = mesh.material;
+
+		const useDerivativeTangents = geometry.attributes.tangent === undefined;
+		const useVertexColors = geometry.attributes.color !== undefined;
+		const useFlatShading = geometry.attributes.normal === undefined;
+
+		if ( mesh.isPoints ) {
+
+			const cacheKey = 'PointsMaterial:' + material.uuid;
+
+			let pointsMaterial = this.cache.get( cacheKey );
+
+			if ( ! pointsMaterial ) {
+
+				pointsMaterial = new PointsMaterial();
+				Material.prototype.copy.call( pointsMaterial, material );
+				pointsMaterial.color.copy( material.color );
+				pointsMaterial.map = material.map;
+				pointsMaterial.sizeAttenuation = false; // glTF spec says points should be 1px
+
+				this.cache.add( cacheKey, pointsMaterial );
+
+			}
+
+			material = pointsMaterial;
+
+		} else if ( mesh.isLine ) {
+
+			const cacheKey = 'LineBasicMaterial:' + material.uuid;
+
+			let lineMaterial = this.cache.get( cacheKey );
+
+			if ( ! lineMaterial ) {
+
+				lineMaterial = new LineBasicMaterial();
+				Material.prototype.copy.call( lineMaterial, material );
+				lineMaterial.color.copy( material.color );
+				lineMaterial.map = material.map;
+
+				this.cache.add( cacheKey, lineMaterial );
+
+			}
+
+			material = lineMaterial;
+
+		}
+
+		// Clone the material if it will be modified
+		if ( useDerivativeTangents || useVertexColors || useFlatShading ) {
+
+			let cacheKey = 'ClonedMaterial:' + material.uuid + ':';
+
+			if ( useDerivativeTangents ) cacheKey += 'derivative-tangents:';
+			if ( useVertexColors ) cacheKey += 'vertex-colors:';
+			if ( useFlatShading ) cacheKey += 'flat-shading:';
+
+			let cachedMaterial = this.cache.get( cacheKey );
+
+			if ( ! cachedMaterial ) {
+
+				cachedMaterial = material.clone();
+
+				if ( useVertexColors ) cachedMaterial.vertexColors = true;
+				if ( useFlatShading ) cachedMaterial.flatShading = true;
+
+				if ( useDerivativeTangents ) {
+
+					// https://github.com/mrdoob/three.js/issues/11438#issuecomment-507003995
+					if ( cachedMaterial.normalScale ) cachedMaterial.normalScale.y *= - 1;
+					if ( cachedMaterial.clearcoatNormalScale ) cachedMaterial.clearcoatNormalScale.y *= - 1;
+
+				}
+
+				this.cache.add( cacheKey, cachedMaterial );
+
+				this.associations.set( cachedMaterial, this.associations.get( material ) );
+
+			}
+
+			material = cachedMaterial;
+
+		}
+
+		mesh.material = material;
+
+	}
+
+	getMaterialType( /* materialIndex */ ) {
+
+		return MeshStandardMaterial;
+
+	}
+
+	/**
+	 * Specification: https://github.com/KhronosGroup/glTF/blob/master/specification/2.0/README.md#materials
+	 * @param {number} materialIndex
+	 * @return {Promise<Material>}
+	 */
+	loadMaterial( materialIndex ) {
+
+		const parser = this;
+		const json = this.json;
+		const extensions = this.extensions;
+		const materialDef = json.materials[ materialIndex ];
+
+		let materialType;
+		const materialParams = {};
+		const materialExtensions = materialDef.extensions || {};
+
+		const pending = [];
+
+		if ( materialExtensions[ EXTENSIONS.KHR_MATERIALS_UNLIT ] ) {
+
+			const kmuExtension = extensions[ EXTENSIONS.KHR_MATERIALS_UNLIT ];
+			materialType = kmuExtension.getMaterialType();
+			pending.push( kmuExtension.extendParams( materialParams, materialDef, parser ) );
+
+		} else {
+
+			// Specification:
+			// https://github.com/KhronosGroup/glTF/tree/master/specification/2.0#metallic-roughness-material
+
+			const metallicRoughness = materialDef.pbrMetallicRoughness || {};
+
+			materialParams.color = new Color( 1.0, 1.0, 1.0 );
+			materialParams.opacity = 1.0;
+
+			if ( Array.isArray( metallicRoughness.baseColorFactor ) ) {
+
+				const array = metallicRoughness.baseColorFactor;
+
+				materialParams.color.setRGB( array[ 0 ], array[ 1 ], array[ 2 ], LinearSRGBColorSpace );
+				materialParams.opacity = array[ 3 ];
+
+			}
+
+			if ( metallicRoughness.baseColorTexture !== undefined ) {
+
+				pending.push( parser.assignTexture( materialParams, 'map', metallicRoughness.baseColorTexture, SRGBColorSpace ) );
+
+			}
+
+			materialParams.metalness = metallicRoughness.metallicFactor !== undefined ? metallicRoughness.metallicFactor : 1.0;
+			materialParams.roughness = metallicRoughness.roughnessFactor !== undefined ? metallicRoughness.roughnessFactor : 1.0;
+
+			if ( metallicRoughness.metallicRoughnessTexture !== undefined ) {
+
+				pending.push( parser.assignTexture( materialParams, 'metalnessMap', metallicRoughness.metallicRoughnessTexture ) );
+				pending.push( parser.assignTexture( materialParams, 'roughnessMap', metallicRoughness.metallicRoughnessTexture ) );
+
+			}
+
+			materialType = this._invokeOne( function ( ext ) {
+
+				return ext.getMaterialType && ext.getMaterialType( materialIndex );
+
+			} );
+
+			pending.push( Promise.all( this._invokeAll( function ( ext ) {
+
+				return ext.extendMaterialParams && ext.extendMaterialParams( materialIndex, materialParams );
+
+			} ) ) );
+
+		}
+
+		if ( materialDef.doubleSided === true ) {
+
+			materialParams.side = DoubleSide;
+
+		}
+
+		const alphaMode = materialDef.alphaMode || ALPHA_MODES.OPAQUE;
+
+		if ( alphaMode === ALPHA_MODES.BLEND ) {
+
+			materialParams.transparent = true;
+
+			// See: https://github.com/mrdoob/three.js/issues/17706
+			materialParams.depthWrite = false;
+
+		} else {
+
+			materialParams.transparent = false;
+
+			if ( alphaMode === ALPHA_MODES.MASK ) {
+
+				materialParams.alphaTest = materialDef.alphaCutoff !== undefined ? materialDef.alphaCutoff : 0.5;
+
+			}
+
+		}
+
+		if ( materialDef.normalTexture !== undefined && materialType !== MeshBasicMaterial ) {
+
+			pending.push( parser.assignTexture( materialParams, 'normalMap', materialDef.normalTexture ) );
+
+			materialParams.normalScale = new Vector2( 1, 1 );
+
+			if ( materialDef.normalTexture.scale !== undefined ) {
+
+				const scale = materialDef.normalTexture.scale;
+
+				materialParams.normalScale.set( scale, scale );
+
+			}
+
+		}
+
+		if ( materialDef.occlusionTexture !== undefined && materialType !== MeshBasicMaterial ) {
+
+			pending.push( parser.assignTexture( materialParams, 'aoMap', materialDef.occlusionTexture ) );
+
+			if ( materialDef.occlusionTexture.strength !== undefined ) {
+
+				materialParams.aoMapIntensity = materialDef.occlusionTexture.strength;
+
+			}
+
+		}
+
+		if ( materialDef.emissiveFactor !== undefined && materialType !== MeshBasicMaterial ) {
+
+			const emissiveFactor = materialDef.emissiveFactor;
+			materialParams.emissive = new Color().setRGB( emissiveFactor[ 0 ], emissiveFactor[ 1 ], emissiveFactor[ 2 ], LinearSRGBColorSpace );
+
+		}
+
+		if ( materialDef.emissiveTexture !== undefined && materialType !== MeshBasicMaterial ) {
+
+			pending.push( parser.assignTexture( materialParams, 'emissiveMap', materialDef.emissiveTexture, SRGBColorSpace ) );
+
+		}
+
+		return Promise.all( pending ).then( function () {
+
+			const material = new materialType( materialParams );
+
+			if ( materialDef.name ) material.name = materialDef.name;
+
+			assignExtrasToUserData( material, materialDef );
+
+			parser.associations.set( material, { materials: materialIndex } );
+
+			if ( materialDef.extensions ) addUnknownExtensionsToUserData( extensions, material, materialDef );
+
+			return material;
+
+		} );
+
+	}
+
+	/** When Object3D instances are targeted by animation, they need unique names. */
+	createUniqueName( originalName ) {
+
+		const sanitizedName = PropertyBinding.sanitizeNodeName( originalName || '' );
+
+		if ( sanitizedName in this.nodeNamesUsed ) {
+
+			return sanitizedName + '_' + ( ++ this.nodeNamesUsed[ sanitizedName ] );
+
+		} else {
+
+			this.nodeNamesUsed[ sanitizedName ] = 0;
+
+			return sanitizedName;
+
+		}
+
+	}
+
+	/**
+	 * Specification: https://github.com/KhronosGroup/glTF/blob/master/specification/2.0/README.md#geometry
+	 *
+	 * Creates BufferGeometries from primitives.
+	 *
+	 * @param {Array<GLTF.Primitive>} primitives
+	 * @return {Promise<Array<BufferGeometry>>}
+	 */
+	loadGeometries( primitives ) {
+
+		const parser = this;
+		const extensions = this.extensions;
+		const cache = this.primitiveCache;
+
+		function createDracoPrimitive( primitive ) {
+
+			return extensions[ EXTENSIONS.KHR_DRACO_MESH_COMPRESSION ]
+				.decodePrimitive( primitive, parser )
+				.then( function ( geometry ) {
+
+					return addPrimitiveAttributes( geometry, primitive, parser );
+
+				} );
+
+		}
+
+		const pending = [];
+
+		for ( let i = 0, il = primitives.length; i < il; i ++ ) {
+
+			const primitive = primitives[ i ];
+			const cacheKey = createPrimitiveKey( primitive );
+
+			// See if we've already created this geometry
+			const cached = cache[ cacheKey ];
+
+			if ( cached ) {
+
+				// Use the cached geometry if it exists
+				pending.push( cached.promise );
+
+			} else {
+
+				let geometryPromise;
+
+				if ( primitive.extensions && primitive.extensions[ EXTENSIONS.KHR_DRACO_MESH_COMPRESSION ] ) {
+
+					// Use DRACO geometry if available
+					geometryPromise = createDracoPrimitive( primitive );
+
+				} else {
+
+					// Otherwise create a new geometry
+					geometryPromise = addPrimitiveAttributes( new BufferGeometry(), primitive, parser );
+
+				}
+
+				// Cache this geometry
+				cache[ cacheKey ] = { primitive: primitive, promise: geometryPromise };
+
+				pending.push( geometryPromise );
+
+			}
+
+		}
+
+		return Promise.all( pending );
+
+	}
+
+	/**
+	 * Specification: https://github.com/KhronosGroup/glTF/blob/master/specification/2.0/README.md#meshes
+	 * @param {number} meshIndex
+	 * @return {Promise<Group|Mesh|SkinnedMesh>}
+	 */
+	loadMesh( meshIndex ) {
+
+		const parser = this;
+		const json = this.json;
+		const extensions = this.extensions;
+
+		const meshDef = json.meshes[ meshIndex ];
+		const primitives = meshDef.primitives;
+
+		const pending = [];
+
+		for ( let i = 0, il = primitives.length; i < il; i ++ ) {
+
+			const material = primitives[ i ].material === undefined
+				? createDefaultMaterial( this.cache )
+				: this.getDependency( 'material', primitives[ i ].material );
+
+			pending.push( material );
+
+		}
+
+		pending.push( parser.loadGeometries( primitives ) );
+
+		return Promise.all( pending ).then( function ( results ) {
+
+			const materials = results.slice( 0, results.length - 1 );
+			const geometries = results[ results.length - 1 ];
+
+			const meshes = [];
+
+			for ( let i = 0, il = geometries.length; i < il; i ++ ) {
+
+				const geometry = geometries[ i ];
+				const primitive = primitives[ i ];
+
+				// 1. create Mesh
+
+				let mesh;
+
+				const material = materials[ i ];
+
+				if ( primitive.mode === WEBGL_CONSTANTS.TRIANGLES ||
+						primitive.mode === WEBGL_CONSTANTS.TRIANGLE_STRIP ||
+						primitive.mode === WEBGL_CONSTANTS.TRIANGLE_FAN ||
+						primitive.mode === undefined ) {
+
+					// .isSkinnedMesh isn't in glTF spec. See ._markDefs()
+					mesh = meshDef.isSkinnedMesh === true
+						? new SkinnedMesh( geometry, material )
+						: new Mesh( geometry, material );
+
+					if ( mesh.isSkinnedMesh === true ) {
+
+						// normalize skin weights to fix malformed assets (see #15319)
+						mesh.normalizeSkinWeights();
+
+					}
+
+					if ( primitive.mode === WEBGL_CONSTANTS.TRIANGLE_STRIP ) {
+
+						mesh.geometry = toTrianglesDrawMode( mesh.geometry, TriangleStripDrawMode );
+
+					} else if ( primitive.mode === WEBGL_CONSTANTS.TRIANGLE_FAN ) {
+
+						mesh.geometry = toTrianglesDrawMode( mesh.geometry, TriangleFanDrawMode );
+
+					}
+
+				} else if ( primitive.mode === WEBGL_CONSTANTS.LINES ) {
+
+					mesh = new LineSegments( geometry, material );
+
+				} else if ( primitive.mode === WEBGL_CONSTANTS.LINE_STRIP ) {
+
+					mesh = new Line( geometry, material );
+
+				} else if ( primitive.mode === WEBGL_CONSTANTS.LINE_LOOP ) {
+
+					mesh = new LineLoop( geometry, material );
+
+				} else if ( primitive.mode === WEBGL_CONSTANTS.POINTS ) {
+
+					mesh = new Points( geometry, material );
+
+				} else {
+
+					throw new Error( 'THREE.GLTFLoader: Primitive mode unsupported: ' + primitive.mode );
+
+				}
+
+				if ( Object.keys( mesh.geometry.morphAttributes ).length > 0 ) {
+
+					updateMorphTargets( mesh, meshDef );
+
+				}
+
+				mesh.name = parser.createUniqueName( meshDef.name || ( 'mesh_' + meshIndex ) );
+
+				assignExtrasToUserData( mesh, meshDef );
+
+				if ( primitive.extensions ) addUnknownExtensionsToUserData( extensions, mesh, primitive );
+
+				parser.assignFinalMaterial( mesh );
+
+				meshes.push( mesh );
+
+			}
+
+			for ( let i = 0, il = meshes.length; i < il; i ++ ) {
+
+				parser.associations.set( meshes[ i ], {
+					meshes: meshIndex,
+					primitives: i
+				} );
+
+			}
+
+			if ( meshes.length === 1 ) {
+
+				if ( meshDef.extensions ) addUnknownExtensionsToUserData( extensions, meshes[ 0 ], meshDef );
+
+				return meshes[ 0 ];
+
+			}
+
+			const group = new Group();
+
+			if ( meshDef.extensions ) addUnknownExtensionsToUserData( extensions, group, meshDef );
+
+			parser.associations.set( group, { meshes: meshIndex } );
+
+			for ( let i = 0, il = meshes.length; i < il; i ++ ) {
+
+				group.add( meshes[ i ] );
+
+			}
+
+			return group;
+
+		} );
+
+	}
+
+	/**
+	 * Specification: https://github.com/KhronosGroup/glTF/tree/master/specification/2.0#cameras
+	 * @param {number} cameraIndex
+	 * @return {Promise<THREE.Camera>}
+	 */
+	loadCamera( cameraIndex ) {
+
+		let camera;
+		const cameraDef = this.json.cameras[ cameraIndex ];
+		const params = cameraDef[ cameraDef.type ];
+
+		if ( ! params ) {
+
+			console.warn( 'THREE.GLTFLoader: Missing camera parameters.' );
+			return;
+
+		}
+
+		if ( cameraDef.type === 'perspective' ) {
+
+			camera = new PerspectiveCamera( MathUtils.radToDeg( params.yfov ), params.aspectRatio || 1, params.znear || 1, params.zfar || 2e6 );
+
+		} else if ( cameraDef.type === 'orthographic' ) {
+
+			camera = new OrthographicCamera( - params.xmag, params.xmag, params.ymag, - params.ymag, params.znear, params.zfar );
+
+		}
+
+		if ( cameraDef.name ) camera.name = this.createUniqueName( cameraDef.name );
+
+		assignExtrasToUserData( camera, cameraDef );
+
+		return Promise.resolve( camera );
+
+	}
+
+	/**
+	 * Specification: https://github.com/KhronosGroup/glTF/tree/master/specification/2.0#skins
+	 * @param {number} skinIndex
+	 * @return {Promise<Skeleton>}
+	 */
+	loadSkin( skinIndex ) {
+
+		const skinDef = this.json.skins[ skinIndex ];
+
+		const pending = [];
+
+		for ( let i = 0, il = skinDef.joints.length; i < il; i ++ ) {
+
+			pending.push( this._loadNodeShallow( skinDef.joints[ i ] ) );
+
+		}
+
+		if ( skinDef.inverseBindMatrices !== undefined ) {
+
+			pending.push( this.getDependency( 'accessor', skinDef.inverseBindMatrices ) );
+
+		} else {
+
+			pending.push( null );
+
+		}
+
+		return Promise.all( pending ).then( function ( results ) {
+
+			const inverseBindMatrices = results.pop();
+			const jointNodes = results;
+
+			// Note that bones (joint nodes) may or may not be in the
+			// scene graph at this time.
+
+			const bones = [];
+			const boneInverses = [];
+
+			for ( let i = 0, il = jointNodes.length; i < il; i ++ ) {
+
+				const jointNode = jointNodes[ i ];
+
+				if ( jointNode ) {
+
+					bones.push( jointNode );
+
+					const mat = new Matrix4();
+
+					if ( inverseBindMatrices !== null ) {
+
+						mat.fromArray( inverseBindMatrices.array, i * 16 );
+
+					}
+
+					boneInverses.push( mat );
+
+				} else {
+
+					console.warn( 'THREE.GLTFLoader: Joint "%s" could not be found.', skinDef.joints[ i ] );
+
+				}
+
+			}
+
+			return new Skeleton( bones, boneInverses );
+
+		} );
+
+	}
+
+	/**
+	 * Specification: https://github.com/KhronosGroup/glTF/tree/master/specification/2.0#animations
+	 * @param {number} animationIndex
+	 * @return {Promise<AnimationClip>}
+	 */
+	loadAnimation( animationIndex ) {
+
+		const json = this.json;
+		const parser = this;
+
+		const animationDef = json.animations[ animationIndex ];
+		const animationName = animationDef.name ? animationDef.name : 'animation_' + animationIndex;
+
+		const pendingNodes = [];
+		const pendingInputAccessors = [];
+		const pendingOutputAccessors = [];
+		const pendingSamplers = [];
+		const pendingTargets = [];
+
+		for ( let i = 0, il = animationDef.channels.length; i < il; i ++ ) {
+
+			const channel = animationDef.channels[ i ];
+			const sampler = animationDef.samplers[ channel.sampler ];
+			const target = channel.target;
+			const name = target.node;
+			const input = animationDef.parameters !== undefined ? animationDef.parameters[ sampler.input ] : sampler.input;
+			const output = animationDef.parameters !== undefined ? animationDef.parameters[ sampler.output ] : sampler.output;
+
+			if ( target.node === undefined ) continue;
+
+			pendingNodes.push( this.getDependency( 'node', name ) );
+			pendingInputAccessors.push( this.getDependency( 'accessor', input ) );
+			pendingOutputAccessors.push( this.getDependency( 'accessor', output ) );
+			pendingSamplers.push( sampler );
+			pendingTargets.push( target );
+
+		}
+
+		return Promise.all( [
+
+			Promise.all( pendingNodes ),
+			Promise.all( pendingInputAccessors ),
+			Promise.all( pendingOutputAccessors ),
+			Promise.all( pendingSamplers ),
+			Promise.all( pendingTargets )
+
+		] ).then( function ( dependencies ) {
+
+			const nodes = dependencies[ 0 ];
+			const inputAccessors = dependencies[ 1 ];
+			const outputAccessors = dependencies[ 2 ];
+			const samplers = dependencies[ 3 ];
+			const targets = dependencies[ 4 ];
+
+			const tracks = [];
+
+			for ( let i = 0, il = nodes.length; i < il; i ++ ) {
+
+				const node = nodes[ i ];
+				const inputAccessor = inputAccessors[ i ];
+				const outputAccessor = outputAccessors[ i ];
+				const sampler = samplers[ i ];
+				const target = targets[ i ];
+
+				if ( node === undefined ) continue;
+
+				if ( node.updateMatrix ) {
+
+					node.updateMatrix();
+
+				}
+
+				const createdTracks = parser._createAnimationTracks( node, inputAccessor, outputAccessor, sampler, target );
+
+				if ( createdTracks ) {
+
+					for ( let k = 0; k < createdTracks.length; k ++ ) {
+
+						tracks.push( createdTracks[ k ] );
+
+					}
+
+				}
+
+			}
+
+			return new AnimationClip( animationName, undefined, tracks );
+
+		} );
+
+	}
+
+	createNodeMesh( nodeIndex ) {
+
+		const json = this.json;
+		const parser = this;
+		const nodeDef = json.nodes[ nodeIndex ];
+
+		if ( nodeDef.mesh === undefined ) return null;
+
+		return parser.getDependency( 'mesh', nodeDef.mesh ).then( function ( mesh ) {
+
+			const node = parser._getNodeRef( parser.meshCache, nodeDef.mesh, mesh );
+
+			// if weights are provided on the node, override weights on the mesh.
+			if ( nodeDef.weights !== undefined ) {
+
+				node.traverse( function ( o ) {
+
+					if ( ! o.isMesh ) return;
+
+					for ( let i = 0, il = nodeDef.weights.length; i < il; i ++ ) {
+
+						o.morphTargetInfluences[ i ] = nodeDef.weights[ i ];
+
+					}
+
+				} );
+
+			}
+
+			return node;
+
+		} );
+
+	}
+
+	/**
+	 * Specification: https://github.com/KhronosGroup/glTF/tree/master/specification/2.0#nodes-and-hierarchy
+	 * @param {number} nodeIndex
+	 * @return {Promise<Object3D>}
+	 */
+	loadNode( nodeIndex ) {
+
+		const json = this.json;
+		const parser = this;
+
+		const nodeDef = json.nodes[ nodeIndex ];
+
+		const nodePending = parser._loadNodeShallow( nodeIndex );
+
+		const childPending = [];
+		const childrenDef = nodeDef.children || [];
+
+		for ( let i = 0, il = childrenDef.length; i < il; i ++ ) {
+
+			childPending.push( parser.getDependency( 'node', childrenDef[ i ] ) );
+
+		}
+
+		const skeletonPending = nodeDef.skin === undefined
+			? Promise.resolve( null )
+			: parser.getDependency( 'skin', nodeDef.skin );
+
+		return Promise.all( [
+			nodePending,
+			Promise.all( childPending ),
+			skeletonPending
+		] ).then( function ( results ) {
+
+			const node = results[ 0 ];
+			const children = results[ 1 ];
+			const skeleton = results[ 2 ];
+
+			if ( skeleton !== null ) {
+
+				// This full traverse should be fine because
+				// child glTF nodes have not been added to this node yet.
+				node.traverse( function ( mesh ) {
+
+					if ( ! mesh.isSkinnedMesh ) return;
+
+					mesh.bind( skeleton, _identityMatrix );
+
+				} );
+
+			}
+
+			for ( let i = 0, il = children.length; i < il; i ++ ) {
+
+				node.add( children[ i ] );
+
+			}
+
+			return node;
+
+		} );
+
+	}
+
+	// ._loadNodeShallow() parses a single node.
+	// skin and child nodes are created and added in .loadNode() (no '_' prefix).
+	_loadNodeShallow( nodeIndex ) {
+
+		const json = this.json;
+		const extensions = this.extensions;
+		const parser = this;
+
+		// This method is called from .loadNode() and .loadSkin().
+		// Cache a node to avoid duplication.
+
+		if ( this.nodeCache[ nodeIndex ] !== undefined ) {
+
+			return this.nodeCache[ nodeIndex ];
+
+		}
+
+		const nodeDef = json.nodes[ nodeIndex ];
+
+		// reserve node's name before its dependencies, so the root has the intended name.
+		const nodeName = nodeDef.name ? parser.createUniqueName( nodeDef.name ) : '';
+
+		const pending = [];
+
+		const meshPromise = parser._invokeOne( function ( ext ) {
+
+			return ext.createNodeMesh && ext.createNodeMesh( nodeIndex );
+
+		} );
+
+		if ( meshPromise ) {
+
+			pending.push( meshPromise );
+
+		}
+
+		if ( nodeDef.camera !== undefined ) {
+
+			pending.push( parser.getDependency( 'camera', nodeDef.camera ).then( function ( camera ) {
+
+				return parser._getNodeRef( parser.cameraCache, nodeDef.camera, camera );
+
+			} ) );
+
+		}
+
+		parser._invokeAll( function ( ext ) {
+
+			return ext.createNodeAttachment && ext.createNodeAttachment( nodeIndex );
+
+		} ).forEach( function ( promise ) {
+
+			pending.push( promise );
+
+		} );
+
+		this.nodeCache[ nodeIndex ] = Promise.all( pending ).then( function ( objects ) {
+
+			let node;
+
+			// .isBone isn't in glTF spec. See ._markDefs
+			if ( nodeDef.isBone === true ) {
+
+				node = new Bone();
+
+			} else if ( objects.length > 1 ) {
+
+				node = new Group();
+
+			} else if ( objects.length === 1 ) {
+
+				node = objects[ 0 ];
+
+			} else {
+
+				node = new Object3D();
+
+			}
+
+			if ( node !== objects[ 0 ] ) {
+
+				for ( let i = 0, il = objects.length; i < il; i ++ ) {
+
+					node.add( objects[ i ] );
+
+				}
+
+			}
+
+			if ( nodeDef.name ) {
+
+				node.userData.name = nodeDef.name;
+				node.name = nodeName;
+
+			}
+
+			assignExtrasToUserData( node, nodeDef );
+
+			if ( nodeDef.extensions ) addUnknownExtensionsToUserData( extensions, node, nodeDef );
+
+			if ( nodeDef.matrix !== undefined ) {
+
+				const matrix = new Matrix4();
+				matrix.fromArray( nodeDef.matrix );
+				node.applyMatrix4( matrix );
+
+			} else {
+
+				if ( nodeDef.translation !== undefined ) {
+
+					node.position.fromArray( nodeDef.translation );
+
+				}
+
+				if ( nodeDef.rotation !== undefined ) {
+
+					node.quaternion.fromArray( nodeDef.rotation );
+
+				}
+
+				if ( nodeDef.scale !== undefined ) {
+
+					node.scale.fromArray( nodeDef.scale );
+
+				}
+
+			}
+
+			if ( ! parser.associations.has( node ) ) {
+
+				parser.associations.set( node, {} );
+
+			}
+
+			parser.associations.get( node ).nodes = nodeIndex;
+
+			return node;
+
+		} );
+
+		return this.nodeCache[ nodeIndex ];
+
+	}
+
+	/**
+	 * Specification: https://github.com/KhronosGroup/glTF/tree/master/specification/2.0#scenes
+	 * @param {number} sceneIndex
+	 * @return {Promise<Group>}
+	 */
+	loadScene( sceneIndex ) {
+
+		const extensions = this.extensions;
+		const sceneDef = this.json.scenes[ sceneIndex ];
+		const parser = this;
+
+		// Loader returns Group, not Scene.
+		// See: https://github.com/mrdoob/three.js/issues/18342#issuecomment-578981172
+		const scene = new Group();
+		if ( sceneDef.name ) scene.name = parser.createUniqueName( sceneDef.name );
+
+		assignExtrasToUserData( scene, sceneDef );
+
+		if ( sceneDef.extensions ) addUnknownExtensionsToUserData( extensions, scene, sceneDef );
+
+		const nodeIds = sceneDef.nodes || [];
+
+		const pending = [];
+
+		for ( let i = 0, il = nodeIds.length; i < il; i ++ ) {
+
+			pending.push( parser.getDependency( 'node', nodeIds[ i ] ) );
+
+		}
+
+		return Promise.all( pending ).then( function ( nodes ) {
+
+			for ( let i = 0, il = nodes.length; i < il; i ++ ) {
+
+				scene.add( nodes[ i ] );
+
+			}
+
+			// Removes dangling associations, associations that reference a node that
+			// didn't make it into the scene.
+			const reduceAssociations = ( node ) => {
+
+				const reducedAssociations = new Map();
+
+				for ( const [ key, value ] of parser.associations ) {
+
+					if ( key instanceof Material || key instanceof Texture ) {
+
+						reducedAssociations.set( key, value );
+
+					}
+
+				}
+
+				node.traverse( ( node ) => {
+
+					const mappings = parser.associations.get( node );
+
+					if ( mappings != null ) {
+
+						reducedAssociations.set( node, mappings );
+
+					}
+
+				} );
+
+				return reducedAssociations;
+
+			};
+
+			parser.associations = reduceAssociations( scene );
+
+			return scene;
+
+		} );
+
+	}
+
+	_createAnimationTracks( node, inputAccessor, outputAccessor, sampler, target ) {
+
+		const tracks = [];
+
+		const targetName = node.name ? node.name : node.uuid;
+		const targetNames = [];
+
+		if ( PATH_PROPERTIES[ target.path ] === PATH_PROPERTIES.weights ) {
+
+			node.traverse( function ( object ) {
+
+				if ( object.morphTargetInfluences ) {
+
+					targetNames.push( object.name ? object.name : object.uuid );
+
+				}
+
+			} );
+
+		} else {
+
+			targetNames.push( targetName );
+
+		}
+
+		let TypedKeyframeTrack;
+
+		switch ( PATH_PROPERTIES[ target.path ] ) {
+
+			case PATH_PROPERTIES.weights:
+
+				TypedKeyframeTrack = NumberKeyframeTrack;
+				break;
+
+			case PATH_PROPERTIES.rotation:
+
+				TypedKeyframeTrack = QuaternionKeyframeTrack;
+				break;
+
+			case PATH_PROPERTIES.position:
+			case PATH_PROPERTIES.scale:
+
+				TypedKeyframeTrack = VectorKeyframeTrack;
+				break;
+
+			default:
+
+				switch ( outputAccessor.itemSize ) {
+
+					case 1:
+						TypedKeyframeTrack = NumberKeyframeTrack;
+						break;
+					case 2:
+					case 3:
+					default:
+						TypedKeyframeTrack = VectorKeyframeTrack;
+						break;
+
+				}
+
+				break;
+
+		}
+
+		const interpolation = sampler.interpolation !== undefined ? INTERPOLATION[ sampler.interpolation ] : InterpolateLinear;
+
+
+		const outputArray = this._getArrayFromAccessor( outputAccessor );
+
+		for ( let j = 0, jl = targetNames.length; j < jl; j ++ ) {
+
+			const track = new TypedKeyframeTrack(
+				targetNames[ j ] + '.' + PATH_PROPERTIES[ target.path ],
+				inputAccessor.array,
+				outputArray,
+				interpolation
+			);
+
+			// Override interpolation with custom factory method.
+			if ( sampler.interpolation === 'CUBICSPLINE' ) {
+
+				this._createCubicSplineTrackInterpolant( track );
+
+			}
+
+			tracks.push( track );
+
+		}
+
+		return tracks;
+
+	}
+
+	_getArrayFromAccessor( accessor ) {
+
+		let outputArray = accessor.array;
+
+		if ( accessor.normalized ) {
+
+			const scale = getNormalizedComponentScale( outputArray.constructor );
+			const scaled = new Float32Array( outputArray.length );
+
+			for ( let j = 0, jl = outputArray.length; j < jl; j ++ ) {
+
+				scaled[ j ] = outputArray[ j ] * scale;
+
+			}
+
+			outputArray = scaled;
+
+		}
+
+		return outputArray;
+
+	}
+
+	_createCubicSplineTrackInterpolant( track ) {
+
+		track.createInterpolant = function InterpolantFactoryMethodGLTFCubicSpline( result ) {
+
+			// A CUBICSPLINE keyframe in glTF has three output values for each input value,
+			// representing inTangent, splineVertex, and outTangent. As a result, track.getValueSize()
+			// must be divided by three to get the interpolant's sampleSize argument.
+
+			const interpolantType = ( this instanceof QuaternionKeyframeTrack ) ? GLTFCubicSplineQuaternionInterpolant : GLTFCubicSplineInterpolant;
+
+			return new interpolantType( this.times, this.values, this.getValueSize() / 3, result );
+
+		};
+
+		// Mark as CUBICSPLINE. `track.getInterpolation()` doesn't support custom interpolants.
+		track.createInterpolant.isInterpolantFactoryMethodGLTFCubicSpline = true;
+
+	}
+
+}
+
+/**
+ * @param {BufferGeometry} geometry
+ * @param {GLTF.Primitive} primitiveDef
+ * @param {GLTFParser} parser
+ */
+function computeBounds( geometry, primitiveDef, parser ) {
+
+	const attributes = primitiveDef.attributes;
+
+	const box = new Box3();
+
+	if ( attributes.POSITION !== undefined ) {
+
+		const accessor = parser.json.accessors[ attributes.POSITION ];
+
+		const min = accessor.min;
+		const max = accessor.max;
+
+		// glTF requires 'min' and 'max', but VRM (which extends glTF) currently ignores that requirement.
+
+		if ( min !== undefined && max !== undefined ) {
+
+			box.set(
+				new Vector3( min[ 0 ], min[ 1 ], min[ 2 ] ),
+				new Vector3( max[ 0 ], max[ 1 ], max[ 2 ] )
+			);
+
+			if ( accessor.normalized ) {
+
+				const boxScale = getNormalizedComponentScale( WEBGL_COMPONENT_TYPES[ accessor.componentType ] );
+				box.min.multiplyScalar( boxScale );
+				box.max.multiplyScalar( boxScale );
+
+			}
+
+		} else {
+
+			console.warn( 'THREE.GLTFLoader: Missing min/max properties for accessor POSITION.' );
+
+			return;
+
+		}
+
+	} else {
+
+		return;
+
+	}
+
+	const targets = primitiveDef.targets;
+
+	if ( targets !== undefined ) {
+
+		const maxDisplacement = new Vector3();
+		const vector = new Vector3();
+
+		for ( let i = 0, il = targets.length; i < il; i ++ ) {
+
+			const target = targets[ i ];
+
+			if ( target.POSITION !== undefined ) {
+
+				const accessor = parser.json.accessors[ target.POSITION ];
+				const min = accessor.min;
+				const max = accessor.max;
+
+				// glTF requires 'min' and 'max', but VRM (which extends glTF) currently ignores that requirement.
+
+				if ( min !== undefined && max !== undefined ) {
+
+					// we need to get max of absolute components because target weight is [-1,1]
+					vector.setX( Math.max( Math.abs( min[ 0 ] ), Math.abs( max[ 0 ] ) ) );
+					vector.setY( Math.max( Math.abs( min[ 1 ] ), Math.abs( max[ 1 ] ) ) );
+					vector.setZ( Math.max( Math.abs( min[ 2 ] ), Math.abs( max[ 2 ] ) ) );
+
+
+					if ( accessor.normalized ) {
+
+						const boxScale = getNormalizedComponentScale( WEBGL_COMPONENT_TYPES[ accessor.componentType ] );
+						vector.multiplyScalar( boxScale );
+
+					}
+
+					// Note: this assumes that the sum of all weights is at most 1. This isn't quite correct - it's more conservative
+					// to assume that each target can have a max weight of 1. However, for some use cases - notably, when morph targets
+					// are used to implement key-frame animations and as such only two are active at a time - this results in very large
+					// boxes. So for now we make a box that's sometimes a touch too small but is hopefully mostly of reasonable size.
+					maxDisplacement.max( vector );
+
+				} else {
+
+					console.warn( 'THREE.GLTFLoader: Missing min/max properties for accessor POSITION.' );
+
+				}
+
+			}
+
+		}
+
+		// As per comment above this box isn't conservative, but has a reasonable size for a very large number of morph targets.
+		box.expandByVector( maxDisplacement );
+
+	}
+
+	geometry.boundingBox = box;
+
+	const sphere = new Sphere();
+
+	box.getCenter( sphere.center );
+	sphere.radius = box.min.distanceTo( box.max ) / 2;
+
+	geometry.boundingSphere = sphere;
+
+}
+
+/**
+ * @param {BufferGeometry} geometry
+ * @param {GLTF.Primitive} primitiveDef
+ * @param {GLTFParser} parser
+ * @return {Promise<BufferGeometry>}
+ */
+function addPrimitiveAttributes( geometry, primitiveDef, parser ) {
+
+	const attributes = primitiveDef.attributes;
+
+	const pending = [];
+
+	function assignAttributeAccessor( accessorIndex, attributeName ) {
+
+		return parser.getDependency( 'accessor', accessorIndex )
+			.then( function ( accessor ) {
+
+				geometry.setAttribute( attributeName, accessor );
+
+			} );
+
+	}
+
+	for ( const gltfAttributeName in attributes ) {
+
+		const threeAttributeName = ATTRIBUTES[ gltfAttributeName ] || gltfAttributeName.toLowerCase();
+
+		// Skip attributes already provided by e.g. Draco extension.
+		if ( threeAttributeName in geometry.attributes ) continue;
+
+		pending.push( assignAttributeAccessor( attributes[ gltfAttributeName ], threeAttributeName ) );
+
+	}
+
+	if ( primitiveDef.indices !== undefined && ! geometry.index ) {
+
+		const accessor = parser.getDependency( 'accessor', primitiveDef.indices ).then( function ( accessor ) {
+
+			geometry.setIndex( accessor );
+
+		} );
+
+		pending.push( accessor );
+
+	}
+
+	if ( ColorManagement.workingColorSpace !== LinearSRGBColorSpace && 'COLOR_0' in attributes ) {
+
+		console.warn( `THREE.GLTFLoader: Converting vertex colors from "srgb-linear" to "${ColorManagement.workingColorSpace}" not supported.` );
+
+	}
+
+	assignExtrasToUserData( geometry, primitiveDef );
+
+	computeBounds( geometry, primitiveDef, parser );
+
+	return Promise.all( pending ).then( function () {
+
+		return primitiveDef.targets !== undefined
+			? addMorphTargets( geometry, primitiveDef.targets, parser )
+			: geometry;
+
+	} );
+
+}
+
+
+
+return GLTFLoader;
+})();
+
+const VERSION = "1.70.0";
+const DEG = Math.PI / 180;
+const WORLD_SIZE = 12; // models are normalised so their footprint is this wide
+const GLOW_NAME = /bulb|shade|glow|screen|display/i;
+const TV_ALT = new THREE.Color("#b08cff");
+const MEDIA_OFF = new Set(["off", "standby", "unavailable", "unknown"]);
+
+const DEMO_ENTITIES = [
+  { entity: "light.living_room", object: "lamp_living", name: "Living room lamp" },
+  { entity: "light.kitchen", object: "lamp_kitchen", name: "Kitchen lamp" },
+  { entity: "light.bedroom", object: "lamp_bedroom", name: "Bedside lamp" },
+  { entity: "light.bathroom", object: "lamp_bath", name: "Mirror light" },
+  { entity: "media_player.living_room_tv", object: "tv_living", name: "Living room TV" },
+];
+
+const ON_STATES = new Set(["on", "open", "playing", "home", "heat", "cool", "auto", "heat_cool", "dry", "fan_only"]);
+const ONE_SHOT = new Set(["scene", "script", "button", "input_button"]);
+const COLOR_MODES = ["hs", "rgb", "rgbw", "rgbww", "xy"];
+const SWATCHES_CT = [
+  { k: 2700, css: "#ffb46b", label: "Warm white" },
+  { k: 4000, css: "#ffe4c4", label: "Neutral white" },
+  { k: 6000, css: "#eef3ff", label: "Cool white" },
+];
+const SWATCHES_RGB = [
+  { rgb: [255, 64, 48], label: "Red" },
+  { rgb: [255, 140, 0], label: "Orange" },
+  { rgb: [80, 210, 100], label: "Green" },
+  { rgb: [40, 190, 255], label: "Cyan" },
+  { rgb: [70, 90, 255], label: "Blue" },
+  { rgb: [175, 80, 255], label: "Purple" },
+  { rgb: [255, 80, 180], label: "Pink" },
+];
+const ICON = {
+  power: "M16.56 5.44l-1.45 1.45A5.97 5.97 0 0 1 18 12a6 6 0 0 1-12 0c0-2.17 1.16-4.06 2.88-5.12L7.44 5.44A7.96 7.96 0 0 0 4 12a8 8 0 0 0 16 0c0-2.72-1.36-5.12-3.44-6.56zM13 3h-2v10h2V3z",
+  wifi: "M1 9l2 2c4.97-4.97 13.03-4.97 18 0l2-2C16.93 2.93 7.08 2.93 1 9zm8 8l3 3 3-3a4.24 4.24 0 0 0-6 0zm-4-4l2 2a7.07 7.07 0 0 1 10 0l2-2C15.14 9.14 8.87 9.14 5 13z",
+  down: "M20 12l-1.41-1.41L13 16.17V4h-2v12.17l-5.58-5.59L4 12l8 8 8-8z",
+  up: "M4 12l1.41 1.41L11 7.83V20h2V7.83l5.58 5.59L20 12l-8-8-8 8z",
+  devices: "M4 6h18V4H4c-1.1 0-2 .9-2 2v11H0v3h14v-3H4V6zm19 2h-6c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h6c.55 0 1-.45 1-1V9c0-.55-.45-1-1-1zm-1 9h-4v-7h4v7z",
+  phone: "M17 1.01L7 1c-1.1 0-2 .9-2 2v18c0 1.1.9 2 2 2h10c1.1 0 2-.9 2-2V3c0-1.1-.9-1.99-2-1.99zM17 19H7V5h10v14z",
+  pc: "M21 2H3c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h7v2H8v2h8v-2h-2v-2h7c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H3V4h18v12z",
+  thermo: "M15 13V5a3 3 0 0 0-6 0v8a5 5 0 1 0 6 0zm-3-9a1 1 0 0 1 1 1v3h-2V5a1 1 0 0 1 1-1z",
+  close: "M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z",
+  up: "M7.41 15.41L12 10.83l4.59 4.58L18 14l-6-6-6 6z",
+  down: "M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z",
+  stop: "M6 6h12v12H6z",
+  playpause: "M3 5v14l8-7zm10 0h3v14h-3zm5 0h3v14h-3z",
+  topview: "M12 2 3 6.5v11L12 22l9-4.5v-11zm0 2.2 6.5 3.3L12 10.8 5.5 7.5zM5 9.2l6 3v7.3l-6-3zm8 10.3v-7.3l6-3v7.3z",
+  home: "M12 3 2 11.5l1.3 1.5L5 11.6V21h5v-6h4v6h5v-9.4l1.7 1.4 1.3-1.5z",
+  play: "M8 5v14l11-7z",
+  minus: "M19 13H5v-2h14v2z",
+  plus: "M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z",
+};
+Object.assign(ICON, {
+  list: "M3 5h2v2H3zm4 0h14v2H7zM3 11h2v2H3zm4 0h14v2H7zm-4 6h2v2H3zm4 0h14v2H7z",
+  bulb: "M9 21h6v-1H9v1zm3-19a7 7 0 0 0-4 12.74V17a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-2.26A7 7 0 0 0 12 2z",
+  blind: "M3 3h18v2H3zm1 3h16v10H4zm7 11h2v3h-2z",
+  fan: "M12 10.5a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3zM12 2c3.6 0 4.6 2.8 2.8 5.7L13 10.4h-2L9.3 7.7C7.6 4.8 8.4 2 12 2zm9.6 13.2c-1.8 3.1-4.8 2.6-6.5-.3L13.8 12l1-1.7 3.1-.2c3.4-.2 5.5 1.9 3.7 5.1zM2.4 15.2C.6 12 2.7 9.9 6.1 10.1l3.1.2 1 1.7-1.3 2.9c-1.7 2.9-4.7 3.4-6.5.3z",
+  camera: "M17 10.5V7a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3.5l4 4v-11l-4 4z",
+  door: "M6 2h12v20h-2V4H8v18H6zm8 9h1.5v2H14z",
+  window: "M4 3h16v18H4zm2 2v6h5V5zm7 0v6h5V5zm-7 8v6h5v-6zm7 0v6h5v-6z",
+  dot: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z",
+  chev: "M9 6l6 6-6 6-1.4-1.4L12.2 12 7.6 7.4z",
+  sparkle: "M12 2l1.9 5.6L19.5 9.5l-5.6 1.9L12 17l-1.9-5.6L4.5 9.5l5.6-1.9zM19 14l.95 2.55L22.5 17.5l-2.55.95L19 21l-.95-2.55-2.55-.95 2.55-.95zM5 15l.7 1.8 1.8.7-1.8.7L5 20l-.7-1.8-1.8-.7 1.8-.7z",
+  minus: "M5 11h14v2H5z",
+  plus: "M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6z",
+  eyeoff: "M12 6.5c3.8 0 7.2 2.1 8.8 5.5-.6 1.3-1.5 2.4-2.6 3.3l1.4 1.4c1.5-1.3 2.7-2.9 3.4-4.7C21.3 7.6 17 4.5 12 4.5c-1.3 0-2.5.2-3.7.6l1.7 1.7c.6-.2 1.3-.3 2-.3zM2.7 3.3 1.3 4.7l2.6 2.6A11.9 11.9 0 0 0 1 12c1.7 4.4 6 7.5 11 7.5 1.6 0 3.1-.3 4.5-.9l3.2 3.2 1.4-1.4zM12 17.5c-3.8 0-7.2-2.1-8.8-5.5.7-1.4 1.7-2.6 2.9-3.5l2 2a4 4 0 0 0 5.4 5.4l1.6 1.6c-1 .3-2 .5-3.1.5z",
+  plug: "M16 7V3h-2v4h-4V3H8v4H7a1 1 0 0 0-1 1v4a6 6 0 0 0 5 5.9V22h2v-4.1A6 6 0 0 0 18 12V8a1 1 0 0 0-1-1z",
+  grid: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
+  check: "M9 16.2l-4.2-4.2-1.4 1.4L9 19 21 7l-1.4-1.4z",
+  undo: "M12.5 8c-2.65 0-5.05 1-6.9 2.6L2 7v9h9l-3.62-3.62A7.95 7.95 0 0 1 12.5 10c3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 10.53 17.15 8 12.5 8z",
+  collapse: "M12 10.2L7.8 6l1.4-1.4L12 7.4l2.8-2.8L16.2 6zM12 13.8l4.2 4.2-1.4 1.4L12 16.6l-2.8 2.8L7.8 18z",
+  expand: "M12 5.8l4.2 4.2-1.4 1.4L12 8.6l-2.8 2.8-1.4-1.4zM12 18.2l-4.2-4.2 1.4-1.4 2.8 2.8 2.8-2.8 1.4 1.4z",
+  vacuum: "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18zm0 1.8a7.2 7.2 0 1 1 0 14.4a7.2 7.2 0 1 1 0-14.4zM7.6 8.2h8.8v1.6H7.6zM12 12.2a2 2 0 1 0 0 4a2 2 0 1 0 0-4z",
+  pause: "M6 5h4v14H6zm8 0h4v14h-4z",
+  locate: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8zm8.94 3A8.99 8.99 0 0 0 13 3.06V1h-2v2.06A8.99 8.99 0 0 0 3.06 11H1v2h2.06A8.99 8.99 0 0 0 11 20.94V23h2v-2.06A8.99 8.99 0 0 0 20.94 13H23v-2h-2.06zM12 19a7 7 0 1 1 0-14 7 7 0 0 1 0 14z",
+  edit: "M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z",
+  bolt: "M7 2v11h3v9l7-12h-4l4-8z",
+  clock: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 18a8 8 0 1 1 0-16 8 8 0 0 1 0 16zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z",
+  moon: "M12.34 2.02A10 10 0 1 0 21.98 11.7 7.5 7.5 0 0 1 12.34 2.02z",
+  auto: "M10.85 12.65h2.3L12 9l-1.15 3.65zM20 8.69V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12 20 8.69zM14.3 16l-.7-2h-3.2l-.7 2H7.8L11 7h2l3.2 9h-1.9z",
+  osc: "M12 5C8 5 4.6 7.2 3 10.5l1.8.9C6.1 8.8 8.8 7 12 7s5.9 1.8 7.2 4.4l1.8-.9C19.4 7.2 16 5 12 5zM2 15.5l.6-6 5 3.4zm20 0-.6-6-5 3.4zM12 11.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5z",
+  airflow: "M11 21V7.83l-4.59 4.58L5 11l7-7 7 7-1.41 1.41L13 7.83V21z",
+  flame: "M13.5 1s.74 2.65.74 4.8c0 2.06-1.35 3.73-3.41 3.73-2.07 0-3.63-1.67-3.63-3.73l.03-.36C5.21 7.51 4 10.62 4 14c0 4.42 3.58 8 8 8s8-3.58 8-8C20 8.61 17.41 3.8 13.5 1zM11.71 19c-1.78 0-3.22-1.4-3.22-3.14 0-1.62 1.05-2.76 2.81-3.12 1.77-.36 3.6-1.21 4.62-2.58.39 1.29.59 2.65.59 4.04 0 2.65-2.15 4.8-4.8 4.8z",
+  eye: "M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5C21.27 7.61 17 4.5 12 4.5zM12 17a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z",
+});
+const ICON_EVENODD = new Set(["window", "door", "vacuum"]);
+const svg = (name) =>
+  `<svg viewBox="0 0 24 24" aria-hidden="true"><path${ICON_EVENODD.has(name) ? ' fill-rule="evenodd"' : ""} d="${ICON[name]}"/></svg>`;
+
+/* ------------------------------------------------------------ weather icons */
+
+const WX_TEXT = {
+  "clear-night": "Clear", sunny: "Sunny", partlycloudy: "Partly cloudy", cloudy: "Cloudy", rainy: "Rain",
+  pouring: "Heavy rain", snowy: "Snow", "snowy-rainy": "Sleet", lightning: "Thunder", "lightning-rainy": "Thunderstorms",
+  fog: "Fog", hail: "Hail", windy: "Windy", "windy-variant": "Windy", exceptional: "Warning",
+};
+
+/** Small colour weather icons drawn as SVG (sun, moon, clouds, rain, snow, thunder, fog, wind). */
+function wxIcon(cond, night = false) {
+  const sun = (x, y, r) => {
+    let rays = "";
+    for (let i = 0; i < 8; i++) {
+      const a = (i * Math.PI) / 4, c = Math.cos(a), s = Math.sin(a);
+      rays += `<line x1="${x + c * (r + 4)}" y1="${y + s * (r + 4)}" x2="${x + c * (r + 9)}" y2="${y + s * (r + 9)}"/>`;
+    }
+    return `<g stroke="#ffc53d" stroke-width="3.2" stroke-linecap="round">${rays}</g><circle cx="${x}" cy="${y}" r="${r}" fill="#ffc53d"/>`;
+  };
+  const moon = (x, y, r) => `<path d="M${x + r * 0.35} ${y - r} a${r} ${r} 0 1 0 ${r * 0.65} ${r * 1.55} a${r * 0.78} ${r * 0.78} 0 0 1 -${r * 0.65} -${r * 1.55}z" fill="#e9e6ff"/>`;
+  const cloud = (dx = 0, dy = 0, k = 1, fill = "#f2f4f8") =>
+    `<path transform="translate(${dx} ${dy}) scale(${k})" d="M17 50h30a11 11 0 0 0 1.2-21.9A15 15 0 0 0 19.4 25 12.5 12.5 0 0 0 17 50z" fill="${fill}"/>`;
+  const drops = (n, col = "#5ac8fa") => {
+    let d = "";
+    for (let i = 0; i < n; i++) d += `<line x1="${22 + i * 9}" y1="54" x2="${19 + i * 9}" y2="61"/>`;
+    return `<g stroke="${col}" stroke-width="3" stroke-linecap="round">${d}</g>`;
+  };
+  const flakes = (n) => {
+    let d = "";
+    for (let i = 0; i < n; i++) d += `<circle cx="${22 + i * 10}" cy="${56 + (i % 2) * 4}" r="2.4"/>`;
+    return `<g fill="#ffffff">${d}</g>`;
+  };
+  const bolt = `<path d="M33 46l-7 10h6l-3 8 10-12h-6l4-6z" fill="#ffd60a"/>`;
+  const orb = night ? moon(20, 22, 11) : sun(22, 22, 9);
+  let body;
+  switch (cond) {
+    case "clear-night": body = moon(30, 30, 18); break;
+    case "sunny": body = sun(32, 32, 13); break;
+    case "partlycloudy": body = orb + cloud(4, 4, 0.92); break;
+    case "cloudy": body = cloud(-6, -6, 0.8, "#aab1bd") + cloud(4, 2, 0.95); break;
+    case "rainy": body = cloud(0, -6) + drops(3); break;
+    case "pouring": body = cloud(0, -6, 1, "#aab1bd") + drops(4, "#3a9bff"); break;
+    case "snowy": body = cloud(0, -6) + flakes(3); break;
+    case "snowy-rainy": body = cloud(0, -6) + drops(2) + `<circle cx="41" cy="58" r="2.4" fill="#fff"/>`; break;
+    case "hail": body = cloud(0, -6) + `<g fill="#d8f1ff">${[22, 32, 42].map((x) => `<circle cx="${x}" cy="58" r="3"/>`).join("")}</g>`; break;
+    case "lightning": body = cloud(0, -8, 1, "#aab1bd") + bolt; break;
+    case "lightning-rainy": body = cloud(0, -8, 1, "#aab1bd") + bolt + `<g stroke="#5ac8fa" stroke-width="3" stroke-linecap="round"><line x1="21" y1="55" x2="18" y2="61"/><line x1="46" y1="55" x2="43" y2="61"/></g>`; break;
+    case "fog": body = cloud(0, -10, 1, "#c9ced8") + `<g stroke="#e4e7ee" stroke-width="3" stroke-linecap="round"><line x1="14" y1="48" x2="50" y2="48"/><line x1="18" y1="55" x2="46" y2="55"/></g>`; break;
+    case "windy": case "windy-variant":
+      body = `<g fill="none" stroke="#dfe6f2" stroke-width="3.4" stroke-linecap="round"><path d="M8 26h32a7 7 0 1 0-7-7"/><path d="M8 36h42a7 7 0 1 1-7 7"/><path d="M8 46h20"/></g>`; break;
+    default: body = `<circle cx="32" cy="32" r="20" fill="#ff9f0a"/><path d="M32 20v15M32 41v2" stroke="#fff" stroke-width="4.5" stroke-linecap="round"/>`;
+  }
+  return `<svg viewBox="0 0 64 64" aria-hidden="true">${body}</svg>`;
+}
+
+function kelvinToRgb(k) {
+  const t = k / 100;
+  let r, g, b;
+  if (t <= 66) {
+    r = 255;
+    g = 99.47 * Math.log(t) - 161.12;
+    b = t <= 19 ? 0 : 138.52 * Math.log(t - 10) - 305.04;
+  } else {
+    r = 329.7 * Math.pow(t - 60, -0.1332);
+    g = 288.12 * Math.pow(t - 60, -0.0755);
+    b = 255;
+  }
+  return [r, g, b].map((v) => Math.round(Math.min(255, Math.max(0, v))));
+}
+
+const wrapPi = (a) => {
+  a = (a + Math.PI) % (2 * Math.PI);
+  if (a < 0) a += 2 * Math.PI;
+  return a - Math.PI;
+};
+const easeOutBack = (t) => {
+  const c1 = 1.1, c3 = c1 + 1;
+  return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+};
+const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+const easeInOutCubic = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+
+/* ------------------------------------------------------------ prop models (units: cm) */
+
+const PROPS = {
+  /**
+   * A ready-made 3D model (.glb or .gltf), e.g. a robot vacuum: `url:` the file, `size:` its width in cm
+   * (without it the file is read as metres, the glTF standard). It stands on its position, centred.
+   */
+  model(name, opts = {}) {
+    const g = new THREE.Group();
+    const src = opts._scene;
+    if (!src) {
+      // the file couldn't be loaded: a plain white puck the same size, so the device is still there to tap
+      const w = Number(opts.size) || 35;
+      const body = new THREE.Mesh(new THREE.CylinderGeometry(w / 2, w / 2, w * 0.24, 48), new THREE.MeshStandardMaterial({ color: 0xf2f2f4, roughness: 0.45 }));
+      body.position.y = w * 0.12;
+      body.name = `${name}_standin`;
+      g.add(body);
+      return g;
+    }
+    const m = src.clone(true);
+    m.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(m);
+    const size = box.getSize(new THREE.Vector3());
+    const k = opts.size ? Number(opts.size) / (Math.max(size.x, size.z) || 1) : 100;
+    m.scale.multiplyScalar(k);
+    m.position.set((-(box.min.x + box.max.x) / 2) * k, -box.min.y * k, (-(box.min.z + box.max.z) / 2) * k);
+    m.name = `${name}_model`;
+    g.add(m);
+    return g;
+  },
+
+  /** Small artificial potted plant (IKEA FEJKA style): matte white pot, leafy green bush. */
+  fejka_plant(name, opts = {}) {
+    const g = new THREE.Group();
+    let seed = 7;
+    const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+    const pot = new THREE.Mesh(
+      new THREE.CylinderGeometry(5.2, 4.3, 8.5, 40),
+      new THREE.MeshStandardMaterial({ color: opts.pot_color || 0xf1efea, roughness: 0.92, metalness: 0 })
+    );
+    pot.position.y = 4.25;
+    pot.name = `${name}_pot`;
+    const rim = new THREE.Mesh(new THREE.TorusGeometry(5.1, 0.35, 8, 40), pot.material);
+    rim.rotation.x = Math.PI / 2;
+    rim.position.y = 8.5;
+    const soil = new THREE.Mesh(new THREE.CircleGeometry(4.9, 32), new THREE.MeshStandardMaterial({ color: 0x2b2118, roughness: 1 }));
+    soil.rotation.x = -Math.PI / 2;
+    soil.position.y = 7.9;
+    const leaves = new THREE.Group();
+    leaves.name = `${name}_leaves`;
+    const greens = [0x3f7a3a, 0x4c8a42, 0x356b33, 0x5a9a4b].map((c) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.55, side: THREE.DoubleSide }));
+    const stemMat = new THREE.MeshStandardMaterial({ color: 0x4d6b35, roughness: 0.7 });
+    const leafGeo = new THREE.SphereGeometry(1, 12, 8);
+    for (let i = 0; i < 34; i++) {
+      const ang = rnd() * Math.PI * 2;
+      const lean = 0.25 + rnd() * 0.75;              // how far the stem leans out
+      const len = 6 + rnd() * 9;
+      const dir = new THREE.Vector3(Math.cos(ang) * lean, 1, Math.sin(ang) * lean).normalize();
+      const base = new THREE.Vector3(Math.cos(ang) * rnd() * 1.5, 8, Math.sin(ang) * rnd() * 1.5);
+      const tip = base.clone().addScaledVector(dir, len);
+      const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.18, len, 5), stemMat);
+      stem.position.copy(base).lerp(tip, 0.5);
+      stem.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+      leaves.add(stem);
+      const leaf = new THREE.Mesh(leafGeo, greens[i % greens.length]);
+      leaf.scale.set(1.3 + rnd() * 0.6, 0.22, 2.4 + rnd() * 1.2); // flat oval leaf
+      leaf.position.copy(tip);
+      leaf.lookAt(tip.clone().add(dir));
+      leaf.rotateX(-0.6 - rnd() * 0.5);               // leaves droop outwards a little
+      leaves.add(leaf);
+    }
+    g.add(pot, rim, soil, leaves);
+    return g;
+  },
+
+  /** UniFi access point (U6 Lite / U6+ style): white ceiling disc with an LED ring underneath. */
+  unifi_ap(name) {
+    const g = new THREE.Group();
+    const white = new THREE.MeshStandardMaterial({ color: 0xf3f4f6, roughness: 0.45, metalness: 0.02 });
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(8, 8, 2.4, 64), white);
+    body.position.y = -1.2;
+    body.name = `${name}_body`;
+    const dome = new THREE.Mesh(new THREE.SphereGeometry(8, 64, 8, 0, Math.PI * 2, Math.PI / 2, Math.PI / 2), white);
+    dome.scale.y = 0.12;
+    dome.position.y = -2.4;
+    dome.name = `${name}_dome`;
+    const ring = new THREE.Mesh(
+      new THREE.TorusGeometry(3.4, 0.28, 12, 72),
+      new THREE.MeshStandardMaterial({ color: 0xdfe5ec, roughness: 0.3 })
+    );
+    ring.rotation.x = Math.PI / 2;
+    ring.position.y = -3.35;
+    ring.name = `${name}_ring`;
+    const logo = new THREE.Mesh(new THREE.CircleGeometry(0.9, 32), new THREE.MeshStandardMaterial({ color: 0xc9ced6, roughness: 0.5 }));
+    logo.rotation.x = Math.PI / 2;
+    logo.position.y = -3.38;
+    logo.name = `${name}_logo`;
+    g.add(body, dome, ring, logo);
+    return g;
+  },
+
+  /** UniFi Cloud Gateway Ultra: small white rounded box, status light bar on the front, ports on the back. */
+  unifi_cgu(name) {
+    const g = new THREE.Group();
+    const W = 14.2, D = 12.8, H = 3.0, r = 1.6;
+    const shape = new THREE.Shape();
+    shape.moveTo(-W / 2 + r, -D / 2);
+    shape.lineTo(W / 2 - r, -D / 2);
+    shape.quadraticCurveTo(W / 2, -D / 2, W / 2, -D / 2 + r);
+    shape.lineTo(W / 2, D / 2 - r);
+    shape.quadraticCurveTo(W / 2, D / 2, W / 2 - r, D / 2);
+    shape.lineTo(-W / 2 + r, D / 2);
+    shape.quadraticCurveTo(-W / 2, D / 2, -W / 2, D / 2 - r);
+    shape.lineTo(-W / 2, -D / 2 + r);
+    shape.quadraticCurveTo(-W / 2, -D / 2, -W / 2 + r, -D / 2);
+    const geo = new THREE.ExtrudeGeometry(shape, { depth: H - 0.6, bevelEnabled: true, bevelThickness: 0.3, bevelSize: 0.3, bevelSegments: 3, curveSegments: 10 });
+    geo.rotateX(-Math.PI / 2);
+    geo.translate(0, 0.3, 0);
+    const body = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0xeef0f2, roughness: 0.32, metalness: 0.08 }));
+    body.name = `${name}_body`;
+    // front: -z in the shape is the back after the rotation, so the front faces +z
+    const led = new THREE.Mesh(new THREE.BoxGeometry(4.6, 0.32, 0.12), new THREE.MeshStandardMaterial({ color: 0xdfe5ec, roughness: 0.3 }));
+    led.position.set(0, H * 0.52, D / 2 + 0.33);
+    led.name = `${name}_led`;
+    const dark = new THREE.MeshStandardMaterial({ color: 0x1d1f22, roughness: 0.6 });
+    const ports = new THREE.Group();
+    ports.name = `${name}_ports`;
+    for (let i = 0; i < 5; i++) {
+      const port = new THREE.Mesh(new THREE.BoxGeometry(1.45, 1.15, 0.3), dark);
+      port.position.set(-4.6 + i * 1.8 + (i === 4 ? 0.5 : 0), 1.35, -D / 2 - 0.2); // 4 LAN + 1 WAN
+      ports.add(port);
+    }
+    const usb = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.35, 0.3), dark);
+    usb.position.set(5.4, 1.35, -D / 2 - 0.2);
+    ports.add(usb);
+    g.add(body, led, ports);
+    return g;
+  },
+};
+
+class House3DCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this._local = {}; // demo state for entities that don't exist in HA
+    this._bindings = [];
+    this._pointers = new Map();
+    this._dirty = true;
+  }
+
+  static getStubConfig() {
+    return {};
+  }
+
+  getCardSize() {
+    const h = this._config?.height;
+    return Math.ceil((h === "full" ? 800 : Number(h) || 450) / 50);
+  }
+
+  setConfig(config) {
+    if (!config) throw new Error("Invalid configuration");
+    const c = {
+      height: 450,
+      snap: true,
+      snap_azimuths: null,
+      snap_step: 45,
+      snap_elevations: [35, 60, 89],
+      start_azimuth: 45,
+      start_elevation: 35,
+      night_mode: "auto",
+      shadows: true,
+      glow_color: "#ffc87a",
+      menu: true,
+      hints: true,
+      views: [],
+      ...config,
+    };
+    if (!c.model && !c.entities) c.entities = DEMO_ENTITIES;
+    // our own copies: devices added from the dashboard are appended to them at runtime
+    c.entities = [...(c.entities || [])];
+    c.labels = [...(c.labels || [])];
+    if (!c.snap_azimuths) {
+      c.snap_azimuths = [];
+      for (let a = 0; a < 360; a += c.snap_step) c.snap_azimuths.push(a);
+    }
+    this._config = c;
+    if (!this._local.__seeded && !c.model) {
+      this._local = { __seeded: true, "light.living_room": { state: "on", attributes: { brightness: 220 } } };
+    }
+    if (this._initialized) {
+      this._teardown();
+      this._init();
+    } else if (this.isConnected) {
+      this._init();
+    }
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    const cb = this._menuFor;
+    if (cb?._camEl?.tagName === "HA-CAMERA-STREAM") {
+      cb._camEl.hass = hass;
+      const cs = hass.states?.[cb.cfg.entity];
+      if (cs && cb._camEl.stateObj?.state !== cs.state) cb._camEl.stateObj = cs;
+    }
+    this._updateLabels();
+    this._applyStates();
+    this._applyNight();
+    this._weatherHass();
+    if (this._modelReady && !this._adLoaded) this._adLoad();
+    if (!this._auLoaded) this._auLoad();
+    if (this._modelReady && !this._phoneTried && this._bindings.length) { this._phoneTried = true; if (this._phonePref()) setTimeout(() => this._setPhone(true), 0); }
+  }
+
+  connectedCallback() {
+    if (this._config && !this._initialized) this._init();
+    else if (this._initialized && !this._raf) this._startLoop();
+  }
+
+  disconnectedCallback() {
+    clearTimeout(this._returnTimer);
+    if (this._raf) cancelAnimationFrame(this._raf);
+    this._raf = null;
+    if (this._onTilt) window.removeEventListener("deviceorientation", this._onTilt);
+    this._onTilt = null;
+    this._bg = null; // set up again (with its tilt listener) if the card comes back
+    for (const u of this._wxUnsub || []) Promise.resolve(u).then((f) => typeof f === "function" && f()).catch(() => {});
+    this._wxUnsub = null;
+    this._wxSubFor = null;
+    clearTimeout(this._wxT);
+  }
+
+  /* ------------------------------------------------------------ setup */
+
+  _init() {
+    this._initialized = true;
+    const c = this._config;
+    this.shadowRoot.innerHTML = `
+      <style>
+        :host { display:block; }
+        ha-card { display:block; overflow:hidden; position:relative; }
+        .wrap { --accent: var(--h3d-accent, #f5a524); position:relative; width:100%; height:${c.height === "full" ? "calc(100vh - var(--header-height, 56px))" : `${Number(c.height) || 450}px`}; ${c.height === "full" ? "height:calc(100dvh - var(--header-height, 56px));" : ""} user-select:none; -webkit-user-select:none; }
+        .hints { position:absolute; inset:0; pointer-events:none; z-index:1; overflow:hidden; transition:opacity .4s ease .12s; }
+        /* while the room is moving (dragging, snapping, flying home) the dots and floating readouts fade away */
+        .wrap.moving .hints { opacity:0; transition:opacity .16s ease; }
+        .wrap.moving .hint { pointer-events:none; }
+        .wrap.moving .lbl:not(.keep) { opacity:0; pointer-events:none; transition:opacity .16s ease; }
+        .wrap:not(.moving) .lbl { transition:opacity .4s ease .12s; }
+        .labels { position:absolute; inset:0; pointer-events:none; z-index:1; overflow:hidden; }
+        .lbl { all:unset; position:absolute; left:0; top:0; transform:translate(-50%, -50%); pointer-events:auto; cursor:pointer;
+          display:inline-flex; align-items:center; gap:6px; padding:6px 12px 6px 9px; border-radius:999px; white-space:nowrap;
+          color:#fff; font:600 15px system-ui, sans-serif; font-variant-numeric:tabular-nums; letter-spacing:-.01em;
+          background:rgba(255,255,255,.14); -webkit-backdrop-filter:blur(10px) saturate(170%); backdrop-filter:blur(10px) saturate(170%);
+          box-shadow:inset 0 1px 1px rgba(255,255,255,.35), 0 4px 14px rgba(0,0,0,.3); text-shadow:0 1px 2px rgba(0,0,0,.35);
+          transition:opacity .25s; -webkit-tap-highlight-color:transparent; }
+        .lbl[hidden], .lbl.off { display:none; }
+        .lbl.multi { gap:8px; font-size:13px; padding:6px 12px; }
+        .lbl.multi > svg { fill:#6fb1ff; filter:drop-shadow(0 0 4px rgba(80,150,255,.7)); }
+        .lbl i { font-style:normal; display:inline-flex; align-items:center; gap:3px; }
+        .lbl i svg { width:13px; height:13px; fill:currentColor; opacity:.8; filter:none; }
+        .lbl .pp svg { width:15px; height:15px; opacity:.45; }
+        .lbl .pp.here svg { fill:#3ddc84; opacity:1; filter:drop-shadow(0 0 4px rgba(61,220,132,.7)); }
+        .lbl .sep { width:1px; height:14px; background:rgba(255,255,255,.3); }
+        .lbl svg { width:16px; height:16px; fill:var(--tc, #fff); filter:drop-shadow(0 0 4px var(--tc, transparent)); transition:fill .6s; }
+        .lbl small { font-weight:500; font-size:11px; opacity:.75; margin-left:2px; }
+        .lbl:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+        .hint { all:unset; position:absolute; left:0; top:0; width:22px; height:22px; margin:-11px 0 0 -11px; box-sizing:border-box;
+          border-radius:50%; pointer-events:auto; cursor:pointer; display:grid; place-items:center;
+          background:radial-gradient(circle at 50% 25%, rgba(255,255,255,.34), rgba(255,255,255,.1) 70%);
+          box-shadow:inset 0 1px 2px rgba(255,255,255,.45), inset 0 -1px 2px rgba(255,255,255,.12), 0 2px 6px rgba(0,0,0,.28);
+          transition:opacity .25s, transform .18s; -webkit-tap-highlight-color:transparent; }
+        .hint[hidden] { display:none; }
+        .hint .core { width:8px; height:8px; border-radius:50%; background:rgba(255,255,255,.92);
+          box-shadow:0 0 6px rgba(255,255,255,.75); transition:background .3s, box-shadow .3s; }
+        .hint.on .core { background:var(--hc, var(--accent)); box-shadow:0 0 10px var(--hc, var(--accent)), 0 0 3px var(--hc, var(--accent)); }
+        .hint::after { content:""; position:absolute; inset:0; border-radius:50%; border:1.5px solid rgba(255,255,255,.55);
+          animation:ping 2.8s ease-out infinite; animation-delay:var(--d, 0s); pointer-events:none; }
+        .hint.on::after { border-color:color-mix(in srgb, var(--hc, var(--accent)) 70%, #fff); }
+        @keyframes ping { 0% { transform:scale(1); opacity:.75; } 60%, 100% { transform:scale(2.1); opacity:0; } }
+        .hint.alert .core { background:#ff3b30; box-shadow:0 0 10px #ff3b30, 0 0 3px #ff3b30; animation:alertcore 1.1s ease-in-out infinite; }
+        .hint.alert::after { border-color:#ff5a4f; animation:ping 1.1s ease-out infinite; animation-delay:0s; }
+        .hint.alert { background:radial-gradient(circle at 50% 25%, rgba(255,120,110,.45), rgba(255,60,50,.15) 70%); }
+        @keyframes alertcore { 50% { transform:scale(1.35); box-shadow:0 0 16px #ff3b30, 0 0 5px #ff3b30; } }
+        @media (prefers-reduced-motion: reduce) { .hint.alert .core { animation:none; } }
+        /* "Offline since ..." tag: red-tinted glass that drops out of the dot and glows with its pulse */
+        .hint .since { display:none; position:absolute; top:calc(100% + 7px); left:50%; transform:translateX(-50%);
+          padding:3px 10px; border-radius:999px; white-space:nowrap; pointer-events:none;
+          font:600 11px system-ui, sans-serif; color:#fff; font-variant-numeric:tabular-nums; letter-spacing:.01em;
+          text-shadow:0 1px 2px rgba(0,0,0,.45);
+          background:linear-gradient(180deg, rgba(255,110,100,.28), rgba(255,50,40,.14));
+          -webkit-backdrop-filter:blur(10px) saturate(160%); backdrop-filter:blur(10px) saturate(160%);
+          box-shadow:inset 0 0 0 1px rgba(255,130,120,.45), inset 0 1px 1px rgba(255,255,255,.3), 0 3px 10px rgba(0,0,0,.25); }
+        .hint.alert .since:not(:empty) { display:block;
+          animation:tagIn .5s cubic-bezier(.2,.9,.3,1.25) both, tagGlow 1.1s ease-in-out .5s infinite; }
+        @keyframes tagIn {
+          from { opacity:0; transform:translate(-50%, -8px) scale(.7); filter:blur(3px); }
+          to { opacity:1; transform:translate(-50%, 0) scale(1); filter:none; } }
+        @keyframes tagGlow {
+          0%, 100% { box-shadow:inset 0 0 0 1px rgba(255,130,120,.45), inset 0 1px 1px rgba(255,255,255,.3), 0 3px 10px rgba(0,0,0,.25); }
+          50% { box-shadow:inset 0 0 0 1px rgba(255,150,140,.75), inset 0 1px 1px rgba(255,255,255,.35), 0 0 14px rgba(255,59,48,.55), 0 3px 10px rgba(0,0,0,.25); } }
+        @media (prefers-reduced-motion: reduce) { .hint.alert .since:not(:empty) { animation:none; } }
+        /* reconnected: green dot and tag for a moment, then the tag floats away */
+        .hint.back .core { background:#3ddc84; box-shadow:0 0 12px #3ddc84, 0 0 3px #3ddc84; }
+        .hint.back::after { border-color:#7ee8ae; animation:ping 1.1s ease-out infinite; animation-delay:0s; }
+        .hint.back .since:not(:empty) { display:block;
+          background:linear-gradient(180deg, rgba(90,230,150,.28), rgba(40,200,110,.14));
+          box-shadow:inset 0 0 0 1px rgba(120,235,170,.5), inset 0 1px 1px rgba(255,255,255,.3), 0 0 12px rgba(61,220,132,.4), 0 3px 10px rgba(0,0,0,.25);
+          animation:tagFlip .45s ease-out both; }
+        .hint.back.leaving .since { animation:tagOut .45s cubic-bezier(.5,0,.8,.4) forwards; }
+        @keyframes tagFlip { from { transform:translate(-50%, 0) scale(.92); filter:brightness(1.6); } to { transform:translate(-50%, 0) scale(1); filter:none; } }
+        @keyframes tagOut { to { opacity:0; transform:translate(-50%, -10px) scale(.85); filter:blur(4px); } }
+        @media (prefers-reduced-motion: reduce) { .hint.back .since:not(:empty), .hint.back.leaving .since { animation:none; } }
+        .hint:hover { transform:scale(1.18); }
+        .hint:active { transform:scale(.9); }
+        .hint:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+        @media (prefers-reduced-motion: reduce) { .hint::after { animation:none; opacity:0; } }
+        canvas { display:block; width:100%; height:100%; touch-action:none; outline:none; }
+        .wrap > canvas { position:relative; }
+        .wrap > canvas.bg { position:absolute; inset:0; pointer-events:none; }
+        .status { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+          color:var(--secondary-text-color,#888); font:14px var(--paper-font-body1_-_font-family, system-ui, sans-serif); pointer-events:none; text-align:center; padding:16px; }
+        .tip { position:absolute; pointer-events:none; padding:6px 10px; border-radius:8px; font:13px system-ui, sans-serif;
+          background:var(--card-background-color,#fff); color:var(--primary-text-color,#222);
+          box-shadow:0 2px 8px rgba(0,0,0,.25); opacity:0; transition:opacity .12s; white-space:nowrap; transform:translate(-50%,-130%); }
+        .tip.show { opacity:1; }
+        .tip b { font-weight:600; }
+        .bar { position:absolute; right:10px; bottom:10px; display:flex; gap:6px; }
+        .bar[hidden] { display:none; }
+        .views { position:absolute; left:10px; bottom:10px; display:flex; gap:6px; flex-wrap:wrap; max-width:60%; }
+        button { all:unset; cursor:pointer; min-width:34px; height:34px; padding:0 10px; box-sizing:border-box; border-radius:17px;
+          display:inline-flex; align-items:center; justify-content:center; font:600 13px system-ui, sans-serif;
+          background:var(--card-background-color,rgba(255,255,255,.9)); color:var(--primary-text-color,#222);
+          box-shadow:0 1px 4px rgba(0,0,0,.25); opacity:.9; }
+        button:hover { opacity:1; }
+        button svg { width:18px; height:18px; fill:currentColor; }
+
+        .net { display:flex; align-items:center; gap:8px; font-size:13px; font-weight:600; padding:8px 10px; border-radius:12px;
+          background:rgba(60,200,120,.14); }
+        .net.down { background:rgba(255,70,60,.18); }
+        .net .dot { width:8px; height:8px; border-radius:50%; background:#3ddc84; box-shadow:0 0 8px #3ddc84; }
+        .net.down .dot { background:#ff4a3d; box-shadow:0 0 8px #ff4a3d; }
+        .aqn svg { width:11px; height:11px; fill:currentColor; vertical-align:-1px; }
+        .aqc small.u { font-size:10px; font-weight:500; opacity:.65; margin-top:-1px; }
+        /* styled like the small display on UniFi gateways: black glass screen in a thin light bezel */
+        .hb { position:relative; display:grid; grid-template-columns:minmax(0, 1fr); min-width:0; gap:4px; padding:10px 11px 8px;
+          border-radius:13px; color:#fff; overflow:hidden; background:#020304;
+          box-shadow:0 0 0 3px rgba(235,238,242,.55), 0 0 0 4px rgba(0,0,0,.25), inset 0 0 18px rgba(40,90,255,.08), 0 6px 14px rgba(0,0,0,.35); }
+        .hb::after { content:""; position:absolute; inset:0; pointer-events:none;
+          background:linear-gradient(155deg, rgba(255,255,255,.09) 0%, rgba(255,255,255,0) 38%); }
+        .hbh { display:flex; flex-wrap:wrap; align-items:baseline; gap:2px 10px; min-width:0; font-variant-numeric:tabular-nums; }
+        .hbt { flex-basis:100%; font-size:9.5px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; color:rgba(255,255,255,.45); }
+        .hbh .dn, .hbh .upl { display:inline-flex; align-items:baseline; gap:2px; font-size:15px; font-weight:600; color:#fff; letter-spacing:-.01em; }
+        .hbh .dn svg { fill:#3d8cff; } .hbh .upl svg { fill:#a58cff; }
+        .hbh svg { width:10px; height:10px; align-self:center; }
+        .hbh small { font-size:9px; font-weight:500; color:rgba(255,255,255,.5); margin-left:2px; }
+        .hbc { display:block; width:100%; max-width:100%; min-width:0; height:78px; }
+        .hbl { display:flex; justify-content:space-between; font-size:9px; color:rgba(255,255,255,.35); }
+        .pres { display:grid; gap:4px; }
+        .pr { display:grid; grid-template-columns:18px 1fr auto; align-items:center; gap:8px; padding:6px 9px; border-radius:10px;
+          background:rgba(255,255,255,.08); font-size:13px; }
+        .pr svg { width:16px; height:16px; fill:currentColor; opacity:.5; }
+        .pr.here svg { fill:#3ddc84; opacity:1; filter:drop-shadow(0 0 3px rgba(61,220,132,.6)); }
+        .prn { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .prs { font-size:11px; opacity:.7; white-space:nowrap; }
+        /* device list: glass button + slide-out glass list */
+        .dl-btn { all:unset; position:absolute; left:12px; top:12px; z-index:3; cursor:pointer; display:inline-flex; align-items:center; gap:7px;
+          height:38px; padding:0 14px 0 12px; border-radius:19px; color:#fff; font:600 13px system-ui, sans-serif;
+          background:rgba(255,255,255,.14); -webkit-backdrop-filter:blur(14px) saturate(170%); backdrop-filter:blur(14px) saturate(170%);
+          box-shadow:inset 0 1px 1px rgba(255,255,255,.35), inset 0 0 0 1px rgba(255,255,255,.12), 0 6px 18px rgba(0,0,0,.3);
+          text-shadow:0 1px 2px rgba(0,0,0,.35); transition:transform .15s, background .2s, opacity .18s ease; -webkit-tap-highlight-color:transparent; }
+        .dl-btn[hidden] { display:none; }
+        .dl-btn svg { width:18px; height:18px; fill:currentColor; }
+        .dl-btn:hover { background:rgba(255,255,255,.2); }
+        .dl-btn:active { transform:scale(.95); }
+        .dl-btn.on { background:rgba(255,255,255,.26); }
+        .dl-btn:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+        .dl-n { font-style:normal; min-width:18px; height:18px; padding:0 5px; box-sizing:border-box; border-radius:9px; display:inline-grid; place-items:center;
+          font:700 11px system-ui, sans-serif; color:#1b1b1b; background:var(--accent); }
+        .dl-n:empty { display:none; }
+        .dl-n.bad { background:#ff3b30; color:#fff; animation:alertcore 1.1s ease-in-out infinite; }
+        .dl { --glass: color-mix(in srgb, var(--card-background-color, #fff) var(--h3d-glass-tint, 32%), transparent);
+          --e:cubic-bezier(.3,.9,.25,1);
+          position:absolute; left:12px; top:12px; z-index:4; width:var(--dlw, 300px); height:calc(100% - 24px); box-sizing:border-box;
+          display:flex; flex-direction:column; border-radius:22px; overflow:hidden; color:var(--primary-text-color, #1c1c1e);
+          background-color:var(--glass);
+          -webkit-backdrop-filter:blur(16px) saturate(190%) brightness(1.06); backdrop-filter:blur(16px) saturate(190%) brightness(1.06);
+          box-shadow:0 18px 40px -12px rgba(0,0,0,.45), inset 0 1px 3px rgba(255,255,255,.28), inset 0 0 0 1px rgba(255,255,255,.12);
+          font:14px var(--paper-font-body1_-_font-family, system-ui, sans-serif);
+          transition:width .5s var(--e), height .5s var(--e), border-radius .5s var(--e), background-color .4s ease, color .4s ease, box-shadow .4s ease; }
+        .dl::before { content:""; position:absolute; inset:0; pointer-events:none; border-radius:inherit; transition:opacity .4s ease;
+          background:radial-gradient(130% 60% at 15% -10%, rgba(255,255,255,.24), rgba(255,255,255,0) 60%); }
+        .dl[hidden] { display:none; }
+        /* closed: the same glass shrunk to the "Devices" pill; tap it and it grows into the list */
+        .dl.mini { width:var(--pw, 132px); height:38px; border-radius:19px; cursor:pointer; color:#fff; background-color:rgba(255,255,255,.14);
+          box-shadow:inset 0 1px 1px rgba(255,255,255,.35), inset 0 0 0 1px rgba(255,255,255,.12), 0 6px 18px rgba(0,0,0,.3);
+          text-shadow:0 1px 2px rgba(0,0,0,.35); -webkit-tap-highlight-color:transparent; }
+        .dl.mini::before { opacity:0; }
+        .dl.mini:hover { background-color:rgba(255,255,255,.2); }
+        .dl-h { position:relative; flex:none; display:flex; align-items:center; gap:7px; height:52px; padding:0 108px 0 16px; white-space:nowrap;
+          box-sizing:border-box; transition:height .5s var(--e), padding .5s var(--e); outline:none; }
+        .dl.mini .dl-h { height:38px; padding:0 10px; gap:0; }
+        .dl-h:focus-visible { box-shadow:inset 0 0 0 2px var(--accent); border-radius:19px; }
+        .dl-hi { all:unset; width:18px; height:18px; flex:none; display:grid; place-items:center; border-radius:50%;
+          transition:width .5s var(--e), height .5s var(--e), margin .5s var(--e), background .2s; }
+        .dl-hi svg { width:18px; height:18px; fill:currentColor; }
+        .dl:not(.mini) .dl-hi { cursor:pointer; width:30px; height:30px; margin:0 -3px 0 -8px; }
+        .dl:not(.mini) .dl-hi:hover, .dl-hi[aria-expanded="true"] { background:rgba(255,255,255,.22); }
+        .dl-hi:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+        .dl-menu { position:absolute; left:10px; top:48px; z-index:6; min-width:210px; padding:5px; border-radius:16px; box-sizing:border-box;
+          background:color-mix(in srgb, var(--card-background-color, #fff) 84%, transparent);
+          -webkit-backdrop-filter:blur(24px) saturate(180%); backdrop-filter:blur(24px) saturate(180%);
+          box-shadow:0 14px 34px -10px rgba(0,0,0,.5), inset 0 1px 1px rgba(255,255,255,.4), inset 0 0 0 1px rgba(255,255,255,.14);
+          transform-origin:14px 0; animation:dlMenuIn .2s cubic-bezier(.2,.9,.3,1.2) both; }
+        .dl-menu[hidden] { display:none; }
+        .dl-menu.out { animation:dlMenuOut .15s ease forwards; }
+        @keyframes dlMenuIn { from { opacity:0; transform:scale(.9) translateY(-4px); } }
+        @keyframes dlMenuOut { to { opacity:0; transform:scale(.94) translateY(-3px); } }
+        .dl-mi { all:unset; box-sizing:border-box; width:100%; display:flex; align-items:center; gap:10px; padding:8px 10px; border-radius:11px;
+          cursor:pointer; font-size:13.5px; font-weight:600; }
+        .dl-mi:hover { background:rgba(255,255,255,.2); }
+        .dl-mi:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+        .dl-mi > svg { width:18px; height:18px; fill:currentColor; opacity:.75; flex:none; }
+        .dl-mi span { flex:1; }
+        .dl-mi.go > svg:last-child { width:16px; height:16px; opacity:.4; }
+        .dl-mi i { position:relative; width:34px; height:20px; border-radius:10px; flex:none; background:rgba(127,127,127,.3); transition:background .2s; }
+        .dl-mi i::after { content:""; position:absolute; top:3px; left:3px; width:14px; height:14px; border-radius:50%; background:#fff;
+          box-shadow:0 1px 3px rgba(0,0,0,.3); transition:transform .22s cubic-bezier(.3,1.3,.5,1); }
+        .dl-mi[aria-pressed="true"] i { background:var(--accent); }
+        .dl-mi[aria-pressed="true"] i::after { transform:translateX(14px); }
+        .dl-chips:empty { display:none; }
+        /* + in the list's header: add a device */
+        .dl-h .dl-addb { all:unset; position:absolute; right:74px; top:12px; cursor:pointer; width:28px; height:28px; border-radius:50%; display:grid; place-items:center;
+          transition:opacity .3s ease .15s, background .2s; }
+        .dl-h .dl-addb:hover { background:rgba(255,255,255,.2); }
+        .dl-h .dl-addb svg { width:18px; height:18px; fill:currentColor; opacity:.65; }
+        .dl-h .dl-addb:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+        .dl.mini .dl-h .dl-addb { opacity:0; pointer-events:none; visibility:hidden; transition:opacity .1s ease; }
+        /* the add-device panel slides over the list */
+        .ad { position:absolute; left:0; right:0; top:0; bottom:0; z-index:7; display:flex; flex-direction:column; border-radius:inherit; overflow:hidden;
+          background:color-mix(in srgb, var(--card-background-color, #fff) 30%, transparent);
+          animation:adIn .32s cubic-bezier(.2,.9,.3,1) both; }
+        /* while adding, the list steps aside so the panel shows only the add flow on its glass */
+        .dl.adding > .dl-h, .dl.adding > .dl-body { visibility:hidden; opacity:0; transition:opacity .15s ease, visibility 0s .15s; }
+        .ad[hidden] { display:none; }
+        /* Devices | Shortcuts tabs at the top of the open list */
+        .dl-tabs { position:relative; flex:none; display:grid; grid-template-columns:1fr 1fr; margin:0 10px 6px; padding:3px; border-radius:12px;
+          background:rgba(127,127,127,.16); box-shadow:inset 0 1px 2px rgba(0,0,0,.1); }
+        .dl-tabs button { all:unset; position:relative; z-index:1; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:6px;
+          padding:6px 0; border-radius:9px; font-size:12.5px; font-weight:650; opacity:.7; transition:opacity .2s; }
+        .dl-tabs button[aria-selected="true"] { opacity:1; }
+        .dl-tabs button:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+        .dl-tabs em { font-style:normal; font-size:10px; font-weight:700; min-width:16px; box-sizing:border-box; padding:1px 5px; border-radius:8px; background:rgba(127,127,127,.25); }
+        .dl-tabs em:empty { display:none; }
+        .dl-tabs i { position:absolute; top:3px; bottom:3px; left:3px; width:calc(50% - 3px); border-radius:9px; background:rgba(255,255,255,.38);
+          box-shadow:0 1px 4px rgba(0,0,0,.15); transition:transform .32s var(--e); }
+        .dl.tab-auto .dl-tabs i { transform:translateX(100%); }
+        .dl.editing .dl-tabs { display:none; }
+        .dl.tab-auto .dl-rows, .dl.tab-auto .dl-chips { display:none; }
+        .dl:not(.tab-auto) .dl-auto { display:none; }
+        .dl.tab-auto .dl-h .dl-exp, .dl.tab-auto .dl-h .dl-sum { opacity:0; pointer-events:none; }
+        .dl.tab-auto .dl-h .dl-sum { max-width:0; }
+        .dl.tab-auto .dl-h .dl-title { max-width:150px; }
+        .dl-auto { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:none; padding:0 8px 10px; display:flex; flex-direction:column; gap:5px; }
+        .dl-auto::-webkit-scrollbar { display:none; }
+        .au-t { display:flex; align-items:center; gap:4px; padding:4px 6px 4px 4px; border-radius:14px; background:rgba(255,255,255,.1); transition:background .2s, opacity .2s; }
+        .au-t:hover { background:rgba(255,255,255,.16); }
+        .au-t.off .au-run { opacity:.55; }
+        .au-t.flash { animation:adFlash 1.4s ease 2; }
+        .au-run { all:unset; cursor:pointer; flex:1; min-width:0; display:flex; align-items:center; gap:9px; border-radius:11px; }
+        .au-run:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+        .au-run .dl-ic { transition:transform .15s ease, background .25s ease, color .25s ease; }
+        .au-run:active .dl-ic { transform:scale(.9); }
+        .au-t.ran .dl-ic { background:var(--accent); color:#2a1c00; }
+        .au-n { flex:1; min-width:0; display:grid; }
+        .au-n b { font-size:13.5px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .au-n small { font-size:11.5px; opacity:.65; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .au-n small svg, .ad-hint svg { width:11px; height:11px; fill:currentColor; vertical-align:-1px; margin-right:3px; }
+        .au-t .sw2 { all:unset; position:relative; flex:none; width:38px; height:22px; border-radius:11px; cursor:pointer; background:rgba(127,127,127,.35); transition:background .2s; }
+        .au-t .sw2::after { content:""; position:absolute; top:3px; left:3px; width:16px; height:16px; border-radius:50%; background:#fff;
+          box-shadow:0 1px 3px rgba(0,0,0,.3); transition:transform .22s cubic-bezier(.3,1.3,.5,1); }
+        .au-t .sw2[aria-pressed="true"] { background:var(--accent); }
+        .au-t .sw2[aria-pressed="true"]::after { transform:translateX(16px); }
+        .au-t .sw2:focus-visible, .au-ed:focus-visible, .au-new:focus-visible, .au-del:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+        .au-ed { all:unset; cursor:pointer; flex:none; width:30px; height:30px; border-radius:50%; display:grid; place-items:center; }
+        .au-ed:hover { background:rgba(255,255,255,.2); }
+        .au-ed svg { width:15px; height:15px; fill:currentColor; opacity:.6; }
+        .au-new { all:unset; box-sizing:border-box; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:6px; width:100%; padding:9px;
+          border-radius:13px; font-size:13px; font-weight:600; border:1.5px dashed rgba(127,127,127,.45); opacity:.85; transition:background .2s, opacity .2s; }
+        .au-new:hover { background:rgba(255,255,255,.12); opacity:1; }
+        .au-new svg { width:16px; height:16px; fill:currentColor; }
+        .au-empty { display:grid; gap:3px; padding:10px 12px; border-radius:14px; background:rgba(255,255,255,.08); font-size:12.5px; line-height:1.4; }
+        .au-empty b { font-size:13.5px; }
+        .au-empty span { opacity:.7; }
+        /* the shortcut editor */
+        .au .ad-body { gap:8px; }
+        .au-a { display:grid; gap:6px; padding:8px; border-radius:13px; background:rgba(255,255,255,.12); box-shadow:inset 0 1px 1px rgba(255,255,255,.18); }
+        .au-ah { display:flex; align-items:center; gap:10px; }
+        .au-hint { font-size:12.5px; opacity:.65; padding:2px 4px; }
+        .au-sel { appearance:none; -webkit-appearance:none; cursor:pointer; color:inherit; font:inherit; font-size:14px;
+          background-image:linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%);
+          background-position:calc(100% - 17px) 55%, calc(100% - 12px) 55%; background-size:5px 5px; background-repeat:no-repeat; padding-right:30px; }
+        .au-sel option { color:#1c1c1e; }
+        .au-time { color:inherit; font:inherit; font-size:14px; }
+        .au-err { font-size:12.5px; font-weight:600; padding:8px 10px; border-radius:11px; color:#fff; background:#d9342b; }
+        .au-del { all:unset; cursor:pointer; align-self:center; padding:6px 12px; border-radius:10px; font-size:12.5px; font-weight:600; color:#ff453a; }
+        .au-del:hover { background:rgba(255,69,58,.12); }
+        .au-sec { display:grid; gap:7px; padding:9px; border-radius:15px; background:rgba(127,127,127,.09); }
+        .au-sh { display:flex; align-items:baseline; gap:8px; }
+        .au-sh small { font-size:11.5px; opacity:.65; }
+        .au-sh .ad-sub { padding:0 2px; }
+        .au-k { font-style:normal; font-size:10.5px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; padding:3px 8px; border-radius:7px; }
+        .au-k.if { background:#4f8cff; color:#fff; }
+        .au-k.then { background:var(--accent); color:#2a1c00; }
+        .au-k.else { background:#8e6cf0; color:#fff; }
+        .au-k.rule { background:rgba(127,127,127,.35); }
+        .au-inl { display:flex; align-items:center; gap:6px; }
+        .au-inl .ad-seg { flex:1; }
+        .au-inl > .ad-name { flex:1; min-width:0; }
+        .au-numw { position:relative; flex:0 0 96px; display:flex; align-items:center; }
+        .au-numw input { padding-right:24px; -moz-appearance:textfield; }
+        .au-numw input::-webkit-inner-spin-button { display:none; }
+        .au-numw span { position:absolute; right:10px; font-size:13px; opacity:.6; pointer-events:none; }
+        .au-to { font-size:12px; opacity:.6; }
+        .au-two { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+        .au-two .au-new { padding:8px 2px; gap:4px; font-size:12px; white-space:nowrap; }
+        .au-two .au-new svg { width:14px; height:14px; }
+        .au-c.not { box-shadow:inset 3px 0 0 #ff6b5e, inset 0 1px 1px rgba(255,255,255,.18); }
+        .au-c.only { box-shadow:inset 3px 0 0 #34c77b, inset 0 1px 1px rgba(255,255,255,.18); }
+        .au-sum { font-size:12.5px; line-height:1.45; padding:9px 11px; border-radius:12px; background:color-mix(in srgb, var(--accent) 14%, transparent); }
+        .au-ideas { display:grid; gap:4px; padding-bottom:4px; }
+        .au-ideas .ad-e > svg { opacity:.4; }
+        /* dragging a card while the room stays live: the glass would have to re-blur the moving room every frame,
+           which some browsers (Safari, the iOS app) can't keep up with and leave parts of the list unpainted.
+           For the drag it becomes a slightly more solid tint of the same glass instead; the blur comes back on drop. */
+        /* Also, the panel stops clipping to its rounded corners for the drag: with the lifted card moving inside a
+           rounded, clipped, blurred panel over a live canvas, Chrome can compute that clip wrongly and cut the list off
+           part-way down (the rest of the list goes blank until you drop). The list still scrolls and clips on its own. */
+        .dl.dragging { -webkit-backdrop-filter:none; backdrop-filter:none; overflow:visible;
+          background-color:color-mix(in srgb, var(--card-background-color, #fff) 78%, transparent); }
+        .ad.out { animation:adOut .2s ease-in forwards; }
+        @keyframes adIn { from { transform:translateX(24px); opacity:0; } }
+        @keyframes adOut { to { transform:translateX(24px); opacity:0; } }
+        .ad-h { display:flex; align-items:center; gap:6px; padding:12px 10px 4px 14px; }
+        .ad-h b { flex:1; font-size:16px; font-weight:700; letter-spacing:-.01em; }
+        .ad-h button { all:unset; cursor:pointer; width:30px; height:30px; border-radius:50%; display:grid; place-items:center; }
+        .ad-h button:hover { background:rgba(127,127,127,.18); }
+        .ad-h svg { width:16px; height:16px; fill:currentColor; opacity:.65; }
+        .ad-back svg { transform:rotate(180deg); }
+        .ad-h .ad-back { margin-left:-8px; }
+        .ad-steps { display:flex; gap:4px; padding:0 14px 8px; }
+        .ad-steps i { height:3px; flex:1; border-radius:2px; background:rgba(127,127,127,.25); transition:background .3s; }
+        .ad-steps i.done, .ad-steps i.on { background:var(--accent); }
+        .ad-steps i.on { opacity:.6; }
+        .ad-body { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:none; padding:2px 10px 14px; display:flex; flex-direction:column; gap:8px; }
+        .ad-body::-webkit-scrollbar { display:none; }
+        .ad-q, .ad-name, .ad-newg { all:unset; box-sizing:border-box; width:100%; padding:9px 12px; border-radius:11px; font-size:14px;
+          background:rgba(127,127,127,.14); box-shadow:inset 0 1px 2px rgba(0,0,0,.12); }
+        .ad-q:focus, .ad-name:focus, .ad-newg:focus { box-shadow:inset 0 0 0 2px var(--accent); }
+        .ad-newg { width:auto; flex:1; min-width:90px; padding:6px 10px; font-size:12.5px; border-radius:14px; }
+        .ad-sub { font-size:10.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; opacity:.5; padding:6px 4px 0; }
+        .ad-list { display:flex; flex-direction:column; gap:3px; }
+        .ad-e, .ad-p, .ad-mine { all:unset; box-sizing:border-box; display:flex; align-items:center; gap:10px; width:100%; padding:7px 8px; border-radius:12px;
+          cursor:pointer; background:rgba(255,255,255,.14); box-shadow:inset 0 1px 1px rgba(255,255,255,.2); transition:background .2s, box-shadow .2s; }
+        .ad-mine { cursor:default; }
+        .ad-e:hover, .ad-p:hover { background:rgba(255,255,255,.3); }
+        .ad-e:focus-visible, .ad-p:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+        .ad-e > svg { width:15px; height:15px; fill:currentColor; opacity:.35; flex:none; }
+        .ad-ic { width:32px; height:32px; flex:none; border-radius:10px; display:grid; place-items:center; background:rgba(127,127,127,.18); }
+        .ad-ic svg { width:17px; height:17px; fill:currentColor; opacity:.8; }
+        .ad-t { flex:1; min-width:0; display:grid; }
+        .ad-t b { font-size:13.5px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; display:flex; align-items:center; gap:6px; }
+        .ad-t small { font-size:11.5px; opacity:.6; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .ad-t em { font-style:normal; font-size:10px; font-weight:700; padding:2px 6px; border-radius:6px; background:var(--accent); color:#2a1c00; flex:none; }
+        .ad-p .ad-t small { white-space:normal; }
+        .ad-p.sel { box-shadow:inset 0 0 0 2px var(--accent); background:color-mix(in srgb, var(--accent) 18%, rgba(255,255,255,.14)); }
+        .ad-presets { display:flex; flex-direction:column; gap:5px; }
+        .ad-for { font-weight:700; font-size:15px; padding:2px 4px 4px; display:grid; }
+        .ad-for small { font-weight:500; font-size:11.5px; opacity:.55; }
+        .ad-sm { all:unset; cursor:pointer; padding:5px 10px; border-radius:10px; font-size:12px; font-weight:600; background:rgba(127,127,127,.18); }
+        .ad-sm.danger { padding:5px 6px; display:grid; place-items:center; color:#fff; background:#ff453a; }
+        .ad-sm svg { width:14px; height:14px; fill:currentColor; }
+        .ad-yaml { all:unset; cursor:pointer; display:flex; align-items:center; gap:8px; padding:6px 8px; font-size:12px; font-weight:600; opacity:.75; border-radius:10px; }
+        .ad-yaml:hover { opacity:1; background:rgba(127,127,127,.12); }
+        .ad-yaml svg { width:14px; height:14px; fill:currentColor; transform:scaleX(-1); }
+        .ad-empty { font-size:13px; opacity:.6; padding:16px 6px; text-align:center; }
+        .ad-f { display:grid; gap:6px; }
+        .ad-f > span { font-size:11.5px; font-weight:700; opacity:.6; padding:0 2px; }
+        .ad-chips { display:flex; flex-wrap:wrap; gap:5px; }
+        .ad-chip { all:unset; cursor:pointer; padding:6px 11px; border-radius:14px; font-size:12.5px; font-weight:600; background:rgba(127,127,127,.16); }
+        .ad-chip.sel { background:var(--accent); color:#2a1c00; }
+        .ad-icons { display:grid; grid-template-columns:repeat(7, 1fr); gap:5px; }
+        .ad-icb { all:unset; cursor:pointer; aspect-ratio:1; border-radius:10px; display:grid; place-items:center; background:rgba(127,127,127,.14); }
+        .ad-icb svg { width:17px; height:17px; fill:currentColor; opacity:.75; }
+        .ad-icb.sel { background:var(--accent); color:#2a1c00; }
+        .ad-sec { display:grid; gap:2px; border-radius:12px; background:rgba(127,127,127,.1); padding:2px 10px; }
+        .ad-sec:empty { display:none; }
+        .ad-row { display:flex; align-items:center; gap:10px; padding:8px 0; }
+        .ad-row .ad-t b, .ad-row .ad-t small { white-space:normal; }
+        .ad-row + .ad-row { border-top:1px solid rgba(127,127,127,.16); }
+        .ad-row .sw2 { all:unset; position:relative; flex:none; width:42px; height:24px; border-radius:12px; cursor:pointer; background:rgba(127,127,127,.3); transition:background .2s; }
+        .ad-row .sw2::after { content:""; position:absolute; top:3px; left:3px; width:18px; height:18px; border-radius:50%; background:#fff;
+          box-shadow:0 1px 3px rgba(0,0,0,.3); transition:transform .22s cubic-bezier(.3,1.3,.5,1); }
+        .ad-row .sw2[aria-pressed="true"] { background:var(--accent); }
+        .ad-row .sw2[aria-pressed="true"]::after { transform:translateX(18px); }
+        .ad-seg { display:flex; gap:3px; padding:3px; border-radius:12px; background:rgba(127,127,127,.14); }
+        .ad-seg button { all:unset; cursor:pointer; flex:1; text-align:center; padding:6px 4px; border-radius:9px; font-size:12px; font-weight:600; opacity:.7; }
+        .ad-seg button.sel { background:rgba(255,255,255,.55); opacity:1; box-shadow:0 1px 3px rgba(0,0,0,.15); }
+        .ad-sw { display:flex; gap:8px; }
+        .ad-sw button { all:unset; cursor:pointer; width:26px; height:26px; border-radius:50%; background:var(--c); box-shadow:inset 0 -2px 3px rgba(0,0,0,.15), 0 1px 3px rgba(0,0,0,.2); }
+        .ad-sw button.sel { box-shadow:0 0 0 2px var(--card-background-color, #fff), 0 0 0 4px var(--accent); }
+        .ad-hint { font-size:11.5px; opacity:.6; padding:0 2px; }
+        .ad-go { flex:none; padding:8px 10px 12px; border-top:1px solid rgba(127,127,127,.14); }
+        .ad-main { all:unset; box-sizing:border-box; cursor:pointer; width:100%; display:flex; align-items:center; justify-content:center; gap:8px; padding:11px;
+          border-radius:13px; font-weight:700; font-size:14px; background:var(--accent); color:#2a1c00; box-shadow:0 6px 16px -6px color-mix(in srgb, var(--accent) 70%, transparent); }
+        .ad-main svg { width:17px; height:17px; fill:currentColor; }
+        .ad-main[disabled] { opacity:.4; cursor:default; box-shadow:none; }
+        .ad-main:focus-visible { outline:2px solid var(--primary-text-color, #000); outline-offset:2px; }
+        .ad-place { display:grid; justify-items:center; gap:6px; text-align:center; padding:22px 10px; border-radius:14px; background:rgba(127,127,127,.1); }
+        .ad-place b { font-size:15px; }
+        .ad-place small { font-size:12px; opacity:.65; }
+        .ad-tap { width:54px; height:54px; border-radius:50%; display:grid; place-items:center; background:rgba(127,127,127,.18); animation:adTap 1.4s ease-in-out infinite; }
+        .ad-tap svg { width:24px; height:24px; fill:currentColor; }
+        .ad-place.ok .ad-tap { background:var(--accent); color:#2a1c00; animation:none; }
+        @keyframes adTap { 50% { transform:scale(1.1); box-shadow:0 0 0 8px rgba(127,127,127,.12); } }
+        /* where the new device goes, in the room */
+        .ad-mark { position:absolute; left:0; top:0; z-index:2; pointer-events:none; transform:translate(-50%, -50%); display:grid; justify-items:center; gap:4px; }
+        .ad-mark[hidden] { display:none; }
+        .ad-mark i { width:18px; height:18px; border-radius:50%; background:var(--accent); box-shadow:0 0 0 4px rgba(255,255,255,.55), 0 0 18px var(--accent);
+          animation:adMark 1.2s ease-in-out infinite; }
+        .ad-mark span { font:600 12px system-ui, sans-serif; color:#fff; padding:3px 8px; border-radius:8px; background:rgba(0,0,0,.45); white-space:nowrap; }
+        @keyframes adMark { 50% { transform:scale(1.25); } }
+        .dl-r.flash, .dl-s.flash { animation:adFlash 1.4s ease 2; }
+        @keyframes adFlash { 50% { box-shadow:inset 0 0 0 2px var(--accent), 0 0 18px color-mix(in srgb, var(--accent) 60%, transparent); } }
+        .hint.flash { animation:adFlash 1.4s ease 2; }
+        @media (prefers-reduced-motion: reduce) { .ad, .ad-tap, .ad-mark i, .dl-r.flash { animation:none; } }
+        /* secret shortcuts: hold the closed ☰ button */
+        .dl.mini.pressing { transform:scale(.9); transition:transform .45s cubic-bezier(.3,.9,.3,1); }
+        .wrap.sc-open .dl.mini { transform:scale(1.08); transition:transform .25s cubic-bezier(.3,1.4,.5,1); z-index:6; }
+        .sc-dim { position:absolute; inset:0; z-index:5; background:rgba(0,0,0,.32); animation:scDim .22s ease both; pointer-events:none; } /* drag the room behind it */
+        .sc-dim[hidden], .sc[hidden] { display:none; }
+        .sc-dim.out { animation:scDimOut .2s ease forwards; }
+        @keyframes scDim { from { opacity:0; } }
+        @keyframes scDimOut { to { opacity:0; } }
+        .sc { position:absolute; left:12px; top:58px; z-index:6; min-width:220px; padding:6px; border-radius:18px; box-sizing:border-box;
+          color:var(--primary-text-color, #1c1c1e); font:14px var(--paper-font-body1_-_font-family, system-ui, sans-serif);
+          background:color-mix(in srgb, var(--card-background-color, #fff) 82%, transparent);
+          -webkit-backdrop-filter:blur(24px) saturate(180%); backdrop-filter:blur(24px) saturate(180%);
+          box-shadow:0 20px 44px -12px rgba(0,0,0,.55), inset 0 1px 1px rgba(255,255,255,.45), inset 0 0 0 1px rgba(255,255,255,.14);
+          transform-origin:19px -20px; animation:scIn .32s cubic-bezier(.2,1.1,.3,1) both; }
+        .sc.out { animation:scOut .18s ease-in forwards; }
+        @keyframes scIn { from { opacity:0; transform:scale(.5); filter:blur(6px); } }
+        @keyframes scOut { to { opacity:0; transform:scale(.8); filter:blur(4px); } }
+        .sc-t { font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; opacity:.5; padding:6px 10px 4px; }
+        .sc-i { all:unset; box-sizing:border-box; width:100%; display:flex; align-items:center; gap:11px; padding:9px 10px; border-radius:12px;
+          cursor:pointer; font-size:14px; font-weight:600; animation:scItem .3s ease both; animation-delay:calc(40ms + var(--i) * 25ms); }
+        @keyframes scItem { from { opacity:0; transform:translateY(-4px); } }
+        .sc-i:hover, .sc-i:focus-visible { background:rgba(255,255,255,.28); outline:none; }
+        .sc-i:active { transform:scale(.97); }
+        .sc-ic { width:30px; height:30px; flex:none; border-radius:9px; display:grid; place-items:center; background:rgba(255,255,255,.3);
+          box-shadow:inset 0 1px 1px rgba(255,255,255,.5); transition:background .2s, color .2s; }
+        .sc-ic svg { width:17px; height:17px; fill:currentColor; }
+        .sc-i.done .sc-ic { background:var(--accent); color:#2a1c00; }
+        .wrap.sc-open .wx { opacity:0; pointer-events:none; }
+        @media (prefers-reduced-motion: reduce) { .sc, .sc-dim, .sc-i { animation:none; } }
+        .dl-rows { grid-auto-rows:max-content; } /* a long list scrolls; rows never get squeezed */
+        /* − badge on every card while arranging: hides the device from the list and the room */
+        .dl-rm { all:unset; display:none; position:absolute; left:-5px; top:-5px; z-index:3; width:20px; height:20px; border-radius:50%;
+          place-items:center; cursor:pointer; color:#fff; background:#8e8e93; box-shadow:0 2px 6px rgba(0,0,0,.35), inset 0 1px 1px rgba(255,255,255,.35); }
+        .dl-rm svg { width:14px; height:14px; fill:currentColor; }
+        .dl-rm:hover { background:#ff453a; }
+        .dl-rm:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+        .dl.editing .dl-rm { display:grid; }
+        .dl.editing .dl-rows .dl-r > .dl-rm { pointer-events:auto; }
+        .dl.editing .dl-rows .dl-r, .dl.editing .dl-s { position:relative; overflow:visible; }
+        .dl.editing .dl-sec { opacity:1; }
+        .dl.editing .dl-s > :not(.dl-rm) { opacity:.6; }
+        .dl-rows { padding-top:6px; }
+        /* ☰ → Hidden devices */
+        .dl-mi em { font-style:normal; font-size:12px; opacity:.6; font-variant-numeric:tabular-nums; }
+        .dl-mi.back > svg:first-child { transform:rotate(180deg); width:16px; height:16px; opacity:.55; }
+        .dl-mi.hid { cursor:default; }
+        .dl-mi.hid:hover { background:transparent; }
+        .dl-mi.none { cursor:default; font-weight:500; font-size:12.5px; opacity:.7; }
+        .dl-mi.none:hover { background:transparent; }
+        .dl-add { all:unset; cursor:pointer; width:26px; height:26px; border-radius:50%; display:grid; place-items:center; flex:none;
+          background:var(--accent); color:#2a1c00; box-shadow:0 2px 6px rgba(0,0,0,.25); transition:transform .12s; }
+        .dl-add svg { width:16px; height:16px; fill:currentColor; }
+        .dl-add:active { transform:scale(.9); }
+        .dl-add:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+        .wrap.no-readouts .lbl:not(.multi) { display:none; }
+        /* the Sensors section at the end of the list */
+        .dl-sec { grid-column:1 / -1; order:99999; display:grid; gap:4px; }
+        .dl-sg { display:grid; grid-template-columns:repeat(6, minmax(0, 1fr)); gap:4px; }
+        .dl-s { all:unset; box-sizing:border-box; cursor:pointer; min-width:0; display:grid; gap:1px; padding:6px 9px 7px; border-radius:11px;
+          background:rgba(255,255,255,.1); box-shadow:inset 0 1px 1px rgba(255,255,255,.18); transition:background .2s; }
+        .dl-s:hover { background:rgba(255,255,255,.18); }
+        .dl-s:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+        .dl-s.s6 { grid-column:span 6; grid-template-columns:1fr auto; align-items:center; }
+        .dl-s.s3 { grid-column:span 3; } .dl-s.s2 { grid-column:span 2; }
+        .dl-s span { display:flex; align-items:center; gap:5px; font-size:11.5px; opacity:.75; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+        .dl-s b { font-size:15px; font-weight:650; font-variant-numeric:tabular-nums; letter-spacing:-.01em; white-space:nowrap; }
+        .dl-s.s6 b { font-size:18px; }
+        .dl-s b small { font-size:10.5px; font-weight:600; opacity:.65; margin-left:2px; }
+        .dl-s i { width:7px; height:7px; border-radius:50%; flex:none; display:none; }
+        .dl-s[data-q="good"] i { display:block; background:#34c759; box-shadow:0 0 6px #34c75988; }
+        .dl-s[data-q="fair"] i { display:block; background:#ffb020; box-shadow:0 0 6px #ffb02088; }
+        .dl-s[data-q="poor"] i { display:block; background:#ff453a; box-shadow:0 0 6px #ff453a88; }
+        .dl:not(.compact) .dl-sg { grid-template-columns:1fr; }
+        .dl:not(.compact) .dl-s { grid-column:auto; grid-template-columns:1fr auto; align-items:center; padding:9px 12px; }
+        .dl.editing .dl-sec { opacity:.55; }
+        /* renaming groups while arranging: tap a heading */
+        .dl.editing .dl-rows .dl-cat { cursor:text; display:flex; align-items:center; gap:5px; }
+        .dl.editing .dl-rows .dl-cat::after { content:""; width:11px; height:11px; opacity:.8; background:currentColor;
+          -webkit-mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M3 17.25V21h3.75L17.8 9.94l-3.75-3.75zM20.7 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75z'/%3E%3C/svg%3E") center / contain no-repeat;
+                  mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M3 17.25V21h3.75L17.8 9.94l-3.75-3.75zM20.7 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75z'/%3E%3C/svg%3E") center / contain no-repeat; }
+        .dl.editing .dl-rows .dl-cat:has(input)::after { display:none; }
+        .dl-cat-in { all:unset; box-sizing:border-box; width:100%; font:inherit; letter-spacing:inherit; text-transform:none; padding:2px 6px;
+          border-radius:7px; background:rgba(255,255,255,.3); box-shadow:inset 0 0 0 1.5px var(--accent); opacity:1; }
+        .dl.editing .dl-rows .dl-cat:has(input) { opacity:1; }
+        /* while a tile is carried, the others stop wiggling so their sliding reads clearly */
+        .dl.dragging .dl-rows .dl-r .dl-go { animation-play-state:paused; }
+        .dl-r.ghost { will-change:transform; }
+        .dl-title { font-weight:700; font-size:16px; letter-spacing:-.01em; max-width:120px; overflow:hidden;
+          transition:max-width .5s var(--e), opacity .3s ease .12s; }
+        .dl.mini .dl-title { max-width:0; opacity:0; transition:max-width .45s var(--e), opacity .12s ease; }
+        .dl-h { transition:height .5s var(--e), padding .5s var(--e), gap .5s var(--e); }
+        .dl-sum { font-size:12px; opacity:.7; max-width:140px; overflow:hidden; transition:opacity .3s ease .15s, max-width .5s var(--e); }
+        .dl.mini .dl-sum { opacity:0; max-width:0; transition:opacity .12s ease, max-width .5s var(--e); }
+        .dl-sum b { color:#ff453a; font-weight:700; }
+        .dl-h .dl-n { transition:opacity .25s ease, transform .3s var(--e); }
+        .dl:not(.mini) .dl-h .dl-n { opacity:0; transform:scale(.5); position:absolute; left:120px; pointer-events:none; }
+        .dl.mini .dl-h .dl-n:not(.bad) { display:none; }
+        /* an offline device: a pulsing red dot sitting on the button's edge, outside it like a notification badge */
+        .dl.mini { overflow:visible; }
+        .dl.mini .dl-body, .dl.mini .dl-h .dl-exp, .dl.mini .dl-h .dl-x { visibility:hidden; transition-property:opacity, visibility; transition-delay:0s, .12s; }
+        .dl.mini .dl-h .dl-n.bad { position:absolute; right:-4px; top:-4px; z-index:2; min-width:0; width:12px; height:12px; padding:0; font-size:0;
+          border-radius:50%; box-shadow:0 0 0 2px rgba(20,20,24,.55), 0 0 10px rgba(255,59,48,.8); animation:dlAlertDot 1.3s ease-in-out infinite; }
+        @keyframes dlAlertDot {
+          0%, 100% { transform:scale(1); box-shadow:0 0 0 2px rgba(20,20,24,.55), 0 0 6px rgba(255,59,48,.6), 0 0 0 0 rgba(255,59,48,.55); }
+          50% { transform:scale(1.15); box-shadow:0 0 0 2px rgba(20,20,24,.55), 0 0 12px rgba(255,59,48,.9), 0 0 0 7px rgba(255,59,48,0); } }
+        @media (prefers-reduced-motion: reduce) { .dl.mini .dl-h .dl-n.bad { animation:none; } }
+        .dl-h .dl-x { position:absolute; right:10px; top:12px; transition:opacity .3s ease .15s; }
+        .dl.mini .dl-h .dl-x { opacity:0; pointer-events:none; transition:opacity .1s ease; }
+        .dl-body { flex:1; min-height:0; transition:opacity .3s ease .16s; }
+        .dl.mini .dl-body { opacity:0; pointer-events:none; transition:opacity .12s ease; }
+        .dl-in { width:var(--dlw, 300px); height:100%; display:flex; flex-direction:column; }
+        @keyframes dlRow { from { opacity:0; transform:translateX(-12px); } to { opacity:1; transform:none; } }
+        @media (prefers-reduced-motion: reduce) { .dl, .dl * { transition:none !important; } }
+        .dl-x { all:unset; cursor:pointer; width:28px; height:28px; border-radius:50%; display:grid; place-items:center; align-self:center; }
+        .dl-x:hover { background:rgba(255,255,255,.2); }
+        .dl-x svg { width:15px; height:15px; fill:currentColor; opacity:.6; }
+        .dl-rows { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:none; padding:0 8px 10px; display:grid; gap:5px; align-content:start; }
+        .dl-rows::-webkit-scrollbar { display:none; }
+        .wx { position:absolute; left:58px; top:10px; z-index:2; width:252px; box-sizing:border-box; /* right of the ☰ button */
+          padding:14px 14px 12px; border-radius:24px; color:#fff; cursor:pointer; -webkit-tap-highlight-color:transparent; overflow:hidden;
+          font:14px var(--paper-font-body1_-_font-family, system-ui, sans-serif); text-shadow:0 1px 2px rgba(0,0,0,.25);
+          background:radial-gradient(120% 60% at 15% -10%, rgba(255,255,255,.2), rgba(255,255,255,0) 60%), rgba(255,255,255,.1);
+          -webkit-backdrop-filter:blur(18px) saturate(180%); backdrop-filter:blur(18px) saturate(180%);
+          box-shadow:0 18px 40px -14px rgba(0,0,0,.5), inset 0 1px 2px rgba(255,255,255,.3), inset 0 0 0 1px rgba(255,255,255,.1);
+          --e:cubic-bezier(.3,.9,.25,1);
+          transition:width .5s var(--e), padding .5s var(--e), border-radius .5s var(--e), left .5s var(--e), opacity .3s ease, transform .3s ease;
+          animation:wxIn .6s var(--e) both; }
+        .wx[hidden] { display:none; }
+        @keyframes wxIn { from { opacity:0; transform:translateX(-14px); } }
+        /* the device list open: the weather (shrunk to its pill) moves over to sit beside the list */
+        .wrap.dl-open .wx { left:calc(var(--h3d-dlw, 256px) + 20px); }
+        /* not in use: shrinks to a small pill (icon and temperature); tap it to open the forecast again */
+        .wx.mini { width:98px; padding:6px 12px 6px 6px; border-radius:22px; }
+        .wx-top { display:grid; grid-template-columns:auto 1fr; align-items:center; column-gap:10px; transition:column-gap .5s var(--e); }
+        .wx-loc { grid-column:1 / -1; font-size:12px; font-weight:600; opacity:.75; letter-spacing:.02em; margin-bottom:2px;
+          max-height:18px; overflow:hidden; white-space:nowrap; transition:max-height .5s var(--e), opacity .3s, margin .5s var(--e); }
+        .wx-ic { width:58px; height:58px; filter:drop-shadow(0 3px 6px rgba(0,0,0,.25)); transition:width .5s var(--e), height .5s var(--e); }
+        .wx-more { display:grid; grid-template-rows:1fr; transition:grid-template-rows .5s var(--e), opacity .35s ease; }
+        .wx-more > div { min-height:0; overflow:hidden; }
+        .wx.mini .wx-top { column-gap:6px; }
+        .wx.mini .wx-loc { max-height:0; opacity:0; margin:0; }
+        .wx.mini .wx-ic { width:30px; height:30px; }
+        .wx.mini .wx-now b { font-size:18px; font-weight:600; letter-spacing:-.01em; }
+        .wx.mini .wx-now span, .wx.mini .wx-now small { max-height:0; opacity:0; margin:0; }
+        .wx.mini .wx-more { grid-template-rows:0fr; opacity:0; }
+        .wx-ic svg, .wx-h svg, .wx-d svg { width:100%; height:100%; display:block; }
+        .wx-now b { display:block; font-size:40px; font-weight:300; letter-spacing:-.03em; line-height:1; white-space:nowrap;
+          transition:font-size .5s var(--e); }
+        .wx-now span { display:block; font-size:13px; font-weight:600; margin-top:3px; max-height:18px; overflow:hidden; white-space:nowrap;
+          transition:max-height .5s var(--e), opacity .3s, margin .5s var(--e); }
+        .wx-now small { display:block; font-size:12px; opacity:.75; margin-top:1px; max-height:16px; overflow:hidden; white-space:nowrap;
+          transition:max-height .5s var(--e), opacity .3s, margin .5s var(--e); }
+        .wx-sec { margin-top:11px; padding-top:9px; border-top:1px solid rgba(255,255,255,.14); }
+        .wx-hours { display:grid; grid-template-columns:repeat(6, 1fr); text-align:center; font-size:12px; }
+        .wx-h { display:grid; justify-items:center; gap:3px; }
+        .wx-h small { opacity:.75; font-size:11px; }
+        .wx-h i { width:24px; height:24px; display:block; }
+        .wx-h b { font-weight:600; }
+        .wx-days { display:grid; gap:11px; }
+        .wx-d { display:grid; grid-template-columns:38px 24px 30px 1fr 30px; align-items:center; column-gap:6px; font-size:13px; }
+        .wx-d > span:first-child { font-weight:600; }
+        .wx-d i { width:24px; height:24px; display:block; position:relative; }
+        .wx-d i em { position:absolute; left:50%; bottom:-9px; transform:translateX(-50%); font:700 9px system-ui; font-style:normal; color:#7fd3ff; line-height:1; }
+        .wx-d .lo { text-align:right; opacity:.6; }
+        .wx-d .hi { font-weight:600; }
+        .wx-bar { position:relative; height:5px; border-radius:3px; background:rgba(0,0,0,.25); box-shadow:inset 0 1px 1px rgba(0,0,0,.2); }
+        .wx-bar b { position:absolute; top:0; bottom:0; border-radius:3px; left:var(--a); right:var(--b); background:linear-gradient(90deg, var(--c1), var(--c2)); }
+        .wx-bar u { position:absolute; top:50%; width:7px; height:7px; margin:-3.5px 0 0 -3.5px; border-radius:50%; left:var(--n);
+          background:#fff; box-shadow:0 0 0 2px rgba(0,0,0,.35); }
+        .wx-foot { display:flex; justify-content:space-between; font-size:12px; opacity:.8; }
+        .wx-foot span { display:inline-flex; align-items:center; gap:4px; }
+        .wx-foot svg { width:13px; height:13px; fill:currentColor; }
+        .wx-empty { font-size:12px; opacity:.7; }
+        /* the rain map under the forecast */
+        .wx-radar { position:relative; margin-top:11px; border-radius:14px; overflow:hidden; background:#1b1d22; isolation:isolate;
+          box-shadow:inset 0 0 0 1px rgba(255,255,255,.12); cursor:default; }
+        .rd-map, .rd-base, .rd-layer { position:absolute; inset:0; }
+        .rd-map img { position:absolute; width:256px; height:256px; max-width:none; user-select:none; pointer-events:none; }
+        .rd-base img { filter:brightness(1.25) contrast(.95); }
+        .rd-layer { opacity:0; transition:opacity .25s ease; }
+        .rd-layer.on { opacity:.85; }
+        .rd-home { position:absolute; left:50%; top:50%; width:9px; height:9px; margin:-4.5px 0 0 -4.5px; border-radius:50%; z-index:2;
+          background:#fff; box-shadow:0 0 0 3px rgba(79,140,255,.9), 0 0 10px rgba(79,140,255,.8); }
+        .rd-bar { position:absolute; left:6px; right:6px; bottom:6px; z-index:3; display:flex; align-items:center; gap:7px; padding:3px 9px 3px 3px;
+          border-radius:13px; background:rgba(12,14,18,.62); -webkit-backdrop-filter:blur(8px); backdrop-filter:blur(8px); color:#fff; }
+        .rd-bar[hidden] { display:none; }
+        .rd-play { all:unset; cursor:pointer; width:20px; height:20px; border-radius:50%; display:grid; place-items:center; background:rgba(255,255,255,.16); }
+        .rd-play:focus-visible { outline:2px solid var(--accent, #f5a524); outline-offset:1px; }
+        .rd-play svg { width:11px; height:11px; fill:currentColor; }
+        .rd-t { font:600 11px system-ui, sans-serif; white-space:nowrap; font-variant-numeric:tabular-nums; }
+        .wx-radar.cast .rd-t { color:#9fd0ff; }
+        .rd-prog { flex:1; height:3px; border-radius:2px; background:rgba(255,255,255,.2); overflow:hidden; }
+        .rd-prog b { display:block; height:100%; background:#fff; transition:width .25s ease; }
+        .rd-cr { position:absolute; right:6px; top:4px; z-index:3; font:500 8.5px system-ui, sans-serif; color:rgba(255,255,255,.6); text-shadow:0 1px 2px #000; }
+        .rd-msg { position:absolute; inset:0; z-index:2; display:grid; place-items:center; padding:0 16px; text-align:center;
+          font:600 12px system-ui, sans-serif; color:rgba(255,255,255,.75); background:rgba(20,22,26,.45); }
+        .rd-msg[hidden] { display:none; }
+        @media (prefers-reduced-motion: reduce) { .rd-layer { transition:none; } }
+        @media (prefers-reduced-motion: reduce) { .wx { animation:none; } }
+        /* compact list: one slim line per device, short state on the right */
+        .dl-q { display:none; font-style:normal; font-size:12px; opacity:.72; white-space:nowrap; font-variant-numeric:tabular-nums; margin-left:auto; padding-left:6px; }
+        .dl-q.good { color:#138a45; opacity:1; } .dl-q.bad { color:#ff453a; opacity:1; font-weight:600; } .dl-q.warn { color:#e08a00; opacity:1; }
+        .dl.compact .dl-q { display:block; }
+        .dl.compact .dl-t small, .dl.compact .dl-ch { display:none; }
+        .dl.compact .dl-rows { gap:3px; padding:0 6px 8px; }
+        .dl.compact .dl-r { padding:2px 8px 2px 2px; border-radius:11px; gap:4px; }
+        .dl.compact .dl-go { gap:8px; padding:2px; }
+        .dl.compact .dl-ic { width:26px; height:26px; border-radius:8px; }
+        .dl.compact .dl-ic svg { width:15px; height:15px; }
+        .dl.compact .dl-t b { font-size:13px; }
+        .dl.compact .dl-r .sw2 { width:34px; height:20px; border-radius:10px; }
+        .dl.compact .dl-r .sw2::after { top:3px; left:3px; width:14px; height:14px; }
+        .dl.compact .dl-r .sw2[aria-pressed="true"]::after { transform:translateX(14px); }
+        .dl.compact .dl-cat { padding:6px 8px 0; font-size:10px; }
+        /* same type of device side by side: a 6-column grid, headings across the whole width */
+        .dl.compact .dl-rows { grid-template-columns:repeat(6, minmax(0, 1fr)); column-gap:4px; }
+        .dl.compact .dl-cat { grid-column:1 / -1; }
+        .dl.compact .dl-r.s6 { grid-column:span 6; }
+        .dl.compact .dl-r.s3 { grid-column:span 3; }
+        .dl.compact .dl-r.s2 { grid-column:span 2; }
+        /* shared lines: small tiles - icon (and switch) on top, name and state below */
+        .dl.compact .dl-r.s3, .dl.compact .dl-r.s2 { position:relative; display:block; padding:5px 6px 6px; min-width:0; }
+        .dl.compact .dl-r.s3 .dl-go, .dl.compact .dl-r.s2 .dl-go { display:flex; flex-direction:column; align-items:flex-start; gap:4px; padding:0; width:100%; box-sizing:border-box; }
+        .dl.compact .dl-r.s3 .dl-t, .dl.compact .dl-r.s2 .dl-t { width:100%; }
+        .dl.compact .dl-r.s3 .dl-t b, .dl.compact .dl-r.s2 .dl-t b { font-size:12px; display:block; }
+        .dl.compact .dl-r.s3 .dl-q, .dl.compact .dl-r.s2 .dl-q { margin:-3px 0 0; padding:0; font-size:11.5px; max-width:100%; overflow:hidden; text-overflow:ellipsis; }
+        .dl.compact .dl-r.s3 .sw2, .dl.compact .dl-r.s2 .sw2 { position:absolute; right:6px; top:8px; }
+        /* a light's card: slide it up or down to dim; it fills with the lamp's colour to its brightness */
+        .dl-rows .dl-r.dim { touch-action:none; cursor:ns-resize; position:relative; overflow:clip; isolation:isolate; }
+        .dl-rows .dl-r.dim.is-on { background:rgba(255,255,255,.1); }
+        .dl-lv { position:absolute; inset:0; z-index:-1; pointer-events:none; border-radius:inherit; transform-origin:50% 100%;
+          transform:scaleY(var(--lvn, 0)); will-change:transform; transition:transform .35s cubic-bezier(.3,.9,.3,1);
+          background:linear-gradient(0deg, color-mix(in srgb, var(--lc, var(--accent)) 62%, transparent), color-mix(in srgb, var(--lc, var(--accent)) 38%, transparent)); }
+        .dl-r.dim.sliding .dl-lv { transition:transform .06s linear; }
+        .dl-rows .dl-r.dim.sliding { box-shadow:inset 0 0 0 1.5px color-mix(in srgb, var(--lc, var(--accent)) 70%, transparent), 0 6px 16px -8px rgba(0,0,0,.4); }
+        .dl-arw { display:flex; gap:4px; flex:none; }
+        .dl-arw button { all:unset; cursor:pointer; width:30px; height:26px; border-radius:13px; display:grid; place-items:center;
+          background:rgba(255,255,255,.16); box-shadow:inset 0 1px 1px rgba(255,255,255,.3); transition:background .2s, transform .12s; }
+        .dl-arw button:hover { background:rgba(255,255,255,.28); }
+        .dl-arw button:active { transform:scale(.9); }
+        .dl-arw button:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+        .dl-arw button[data-dl="stop"] { background:var(--accent); color:#2a1c00; }
+        .dl-arw button.run { background:#49b8ff; color:#fff; }
+        .dl-arw button[aria-disabled="true"] { opacity:.35; cursor:default; }
+        .dl-arw svg { width:16px; height:16px; fill:currentColor; }
+        .dl.compact .dl-arw button { width:26px; height:22px; border-radius:11px; }
+        .dl.compact .dl-arw svg { width:14px; height:14px; }
+        .dl-h .dl-exp { all:unset; position:absolute; right:42px; top:12px; cursor:pointer; width:28px; height:28px; border-radius:50%; display:grid; place-items:center;
+          transition:opacity .3s ease .15s, background .2s; }
+        .dl-h .dl-exp:hover { background:rgba(255,255,255,.2); }
+        .dl-h .dl-exp svg { width:17px; height:17px; fill:currentColor; opacity:.6; transition:transform .35s var(--e); }
+        .dl-h .dl-exp:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+        .dl.mini .dl-h .dl-exp { opacity:0; pointer-events:none; transition:opacity .1s ease; }
+        /* arranging: the tiles wiggle; drag one and the others slide over and resize to share its row */
+        .dl.editing .dl-rows .dl-r { cursor:grab; touch-action:none; user-select:none; -webkit-user-select:none; }
+        .dl.editing .dl-rows .dl-r > * { pointer-events:none; }
+        .dl.editing .dl-rows .dl-r .dl-go { animation:dlWiggle .32s ease-in-out infinite alternate; }
+        .dl.editing .dl-rows .dl-r:nth-child(2n) .dl-go { animation-delay:-.16s; animation-direction:alternate-reverse; }
+        @keyframes dlWiggle { from { transform:rotate(-1.1deg); } to { transform:rotate(1.1deg); } }
+        .dl.editing .dl-rows { touch-action:none; }
+        .dl-r.ph { opacity:.28; box-shadow:inset 0 0 0 1.5px rgba(255,255,255,.55); background:transparent; }
+        .dl-r.ph > * { visibility:hidden; }
+        .dl-r.ghost { position:absolute; z-index:10; margin:0; pointer-events:none; box-sizing:border-box;
+          background:color-mix(in srgb, var(--card-background-color, #fff) 55%, transparent);
+          box-shadow:0 14px 30px -8px rgba(0,0,0,.5), inset 0 1px 1px rgba(255,255,255,.4); transform:scale(1.05); opacity:.96; transform-origin:center; }
+        .dl-r.ghost .dl-go { animation:none; }
+        /* the lifted card lives in its own layer above the panel (not inside the clipped, blurred panel, where some
+           browsers drew it cut off or not at all); it keeps the list's look, without the panel's glass */
+        .dl.dl-float { position:absolute; z-index:8; box-sizing:border-box; overflow:visible; pointer-events:none; padding:0; margin:0;
+          background:none; box-shadow:none; -webkit-backdrop-filter:none; backdrop-filter:none; border-radius:0; transition:none; }
+        .dl.dl-float::before { display:none; }
+        .dl-float .dl-r.ghost { left:0; top:0; width:100%; height:100%; transition:filter .14s ease-out, opacity .14s ease-out;
+          background:color-mix(in srgb, var(--card-background-color, #fff) 88%, transparent); }
+        .dl-chip.done { background:var(--accent); color:#2a1c00; opacity:1; }
+        @media (prefers-reduced-motion: reduce) { .dl.editing .dl-rows .dl-r .dl-go { animation:none; } }
+        .dl-chips { display:flex; gap:6px; padding:0 8px 6px; flex-wrap:wrap; }
+        .dl-chip { all:unset; cursor:pointer; display:inline-flex; align-items:center; gap:5px; height:26px; padding:0 10px 0 8px; border-radius:13px;
+          font-size:11.5px; font-weight:600; background:rgba(255,255,255,.1); box-shadow:inset 0 1px 1px rgba(255,255,255,.18); opacity:.65;
+          transition:background .25s, opacity .25s, box-shadow .25s; }
+        .dl-chip svg { width:14px; height:14px; fill:currentColor; }
+        .dl-chip[aria-pressed="true"] { opacity:1; background:color-mix(in srgb, var(--accent) 30%, rgba(255,255,255,.12));
+          box-shadow:inset 0 1px 1px rgba(255,255,255,.35), inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent); }
+        .dl-chip:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+        /* blind icon: the little blind sits where the real one is and slides with it */
+        .dl-ic.blind .bl-fab { transform-box:view-box; transform-origin:0 5.4px; transform:scaleY(var(--bl, .4)); opacity:.9;
+          transition:transform .45s cubic-bezier(.3,.9,.3,1); }
+        .dl-ic.blind .bl-bar { transform:translateY(calc(var(--bl, .4) * 15.6px)); transition:transform .45s cubic-bezier(.3,.9,.3,1); }
+        .dl-ic.blind.live .bl-fab, .dl-ic.blind.live .bl-bar { transition:none; }
+        .dl-cat { font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; opacity:.55; padding:8px 10px 1px; }
+        .dl-cat:first-child { padding-top:2px; }
+        .dl-opt { margin:0 8px 6px; }
+        .dl-opt + .dl-opt { margin-top:-1px; }
+        .wrap.no-bg > canvas.bg { display:none; }
+        .dl-opt .dl-t b { font-size:13px; }
+        .dl-opt .dl-ic { width:30px; height:30px; border-radius:10px; }
+        /* "Dots & network status" switched off in the device list: offline alerts still show */
+        .wrap.no-overlays .hint:not(.alert):not(.back) { display:none; }
+        .wrap.no-overlays .lbl.multi { display:none; }
+        .dl-r { display:flex; align-items:center; gap:6px; padding:4px 10px 4px 4px; border-radius:14px; background:rgba(255,255,255,.1);
+          box-shadow:inset 0 1px 1px rgba(255,255,255,.18); transition:background .25s; }
+        .dl-r.is-on { background:rgba(255,255,255,.2); }
+        .dl-r.is-bad { background:rgba(255,59,48,.14); box-shadow:inset 0 0 0 1px rgba(255,110,100,.35); }
+        .dl-go { all:unset; flex:1; min-width:0; display:flex; align-items:center; gap:10px; cursor:pointer; padding:4px; border-radius:11px; }
+        .dl-go:focus-visible, .dl-r .sw2:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+        .dl-ic { width:34px; height:34px; flex:none; border-radius:11px; display:grid; place-items:center; background:rgba(255,255,255,.16);
+          box-shadow:inset 0 1px 1px rgba(255,255,255,.3); transition:background .25s, color .25s; }
+        .dl-ic svg { width:18px; height:18px; fill:currentColor; opacity:.75; }
+        .dl-r.is-on .dl-ic { background:var(--accent); color:#2a1c00; box-shadow:0 0 12px color-mix(in srgb, var(--accent) 55%, transparent), inset 0 1px 1px rgba(255,255,255,.6); }
+        .dl-r.is-on .dl-ic svg { opacity:1; }
+        .dl-r.is-on .dl-ic.tint { color:var(--ic-fg);
+          background:color-mix(in srgb, var(--ic-bg) var(--ic-a), #1c1c1e);
+          box-shadow:0 0 14px color-mix(in srgb, var(--ic-bg) 60%, transparent), inset 0 1px 1px rgba(255,255,255,.55); }
+        .dl-ic { transition:background .5s ease, color .5s ease, box-shadow .5s ease; }
+        .dl-ic.spin svg { animation:dlSpin var(--spin, 1s) linear infinite; }
+        @keyframes dlSpin { to { transform:rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) { .dl-ic.spin svg { animation:none; } }
+        .dl-ic.roam svg { animation:dlRoam 2.6s ease-in-out infinite; }
+        @keyframes dlRoam { 0%,100% { transform:translate(-2px,1px) rotate(-14deg); } 25% { transform:translate(1px,-2px) rotate(8deg); }
+          50% { transform:translate(2px,1px) rotate(18deg); } 75% { transform:translate(-1px,2px) rotate(-4deg); } }
+        @media (prefers-reduced-motion: reduce) { .dl-ic.roam svg { animation:none; } }
+        .dl-r.is-on[data-ic="vacuum"] .dl-ic { background:#49b8ff; color:#fff; box-shadow:0 0 14px rgba(73,184,255,.55), inset 0 1px 1px rgba(255,255,255,.55); }
+        .dl-r.is-bad .dl-ic { background:rgba(255,59,48,.85); color:#fff; }
+        .dl-t { min-width:0; display:grid; }
+        .dl-t b { font-weight:600; font-size:13.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .dl-t small { font-size:11.5px; opacity:.7; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-variant-numeric:tabular-nums; }
+        .dl-t small.good { color:#138a45; opacity:1; } .dl-t small.bad { color:#ff453a; opacity:1; font-weight:600; } .dl-t small.warn { color:#e08a00; opacity:1; }
+        .dl-ch { margin-left:auto; display:grid; place-items:center; }
+        .dl-ch svg { width:16px; height:16px; fill:currentColor; opacity:.4; }
+        .dl-r .sw2 { all:unset; position:relative; flex:none; width:42px; height:24px; border-radius:12px; cursor:pointer;
+          background:rgba(127,127,127,.3); box-shadow:inset 0 1px 2px rgba(0,0,0,.15); transition:background .2s; }
+        .dl-r .sw2::after { content:""; position:absolute; top:3px; left:3px; width:18px; height:18px; border-radius:50%; background:#fff;
+          box-shadow:0 1px 3px rgba(0,0,0,.3); transition:transform .22s cubic-bezier(.3,1.3,.5,1); }
+        .dl-r .sw2[aria-pressed="true"] { background:var(--accent); }
+        .dl-r .sw2[aria-pressed="true"]::after { transform:translateX(18px); }
+        .menu.wide { width:min(380px, calc(100% - 16px)); }
+        .cam { position:relative; aspect-ratio:16/9; border-radius:14px; overflow:hidden; background:#07090c;
+          box-shadow:inset 0 0 0 1px rgba(255,255,255,.12); }
+        .cam > img, .cam > ha-camera-stream { display:block; width:100%; height:100%; object-fit:cover; --video-max-height:100%; }
+        .cam .live { position:absolute; left:8px; top:8px; z-index:1; padding:2px 7px 2px 16px; border-radius:6px;
+          font:700 10px system-ui, sans-serif; letter-spacing:.08em; color:#fff; background:rgba(0,0,0,.45); }
+        .cam .live::before { content:""; position:absolute; left:6px; top:50%; width:6px; height:6px; margin-top:-3px; border-radius:50%;
+          background:#ff4040; box-shadow:0 0 6px #ff4040; animation:blink 1.6s ease-in-out infinite; }
+        .cam .live.off::before { background:#888; box-shadow:none; animation:none; }
+        @keyframes blink { 50% { opacity:.25; } }
+        @media (prefers-reduced-motion: reduce) { .cam .live::before { animation:none; } }
+        .menu { --accent: var(--h3d-accent, #f5a524); --tint: var(--h3d-glass-tint, 32%);
+          --glass: color-mix(in srgb, var(--card-background-color, #fff) var(--tint), transparent);
+          position:absolute; left:0; top:0; width:232px; box-sizing:border-box; isolation:isolate;
+          max-height:calc(100% - 16px); overflow-y:auto; overscroll-behavior:contain; scrollbar-width:none;
+          display:grid; gap:12px; padding:14px; border-radius:24px; z-index:2;
+          color:var(--primary-text-color,#1c1c1e);
+          background:
+            radial-gradient(130% 80% at 20% -15%, rgba(255,255,255,.26), rgba(255,255,255,.08) 35%, rgba(255,255,255,0) 65%),
+            radial-gradient(90% 60% at 110% 120%, rgba(255,255,255,.14), rgba(255,255,255,0) 60%),
+            var(--glass);
+          -webkit-backdrop-filter: blur(16px) saturate(190%) brightness(1.06);
+          backdrop-filter: blur(16px) saturate(190%) brightness(1.06);
+          box-shadow:
+            0 18px 40px -12px rgba(0,0,0,.45),
+            0 2px 6px rgba(0,0,0,.12),
+            inset 0 1px 3px rgba(255,255,255,.28),
+            inset 0 -10px 20px -14px rgba(255,255,255,.22),
+            inset 0 0 28px rgba(255,255,255,.07);
+          font:14px var(--paper-font-body1_-_font-family, system-ui, sans-serif);
+          transform-origin:var(--tail,50%) 100%; }
+        /* light-catching rim; its angle follows the camera so the sheen moves as you rotate */
+        .menu::before { content:""; position:absolute; inset:0; border-radius:inherit; padding:1.5px; pointer-events:none; z-index:-1;
+          background:linear-gradient(var(--sheen,135deg),
+            rgba(255,255,255,.55) 0%, rgba(255,255,255,.34) 12%, rgba(255,255,255,.16) 28%, rgba(255,255,255,.06) 45%,
+            rgba(255,255,255,.04) 58%, rgba(255,255,255,.10) 74%, rgba(255,255,255,.22) 88%, rgba(255,255,255,.32) 100%);
+          filter:blur(.6px); opacity:.9;
+          transform:translateY(var(--st, 0px)); /* the card's scroll: keeps the rim on the card, not on its contents */
+          -webkit-mask:linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          -webkit-mask-composite:xor; mask:linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0); }
+        /* phone view: one device at a time, its button at the bottom, swipe for the next one */
+        .phb { position:absolute; left:50%; bottom:84px; transform:translateX(-50%); z-index:3; display:flex; align-items:center; gap:10px;
+          max-width:calc(100% - 24px); color:#fff; text-shadow:0 1px 3px rgba(0,0,0,.5); transition:opacity .2s, transform .25s; }
+        .phb[hidden] { display:none; }
+        .phb.under { opacity:0; pointer-events:none; transform:translateX(-50%) translateY(8px); }
+        .phb-t { display:grid; justify-items:center; gap:5px; min-width:0; }
+        .phb-t b { font:600 15px system-ui, sans-serif; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:60vw; }
+        .phb-d { display:flex; gap:5px; font:600 11px system-ui, sans-serif; opacity:.8; }
+        .phb-d i { width:6px; height:6px; border-radius:50%; background:rgba(255,255,255,.4); transition:background .2s, transform .2s; }
+        .phb-d i.on { background:#fff; transform:scale(1.25); }
+        .phb-a { all:unset; cursor:pointer; width:34px; height:34px; border-radius:50%; display:grid; place-items:center; color:#fff;
+          background:rgba(255,255,255,.14); -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px); }
+        .phb-a:hover { background:rgba(255,255,255,.24); }
+        .phb-a:focus-visible, .phx:focus-visible { outline:2px solid var(--accent, #f5a524); outline-offset:2px; }
+        .phb-a svg { width:18px; height:18px; fill:currentColor; }
+        .phb-a[data-ph="-1"] svg { transform:rotate(180deg); }
+        .phx { all:unset; position:absolute; right:12px; top:12px; z-index:4; cursor:pointer; display:flex; align-items:center; gap:4px; height:32px; padding:0 12px 0 9px;
+          border-radius:16px; font:600 12.5px system-ui, sans-serif; color:#fff; background:rgba(255,255,255,.14);
+          -webkit-backdrop-filter:blur(10px); backdrop-filter:blur(10px); box-shadow:inset 0 0 0 1px rgba(255,255,255,.14); }
+        .phx[hidden] { display:none; }
+        .phx:hover { background:rgba(255,255,255,.22); }
+        .phx svg { width:15px; height:15px; fill:currentColor; }
+        .wrap.phone .wx { display:none; } /* the weather pill makes room for Exit */
+        /* a device that's on: its round button breathes, very gently (not while the card grows or shrinks) */
+        .menu.mini:not(.morph) .pw.on { animation:pwPulse 2.4s ease-in-out infinite; }
+        @keyframes pwPulse { 50% { transform:scale(1.045); filter:brightness(1.12); } }
+        @media (prefers-reduced-motion: reduce) { .menu.mini .pw.on { animation:none; } }
+        /* something's wrong (internet down, a device offline): the round button turns red and pulses */
+        .menu .pw.alert { background:#ff3b30; color:#fff; box-shadow:0 0 16px rgba(255,59,48,.6), inset 0 1px 1px rgba(255,255,255,.4); }
+        .menu.mini:not(.morph) .pw.alert { animation:pwAlert 1.4s ease-in-out infinite; }
+        @keyframes pwAlert {
+          0%, 100% { transform:scale(1); box-shadow:0 0 10px rgba(255,59,48,.5), 0 0 0 0 rgba(255,59,48,.55); }
+          50% { transform:scale(1.06); box-shadow:0 0 18px rgba(255,59,48,.85), 0 0 0 9px rgba(255,59,48,0); } }
+        @media (prefers-reduced-motion: reduce) { .menu.mini .pw.alert { animation:none; } }
+        .menu.below { transform-origin:var(--tail,50%) 0%; }
+        .menu[hidden] { display:none; }
+        .menu.in { animation:jelly .55s cubic-bezier(.2,.9,.3,1.2); }
+        .menu.out { animation:menuOut .3s cubic-bezier(.55,0,.75,.3) forwards; pointer-events:none; }
+        @keyframes menuOut {
+          0% { opacity:1; transform:none; filter:none; }
+          30% { transform:scale(1.03, .97); }
+          100% { opacity:0; transform:scale(.5, .42); filter:blur(5px); } }
+        @keyframes jelly {
+          0% { opacity:0; transform:scale(.55,.45); filter:blur(4px); }
+          40% { opacity:1; transform:scale(1.05,.96); filter:none; }
+          65% { transform:scale(.98,1.03); }
+          85% { transform:scale(1.01,.99); }
+          100% { transform:none; } }
+        @media (prefers-reduced-motion: reduce) { .menu.in, .menu.out { animation:none; } }
+        /* droplet between the panel and the device */
+        .drop { position:absolute; left:clamp(18px, var(--tail,50%), calc(100% - 18px)); bottom:-15px; width:10px; height:10px;
+          margin-left:-5px; border-radius:50%; background:var(--glass);
+          -webkit-backdrop-filter:blur(8px) saturate(190%); backdrop-filter:blur(8px) saturate(190%);
+          box-shadow:inset 0 1px 2px rgba(255,255,255,.45), inset 0 -1px 2px rgba(255,255,255,.18), 0 2px 5px rgba(0,0,0,.25); }
+        .menu.below .drop { bottom:auto; top:-15px; }
+        .menu > .drop { display:none; }
+        .mh { display:flex; align-items:center; gap:8px; }
+        /* a light that's off: the panel is just its power button, a round glass bubble above the lamp */
+        .menu.mini { width:auto; padding:6px; gap:0; border-radius:30px; overflow:hidden; }
+        .menu.mini .mt, .menu.mini .mx, .menu.mini > :not(.mh):not(.drop) { display:none; }
+        .menu.mini .pw { width:44px; min-width:44px; height:44px; }
+        .menu.mini .pw svg { width:22px; height:22px; }
+        .menu.morph { overflow:hidden; grid-template-columns:minmax(0, 1fr); } /* contents follow the panel's size as it grows */
+        .menu.morph.grow > :not(.mh):not(.drop):not(.mf) { contain:layout paint; }
+        .menu.grow > :not(.mh):not(.drop):not(.mf), .menu.grow .mt, .menu.grow .mx { animation:menuFade .3s ease .2s both; }
+        /* the open card's power button, at the bottom, the same size as on its own */
+        .menu .mf { display:flex; justify-content:center; position:sticky; bottom:0; z-index:1; margin-top:-2px; }
+        .menu .mf .pw { width:44px; min-width:44px; height:44px; }
+        .menu .mf .pw svg { width:22px; height:22px; }
+        @keyframes menuFade { from { opacity:0; } }
+        .mt { flex:1; min-width:0; }
+        .mn { font-weight:650; letter-spacing:-.01em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .ms { font-size:12px; opacity:.72; font-variant-numeric:tabular-nums; }
+        .menu button { box-shadow:none; opacity:1; min-width:32px; height:32px; padding:0; border-radius:50%;
+          background:rgba(255,255,255,.16); box-shadow:inset 0 1px 1px rgba(255,255,255,.5), inset 0 -1px 1px rgba(0,0,0,.06);
+          transition:background .15s, transform .15s; }
+        .menu button:hover { background:rgba(255,255,255,.28); }
+        .menu button:active { transform:scale(.92); }
+        .menu button:focus-visible, .menu input:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+        .menu .pw.on { color:#2a1c00; background:linear-gradient(180deg, color-mix(in srgb, var(--accent) 55%, #fff), var(--accent));
+          box-shadow:0 0 16px color-mix(in srgb, var(--accent) 70%, transparent), inset 0 1px 1px rgba(255,255,255,.75); }
+        .menu .mx { background:transparent; box-shadow:none; }
+        .menu .mx svg { width:16px; height:16px; opacity:.6; }
+        .row { display:grid; gap:7px; }
+        .rl { display:flex; justify-content:space-between; font-size:12px; opacity:.85; }
+        .rl b { font-weight:600; font-variant-numeric:tabular-nums; }
+        .menu input[type=range] { -webkit-appearance:none; appearance:none; width:100%; height:24px; margin:0; background:transparent; cursor:pointer; }
+        .menu input[type=range]::-webkit-slider-runnable-track { height:10px; border-radius:5px;
+          background:linear-gradient(90deg, var(--accent) var(--p,50%), rgba(255,255,255,.18) var(--p,50%));
+          box-shadow:inset 0 1px 2px rgba(0,0,0,.2), inset 0 -1px 0 rgba(255,255,255,.35); }
+        .menu input[type=range]::-moz-range-track { height:10px; border-radius:5px; background:rgba(255,255,255,.18);
+          box-shadow:inset 0 1px 2px rgba(0,0,0,.2), inset 0 -1px 0 rgba(255,255,255,.35); }
+        .menu input[type=range]::-moz-range-progress { height:10px; border-radius:5px; background:var(--accent); }
+        .menu input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:22px; height:22px; margin-top:-6px; border-radius:50%;
+          background:radial-gradient(circle at 50% 30%, #fff, rgba(255,255,255,.75) 60%, rgba(230,230,235,.9));
+          box-shadow:0 2px 6px rgba(0,0,0,.3), inset 0 -1px 2px rgba(0,0,0,.08); }
+        .menu input[type=range]::-moz-range-thumb { width:22px; height:22px; border:0; border-radius:50%;
+          background:radial-gradient(circle at 50% 30%, #fff, rgba(255,255,255,.75) 60%, rgba(230,230,235,.9));
+          box-shadow:0 2px 6px rgba(0,0,0,.3); }
+        .sw { display:flex; flex-wrap:wrap; gap:7px; }
+        .menu .sw button { width:24px; min-width:24px; height:24px; border-radius:50%;
+          background:radial-gradient(circle at 35% 28%, rgba(255,255,255,.75), rgba(255,255,255,0) 42%), var(--c);
+          box-shadow:inset 0 -2px 3px rgba(0,0,0,.18), 0 1px 3px rgba(0,0,0,.25); }
+        .menu .sw button.sel { box-shadow:inset 0 -2px 3px rgba(0,0,0,.18), 0 0 0 2px rgba(255,255,255,.85), 0 0 12px var(--c); }
+        .btns { display:flex; gap:6px; justify-content:space-between; }
+        /* the light's card, laid out like Apple's Home app: dark material, one big slider, colour circles */
+        .menu.hkl { --card-background-color:#1c1c1e; --tint:72%; color:#fff; gap:12px; }
+        .menu.hkl .mh { gap:10px; }
+        .menu.hkl .mn { font-weight:600; }
+        .menu.hkl .ms { color:#98989f; opacity:1; font-size:13px; }
+        .menu.hkl .mx svg { fill:#fff; }
+        .hk-ic { width:34px; height:34px; flex:none; border-radius:50%; display:grid; place-items:center; background:rgba(255,255,255,.14); color:#fff;
+          transition:background .3s, color .3s, box-shadow .3s; }
+        .hk-ic svg { width:19px; height:19px; fill:currentColor; }
+        .hk-ic.on { background:var(--lc); color:#1c1c1e; box-shadow:0 0 14px color-mix(in srgb, var(--lc) 55%, transparent); }
+        .menu.mini .hk-ic { display:none; }
+        .lt-box.hk { padding:0; }
+        .lt-box.hk .lt { width:76px; height:150px; border-radius:22px; background:rgba(255,255,255,.14);
+          box-shadow:inset 0 0 0 .5px rgba(255,255,255,.18); }
+        .lt-box.hk .lt-f { background:var(--lc); box-shadow:none; }
+        .lt-box.hk .lt-ic { bottom:14px; width:24px; height:24px; color:rgba(0,0,0,.72); }
+        .lt-box.hk .lt.dark .lt-ic { color:rgba(255,255,255,.85); }
+        .hk-sw { display:flex; flex-wrap:wrap; justify-content:center; gap:10px; padding:0 4px; }
+        .menu .hk-sw button { width:30px; height:30px; min-width:30px; border-radius:50%; padding:0; background:var(--c);
+          box-shadow:inset 0 0 0 .5px rgba(255,255,255,.25); transition:box-shadow .2s, transform .15s; }
+        .menu .hk-sw button:hover { background:var(--c); transform:scale(1.06); }
+        .menu .hk-sw button.sel { box-shadow:0 0 0 2.5px #1c1c1e, 0 0 0 4.5px #fff; }
+        .menu.hkl .pw.on { background:var(--lcp, var(--accent)); color:#1c1c1e; box-shadow:0 0 16px color-mix(in srgb, var(--lcp, var(--accent)) 55%, transparent); }
+        .lt-box { display:flex; flex-direction:column; align-items:center; gap:6px; padding:0 0 2px; }
+        .lt-pct b { font-size:30px; font-weight:650; letter-spacing:-.6px; font-variant-numeric:tabular-nums; line-height:1; }
+        .lt { position:relative; width:100px; height:96px; border-radius:24px; overflow:hidden; touch-action:none; cursor:ns-resize; outline:none;
+          -webkit-tap-highlight-color:transparent; background:rgba(120,120,128,.28);
+          box-shadow:inset 0 0 0 1px rgba(255,255,255,.22), inset 0 3px 10px rgba(0,0,0,.2), 0 6px 16px -8px rgba(0,0,0,.35);
+          transition:transform .2s cubic-bezier(.3,.9,.3,1.3); }
+        .lt:focus-visible { box-shadow:inset 0 0 0 1px rgba(255,255,255,.3), 0 0 0 3px color-mix(in srgb, var(--accent) 60%, transparent); }
+        .lt.drag { transform:scale(1.03); }
+        .lt-f { position:absolute; left:0; right:0; bottom:0; height:var(--lv); transition:height .35s cubic-bezier(.3,.9,.3,1);
+          background:linear-gradient(180deg, color-mix(in srgb, var(--lc) 70%, #fff), var(--lc));
+          box-shadow:0 0 24px color-mix(in srgb, var(--lc) 60%, transparent); }
+        .lt.drag .lt-f { transition:none; }
+        .lt-ic { position:absolute; left:50%; bottom:14px; transform:translateX(-50%); width:26px; height:26px; color:#2a1c00; transition:color .25s; }
+        .lt.dark .lt-ic { color:#fff; }
+        .lt-ic svg { width:100%; height:100%; fill:currentColor; }
+        .bl-box { display:flex; flex-direction:column; align-items:center; gap:10px; padding:2px 0 4px; }
+        .bl-pct b.word { font-size:24px; }
+        .bl-pct b { font-size:30px; font-weight:650; letter-spacing:-.6px; font-variant-numeric:tabular-nums; line-height:1; }
+        .bl { position:relative; width:118px; height:196px; border-radius:30px; overflow:hidden; touch-action:none; cursor:ns-resize;
+          outline:none; -webkit-tap-highlight-color:transparent;
+          background:linear-gradient(180deg, rgba(160,205,255,.55), rgba(215,232,255,.28) 55%, rgba(255,255,255,.14));
+          box-shadow:inset 0 0 0 1px rgba(255,255,255,.3), inset 0 3px 10px rgba(0,0,0,.18), 0 6px 16px -8px rgba(0,0,0,.35);
+          transition:transform .2s cubic-bezier(.3,.9,.3,1.3); }
+        .bl::before { content:""; position:absolute; inset:0; pointer-events:none; /* window frame cross, behind the blind */
+          background:linear-gradient(90deg, transparent calc(50% - 1px), rgba(255,255,255,.4) calc(50% - 1px) calc(50% + 1px), transparent calc(50% + 1px)),
+                     linear-gradient(180deg, transparent calc(50% - 1px), rgba(255,255,255,.4) calc(50% - 1px) calc(50% + 1px), transparent calc(50% + 1px)); }
+        .bl:focus-visible { box-shadow:inset 0 0 0 1px rgba(255,255,255,.3), 0 0 0 3px color-mix(in srgb, var(--accent) 60%, transparent); }
+        .bl.drag { transform:scale(1.03); }
+        .bl-f { position:absolute; left:0; right:0; top:0; height:var(--c); transition:height .45s cubic-bezier(.3,.9,.3,1);
+          background:repeating-linear-gradient(180deg, #fafafc 0 9px, #d2d2d8 9px 10px);
+          box-shadow:0 3px 8px rgba(0,0,0,.18); }
+        .bl-bar { position:absolute; left:10px; right:10px; top:var(--c); height:6px; margin-top:-4px; border-radius:3px;
+          background:linear-gradient(180deg, #f4f4f6, #b9b9c1); box-shadow:0 2px 4px rgba(0,0,0,.3); transition:top .45s cubic-bezier(.3,.9,.3,1); }
+        .bl.drag .bl-f, .bl.drag .bl-bar, .bl.live .bl-f, .bl.live .bl-bar { transition:none; }
+        .bl-btns { display:flex; gap:8px; }
+        .menu .bl-btns button { width:40px; min-width:40px; height:32px; border-radius:16px; }
+        .menu .btns button { flex:1; border-radius:12px; height:36px; }
+        .temp { display:flex; align-items:center; justify-content:space-between; }
+        .tgl { display:flex; align-items:center; justify-content:space-between; font-size:13px; }
+        .menu .sw2 { position:relative; width:42px; min-width:42px; height:24px; border-radius:12px; padding:0;
+          background:rgba(255,255,255,.18); box-shadow:inset 0 1px 2px rgba(0,0,0,.25); transition:background .2s; }
+        .menu .sw2::after { content:""; position:absolute; top:3px; left:3px; width:18px; height:18px; border-radius:50%;
+          background:radial-gradient(circle at 50% 30%, #fff, #e8e8ec); box-shadow:0 1px 3px rgba(0,0,0,.35); transition:transform .2s; }
+        .menu .sw2[aria-pressed="true"] { background:var(--accent); }
+        .menu .sw2[aria-pressed="true"]::after { transform:translateX(18px); }
+        .seg2 { display:flex; gap:3px; padding:3px; border-radius:12px; background:rgba(255,255,255,.1);
+          box-shadow:inset 0 1px 2px rgba(0,0,0,.2); }
+        .menu .seg2 button { flex:1; height:28px; border-radius:9px; font-size:12px; font-weight:600; background:transparent; box-shadow:none; opacity:.75; }
+        .menu .seg2 button[aria-pressed="true"] { background:rgba(255,255,255,.34); opacity:1;
+          box-shadow:inset 0 1px 1px rgba(255,255,255,.6), 0 1px 3px rgba(0,0,0,.2); }
+        .aq { display:grid; grid-template-columns:repeat(3, 1fr); gap:5px; }
+        .aqc { display:grid; gap:0; padding:6px 7px; border-radius:10px; background:rgba(255,255,255,.08); min-width:0; }
+        .aqn { font-size:10.5px; opacity:.7; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .aqc b { font-size:14px; font-weight:600; font-variant-numeric:tabular-nums; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .aqc small { font-size:10px; font-weight:500; opacity:.7; }
+        .heat { display:grid; gap:8px; padding:10px 10px 8px; margin:0 -4px; border-radius:14px; background:rgba(255,255,255,.06); transition:background .3s; }
+        /* the fan's card, laid out like Dyson's app: dark, a big speed number, round controls */
+        .menu.dyf { --card-background-color:#15171b; --tint:74%; color:#f4f5f7; gap:6px; padding:11px 12px; }
+        .menu.dyf .ms { color:#a9aeb8; opacity:1; }
+        .menu.dyf .mx svg { fill:#f4f5f7; }
+        .menu.dyf .mf .pw { width:40px; min-width:40px; height:40px; }
+        .menu.dyf .pw.on { background:#fff; color:#15171b; box-shadow:0 0 18px rgba(255,255,255,.28), inset 0 1px 1px #fff; }
+        .dy-spd { display:grid; grid-template-columns:36px 1fr 36px; align-items:center; gap:6px; padding:4px 6px; border-radius:18px; background:rgba(255,255,255,.06); }
+        .menu .dy-pm { width:36px; height:36px; min-width:36px; background:rgba(255,255,255,.1); box-shadow:none; color:#f4f5f7; display:grid; place-items:center; }
+        .menu .dy-pm svg { width:18px; height:18px; fill:currentColor; }
+        .menu .dy-pm[disabled] { opacity:.3; cursor:default; }
+        .dy-n { display:grid; justify-items:center; gap:4px; }
+        .dy-n b { font-size:28px; font-weight:300; letter-spacing:-.5px; line-height:1; font-variant-numeric:tabular-nums; }
+        .dy-spd.auto .dy-n b { font-size:18px; font-weight:600; letter-spacing:.08em; text-transform:uppercase; padding:6px 0 1px; }
+        .dy-bars { display:flex; align-items:flex-end; gap:3px; height:11px; }
+        .dy-bars i { width:5px; height:var(--h); border-radius:2px; background:rgba(255,255,255,.18); transition:background .2s; }
+        .dy-bars i.on { background:#fff; }
+        .dy-row { display:flex; justify-content:space-between; gap:2px; }
+        .menu .dy-b { flex:1; min-width:0; height:auto; padding:0; border-radius:12px; background:none; box-shadow:none; display:grid; justify-items:center; gap:3px; color:inherit; }
+        .menu .dy-b:hover { background:none; }
+        .dy-b span { width:36px; height:36px; border-radius:50%; display:grid; place-items:center; background:rgba(255,255,255,.08);
+          box-shadow:inset 0 0 0 1px rgba(255,255,255,.08); transition:background .2s, color .2s, box-shadow .2s; }
+        .dy-b:hover span { background:rgba(255,255,255,.14); }
+        .dy-b span svg { width:19px; height:19px; fill:currentColor; transition:transform .3s ease; }
+        .dy-b.rev span svg { transform:scaleY(-1); }
+        .dy-b small { font-size:10.5px; font-weight:600; color:#a9aeb8; white-space:nowrap; }
+        .dy-b[aria-pressed="true"] span { background:#fff; color:#15171b; box-shadow:0 4px 14px rgba(0,0,0,.35); }
+        .dy-b[aria-pressed="true"] small { color:#f4f5f7; }
+        .dy-b.heat[aria-pressed="true"] span { background:linear-gradient(180deg, #ffa066, #ff6a2c); color:#fff; box-shadow:0 4px 14px rgba(255,106,44,.4); }
+        .dy-heat { display:flex; align-items:center; gap:6px; padding:2px 4px 2px 12px; border-radius:16px; background:linear-gradient(90deg, rgba(255,120,60,.26), rgba(255,120,60,.1)); }
+        .dy-heat span { flex:1; font-size:12px; font-weight:600; color:#ffb48a; }
+        .dy-heat b { font-size:17px; font-weight:400; min-width:38px; text-align:center; color:#ff9a5c; font-variant-numeric:tabular-nums; }
+        .menu .dy-heat button { width:26px; height:26px; min-width:26px; background:rgba(255,255,255,.1); box-shadow:none; color:#f4f5f7; }
+        .menu .dy-heat button svg { width:15px; height:15px; fill:currentColor; }
+        .dy-aq { display:flex; align-items:center; gap:7px; padding:0 2px; font-size:11.5px; }
+        .dy-aq span { flex:1; color:#a9aeb8; font-weight:600; }
+        .dy-aq b { font-weight:700; color:var(--q); }
+        .dy-aq i { width:8px; height:8px; border-radius:50%; background:var(--q); box-shadow:0 0 8px var(--q); }
+        .q-good { --q:#34d17f; } .q-fair { --q:#f5b83d; } .q-poor { --q:#ff5a4e; }
+        /* readings: temperature and humidity share the first line, the pollutants go four to a line */
+        .menu.dyf .aq { gap:3px; grid-template-columns:repeat(12, minmax(0, 1fr)); }
+        .menu.dyf .aqc { grid-column:span 6; }
+        .menu.dyf .aqc[data-p] { grid-column:span 3; display:grid; justify-items:center; gap:0; padding:3px 4px 4px; }
+        .menu.dyf .aqc[data-p] .aqn { gap:3px; }
+        .menu.dyf .aqc { display:flex; align-items:baseline; justify-content:space-between; gap:4px; padding:3px 7px; border-radius:9px; background:rgba(255,255,255,.06); }
+        .menu.dyf .aqn { font-size:10px; color:#a9aeb8; opacity:1; display:flex; align-items:center; gap:4px; min-width:0; }
+        .menu.dyf .aqc[data-q] .aqn::before { content:""; width:5px; height:5px; border-radius:50%; background:var(--q, transparent); flex:none; }
+        .menu.dyf .aqc[data-q="good"] { --q:#34d17f; } .menu.dyf .aqc[data-q="fair"] { --q:#f5b83d; } .menu.dyf .aqc[data-q="poor"] { --q:#ff5a4e; }
+        .menu.dyf .aqc b { font-size:12.5px; flex:none; }
+        .menu.dyf .aqc[data-p] small { display:none; } /* pollutant units (µg/m³) don't fit four across */
+        .heat.on { background:linear-gradient(160deg, rgba(255,120,40,.28), rgba(255,80,20,.12)); }
+        .heat.on .temp b { color:#ffb070; }
+        .menu .heat .sw2[aria-pressed="true"] { background:#ff7a2a; }
+        .temp b { font-size:22px; font-weight:600; font-variant-numeric:tabular-nums; }
+        .vac { display:grid; gap:10px; }
+        .vac-hero { display:flex; align-items:center; gap:14px; padding:2px 2px 0; }
+        .vac-bot { position:relative; flex:none; width:62px; height:62px; border-radius:50%;
+          background:radial-gradient(circle at 50% 38%, #fff, #e9ebef 62%, #c9ccd3);
+          box-shadow:inset 0 -3px 5px rgba(0,0,0,.14), 0 4px 12px -4px rgba(0,0,0,.35), 0 0 0 1px rgba(255,255,255,.5); }
+        .vac-bot::before { content:""; position:absolute; left:9px; right:9px; top:39px; height:1px; background:rgba(0,0,0,.14); }
+        .vac-led { position:absolute; left:50%; top:44px; width:7px; height:10px; margin-left:-3.5px; border-radius:4px; background:#cfd4dc; }
+        .vac.cleaning .vac-led { background:#49b8ff; box-shadow:0 0 8px #49b8ff; }
+        .vac.returning .vac-led { background:#ffb020; box-shadow:0 0 8px #ffb020; }
+        .vac.docked .vac-led { background:#46d160; box-shadow:0 0 6px #46d160; }
+        .vac.error .vac-led { background:#ff3b30; box-shadow:0 0 8px #ff3b30; }
+        .vac.cleaning .vac-bot { animation:vacRoam 3.2s ease-in-out infinite; }
+        .vac.returning .vac-bot { animation:vacRoam 5s ease-in-out infinite; }
+        @keyframes vacRoam { 0%,100% { transform:translateX(-3px) rotate(-10deg); } 50% { transform:translateX(3px) rotate(12deg); } }
+        @media (prefers-reduced-motion: reduce) { .vac .vac-bot { animation:none !important; } }
+        .vac-bt { display:grid; gap:4px; min-width:0; flex:1; }
+        .vac-bt b { font-size:30px; font-weight:650; letter-spacing:-.6px; line-height:1; font-variant-numeric:tabular-nums; }
+        .vac-bt b small { font-size:16px; font-weight:600; margin-left:1px; opacity:.7; }
+        .vac-bt b.w { font-size:20px; }
+        .vac-w { font-size:11.5px; opacity:.7; }
+        .vac-bar { position:relative; height:8px; border-radius:4px; overflow:hidden; background:rgba(255,255,255,.18);
+          box-shadow:inset 0 1px 2px rgba(0,0,0,.2); }
+        .vac-bar i { position:absolute; left:0; top:0; bottom:0; width:var(--b); border-radius:4px; background:#46d160; transition:width .6s ease; }
+        .vac-bar.low i { background:#ff453a; }
+        .vac-bar.chg i { background:linear-gradient(90deg, #46d160 0 40%, #9af0a8 50%, #46d160 60% 100%); background-size:250% 100%; animation:vacChg 2s linear infinite; }
+        @keyframes vacChg { from { background-position:100% 0; } to { background-position:-150% 0; } }
+        @media (prefers-reduced-motion: reduce) { .vac-bar.chg i { animation:none; } }
+        .menu .vac-go { display:flex; align-items:center; justify-content:center; gap:8px; height:44px; border-radius:22px; font-size:14px; font-weight:650;
+          color:#fff; background:linear-gradient(180deg, #6cc6ff, #2f9ff0); box-shadow:0 6px 16px -6px rgba(47,159,240,.8), inset 0 1px 1px rgba(255,255,255,.55); }
+        .menu .vac-go.run { color:inherit; background:rgba(255,255,255,.22); box-shadow:inset 0 1px 1px rgba(255,255,255,.55), 0 2px 6px rgba(0,0,0,.15); }
+        .menu .vac-go svg { width:20px; height:20px; fill:currentColor; }
+        .vac-row { display:flex; gap:6px; }
+        .menu .vac-row button { flex:1; display:flex; align-items:center; justify-content:center; gap:6px; height:36px; border-radius:18px; font-size:12.5px; font-weight:600; }
+        .menu .vac-row button svg { width:17px; height:17px; fill:currentColor; }
+        .menu .vac-row button[aria-disabled="true"] { opacity:.4; cursor:default; }
+        .vac-fs { display:grid; grid-template-columns:repeat(var(--n, 2), minmax(0, 1fr)); gap:3px; padding:3px; border-radius:12px; background:rgba(255,255,255,.1); box-shadow:inset 0 1px 2px rgba(0,0,0,.2); }
+        .menu .vac-fs button { min-width:0; height:28px; padding:0 6px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; border-radius:9px; font-size:12px; font-weight:600;
+          background:transparent; box-shadow:none; opacity:.75; }
+        .menu .vac-fs button[aria-pressed="true"] { background:rgba(255,255,255,.34); opacity:1; box-shadow:inset 0 1px 1px rgba(255,255,255,.6), 0 1px 3px rgba(0,0,0,.2); }
+        .vac-err { display:flex; align-items:center; gap:8px; padding:8px 10px; border-radius:12px; font-size:12.5px; font-weight:600;
+          color:#fff; background:rgba(255,59,48,.8); }
+        .vac-err svg { width:16px; height:16px; fill:currentColor; flex:none; }
+        .menu .more { all:unset; cursor:pointer; font-size:12px; opacity:.72; justify-self:start; }
+        .menu .more:hover { opacity:1; text-decoration:underline; }
+        .menu .more:focus-visible { outline:2px solid var(--accent); outline-offset:2px; border-radius:4px; }
+      </style>
+      <ha-card>
+        <div class="wrap">
+          ${c.background === false || c.background === "none" ? "" : '<canvas class="bg" aria-hidden="true"></canvas>'}
+          <canvas tabindex="0"></canvas>
+          <div class="status">Loading 3D…</div>
+          <div class="tip"></div>
+          <div class="labels"></div>
+          <div class="hints"></div>
+          <div class="menu" hidden role="dialog"></div>
+          <div class="wx" hidden></div>
+          <div class="sc-dim" hidden></div>
+          <div class="ad-mark" hidden><i></i><span></span></div>
+          <div class="sc" role="menu" aria-label="Shortcuts" hidden></div>
+          <button class="dl-btn" hidden aria-expanded="false" aria-label="Devices"></button>
+          <div class="dl" hidden role="dialog" aria-label="Devices"></div>
+          <div class="views"></div>
+          <div class="bar"${c.buttons === false ? " hidden" : ""}>
+            <button class="left" title="Rotate left"><svg viewBox="0 0 24 24"><path d="M12 5V1L7 6l5 5V7a6 6 0 1 1-6 6H4a8 8 0 1 0 8-8z"/></svg></button>
+            <button class="right" title="Rotate right"><svg viewBox="0 0 24 24"><path d="M12 5V1l5 5-5 5V7a6 6 0 1 0 6 6h2a8 8 0 1 1-8-8z"/></svg></button>
+            <button class="top" title="Top / 3D view">Top</button>
+            <button class="home" title="Reset view"><svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg></button>
+          </div>
+        </div>
+      </ha-card>`;
+    const $ = (s) => this.shadowRoot.querySelector(s);
+    this._wrap = $(".wrap");
+    this._canvas = $("canvas:not(.bg)");
+    this._status = $(".status");
+    this._tip = $(".tip");
+    this._menu = $(".menu");
+    this._reducedMotion = !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    this._menuFor = null;
+
+    // renderer / scene
+    const r = new THREE.WebGLRenderer({ canvas: this._canvas, antialias: true, alpha: true });
+    r.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    r.toneMapping = THREE.ACESFilmicToneMapping;
+    r.shadowMap.enabled = !!c.shadows;
+    r.shadowMap.type = THREE.PCFSoftShadowMap;
+    this._renderer = r;
+    this._scene = new THREE.Scene();
+    this._camera = new THREE.PerspectiveCamera(35, 1, 0.1, 1000);
+    this._raycaster = new THREE.Raycaster();
+
+    this._hemi = new THREE.HemisphereLight(0xffffff, 0x8a7f70, 1.4);
+    this._sun = new THREE.DirectionalLight(0xfff2e0, 2.0);
+    this._sun.position.set(8, 14, 6);
+    this._sun.castShadow = !!c.shadows;
+    this._sun.shadow.mapSize.set(1024, 1024);
+    this._sun.shadow.bias = -0.0005;
+    this._sun.shadow.normalBias = 0.02;
+    const sc = this._sun.shadow.camera;
+    sc.left = sc.bottom = -WORLD_SIZE * 0.75;
+    sc.right = sc.top = WORLD_SIZE * 0.75;
+    sc.near = 1;
+    sc.far = 60;
+    this._scene.add(this._hemi, this._sun, this._sun.target);
+
+    // camera state (spherical, radians)
+    this._az = c.start_azimuth * DEG;
+    this._el = c.start_elevation * DEG;
+    this._target = new THREE.Vector3();
+    this._home = { target: new THREE.Vector3(), dist: 20 };
+    this._dist = 20;
+
+    this._bindEvents();
+    this._resize();
+    this._ro = new ResizeObserver(() => this._resize());
+    this._ro.observe(this._wrap);
+    this._startLoop();
+
+    this._loadModel()
+      .then(async (root) => {
+        await this._loadPropModels();
+        this._placeModel(root);
+        this._bindEntities();
+        this._setupLightFade();
+        this._buildViewButtons();
+        this._buildHints();
+        this._buildLabels();
+        this._buildDeviceList();
+        this._wrap.classList.toggle("no-overlays", !this._overlaysShown());
+        this._wrap.classList.toggle("no-bg", !this._bgShown());
+        this._wrap.classList.toggle("no-readouts", !this._tempShown());
+        this._applyHidden();
+        this._applyStates();
+        this._applyNight();
+        this._modelReady = true;
+        this._adLoad();
+        this._status.style.display = "none";
+        this._dirty = true;
+      })
+      .catch((err) => {
+        console.error("house3d-card:", err);
+        this._status.textContent = `Could not load model: ${err.message || err}`;
+      });
+  }
+
+  _teardown() {
+    if (this._raf) cancelAnimationFrame(this._raf);
+    this._raf = null;
+    this._ro?.disconnect();
+    this._scene?.traverse((o) => {
+      o.geometry?.dispose?.();
+      const m = o.material;
+      (Array.isArray(m) ? m : m ? [m] : []).forEach((x) => x.dispose?.());
+    });
+    this._renderer?.dispose();
+    this._bindings = [];
+    this._initialized = false;
+  }
+
+  async _loadModel() {
+    const url = this._config.model;
+    if (!url) return buildDemoHouse();
+    this._status.textContent = "Loading model…";
+    const lower = url.split("?")[0].toLowerCase();
+    if (lower.endsWith(".obj")) {
+      const [{ OBJLoader }, { MTLLoader }] = await Promise.all([
+        Promise.resolve({ OBJLoader: __OBJLoader }),
+        Promise.resolve({ MTLLoader: __MTLLoader }),
+      ]);
+      const loader = new OBJLoader();
+      const mtlUrl = this._config.materials ?? url.replace(/\.obj(\?.*)?$/i, ".mtl$1");
+      if (mtlUrl) {
+        try {
+          const dir = mtlUrl.substring(0, mtlUrl.lastIndexOf("/") + 1);
+          const mtl = await new MTLLoader().setResourcePath(dir).loadAsync(mtlUrl);
+          mtl.preload();
+          loader.setMaterials(mtl);
+        } catch (e) {
+          console.warn("house3d-card: no materials loaded", e);
+        }
+      }
+      return loader.loadAsync(url);
+    }
+    const { GLTFLoader } = await Promise.resolve({ GLTFLoader: __GLTFLoader });
+    const gltf = await new GLTFLoader().loadAsync(url);
+    return gltf.scene;
+  }
+
+  /** A file next to the room model: `robot_vacuum.glb` sits in the same folder as the model itself. */
+  _assetUrl(u) {
+    u = String(u);
+    if (/^([a-z]+:|\/)/i.test(u)) return u;
+    const m = this._config.model || "";
+    return m.substring(0, m.lastIndexOf("/") + 1) + u;
+  }
+
+  /** Props that are model files (`url:`) are loaded before the room is built, so they can be bound like any object. */
+  async _loadPropModels() {
+    const list = (this._config.props || []).filter((p) => p && p.url);
+    this._propScenes = new Map();
+    if (!list.length) return;
+    const { GLTFLoader } = await Promise.resolve({ GLTFLoader: __GLTFLoader });
+    const loader = new GLTFLoader();
+    await Promise.all(list.map(async (p) => {
+      const url = this._assetUrl(p.url);
+      if (this._propScenes.has(url)) return;
+      this._propScenes.set(url, null);
+      try {
+        let gltf;
+        if (url.startsWith("data:")) {
+          // a model packed into the config: read it straight from memory (some pages don't allow fetching data: URLs)
+          const bin = atob(url.slice(url.indexOf(",") + 1));
+          const buf = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+          // and its pictures as plain images rather than fetched bitmaps, for the same reason
+          const cib = window.createImageBitmap;
+          let pr;
+          try { window.createImageBitmap = undefined; pr = loader.parseAsync(buf.buffer, ""); }
+          finally { window.createImageBitmap = cib; }
+          gltf = await pr;
+        } else gltf = await loader.loadAsync(url);
+        this._propScenes.set(url, gltf.scene);
+      } catch (e) {
+        console.warn(`house3d-card: could not load the prop model ${url.slice(0, 80)} (drawing a stand-in instead)`, e);
+      }
+    }));
+  }
+
+  _placeModel(root) {
+    const box = new THREE.Box3().setFromObject(root);
+    const size = box.getSize(new THREE.Vector3());
+    const footprint = Math.max(size.x, size.z) || 1;
+    const s = (this._config.model_scale ?? 1) * (WORLD_SIZE / footprint);
+    this._modelScale = s;
+    root.scale.multiplyScalar(s);
+    root.updateMatrixWorld(true);
+    const b2 = new THREE.Box3().setFromObject(root);
+    const center = b2.getCenter(new THREE.Vector3());
+    root.position.x -= center.x;
+    root.position.z -= center.z;
+    root.position.y -= b2.min.y;
+    root.updateMatrixWorld(true);
+
+    // objects that no longer exist in the real room can be left out without re-exporting the model
+    for (const n of this._config.hide_objects || []) {
+      const o = root.getObjectByName(String(n));
+      if (o) o.visible = false;
+      else console.warn(`house3d-card: hide_objects: "${n}" not found`);
+    }
+    root.updateMatrixWorld(true);
+
+    const shadows = !!this._config.shadows;
+    // OBJ exports (Sweet Home 3D especially) often have faces wound the wrong way, e.g. the inside of a
+    // wall with a window in it. Drawing both sides keeps those walls from vanishing.
+    const doubleSided = this._config.double_sided ?? /\.obj(\?|$)/i.test(this._config.model || "");
+    root.traverse((o) => {
+      if (!o.isMesh) return;
+      const ms = Array.isArray(o.material) ? o.material : [o.material];
+      if (doubleSided) ms.forEach((m) => (m.side = THREE.DoubleSide));
+      // fully transparent helper geometry (e.g. Sweet Home 3D "d 0.0" materials) is hidden,
+      // and see-through glass doesn't throw solid shadows
+      if (ms.every((m) => m.transparent && m.opacity < 0.02)) {
+        o.visible = false;
+        return;
+      }
+      o.castShadow = shadows && !ms.some((m) => m.transparent && m.opacity < 0.6);
+      o.receiveShadow = shadows;
+    });
+    this._scene.add(root);
+    this._root = root;
+    this._dlRoomBox = null;
+
+    const fb = new THREE.Box3().setFromObject(root);
+    const sphere = fb.getBoundingSphere(new THREE.Sphere());
+    // the camera circles around a point this far up the room (0 = floor, 0.5 = middle, 1 = top of the walls)
+    const lookH = Math.min(1, Math.max(0, Number(this._config.look_height ?? 0.5)));
+    this._home.target.set(0, fb.min.y + (fb.max.y - fb.min.y) * lookH, 0);
+    this._home.dist = (sphere.radius / Math.sin((this._camera.fov / 2) * DEG)) * 0.82;
+    this._target.copy(this._home.target);
+    this._dist = this._home.dist;
+    this._minDist = this._home.dist * 0.2;
+    this._maxDist = this._home.dist * 1.8;
+    this._addProps(root);
+    this._setupWalls();
+    this._fitBox = this._visibleBox(root);
+    if (!this._fitBox.isEmpty()) {
+      // the camera circles around the middle of what you actually see (hidden objects like the ground
+      // plane don't pull it off-centre), so the room stays centred on the card from every angle
+      const fb2 = this._fitBox, lookH2 = Math.min(1, Math.max(0, Number(this._config.look_height ?? 0.5)));
+      const cx = (fb2.min.x + fb2.max.x) / 2, cz = (fb2.min.z + fb2.max.z) / 2;
+      this._home.target.set(cx, fb2.min.y + (fb2.max.y - fb2.min.y) * lookH2, cz);
+      this._target.copy(this._home.target);
+    }
+    this._fitHome();
+    this._dirty = true;
+  }
+
+  /** Bounding box of what's actually shown (hidden helper objects like the ground plane don't count). */
+  _visibleBox(root) {
+    const box = new THREE.Box3();
+    const walk = (o) => {
+      if (!o.visible) return;
+      if (o.isMesh) box.expandByObject(o, false);
+      else o.children.forEach(walk);
+    };
+    walk(root);
+    return box;
+  }
+
+  /**
+   * Zoom the start view so the whole room fits the card with a little margin (tops of the walls included),
+   * whatever the card's shape. Moving the camera around keeps this zoom as the reference.
+   */
+  _fitHome() {
+    const bb = this._fitBox;
+    if (!bb || bb.isEmpty()) return;
+    const c = this._config, cam = this._camera.clone();
+    const az = (c.start_azimuth ?? 45) * DEG, el = (c.start_elevation ?? 35) * DEG, t = this._home.target;
+    const margin = Number(c.fit_margin ?? 0.92); // fraction of the card the room may use
+    const v = new THREE.Vector3();
+    cam.clearViewOffset();
+    // the weather panel takes the left edge of wide cards: the room is fitted into (and centred in) what's left
+    const W = this._wrap.clientWidth || 1, H = this._wrap.clientHeight || 1;
+    const reserve = this._wxRes ?? this._wxReserve(W);
+    const free = (W - reserve) / W;
+    let z = 1;
+    for (let i = 0; i < 6; i++) {
+      const d = this._home.dist * z, ce = Math.cos(el);
+      cam.position.set(t.x + d * ce * Math.sin(az), t.y + d * Math.sin(el), t.z + d * ce * Math.cos(az));
+      cam.lookAt(t);
+      cam.updateMatrixWorld(true);
+      let x = 0, y0 = Infinity, y1 = -Infinity;
+      for (let k = 0; k < 8; k++) {
+        v.set(k & 1 ? bb.max.x : bb.min.x, k & 2 ? bb.max.y : bb.min.y, k & 4 ? bb.max.z : bb.min.z).project(cam);
+        x = Math.max(x, Math.abs(v.x));
+        y0 = Math.min(y0, v.y); y1 = Math.max(y1, v.y);
+      }
+      const ext = Math.max(x / free, -y0, y1); // the pivot stays in the middle of the free area, so both edges must fit
+      z = Math.min(3, Math.max(0.5, z * (ext / margin)));
+    }
+    this._aspectZoom = z;
+    if (reserve) this._camera.setViewOffset(W, H, -reserve / 2, 0, W, H);
+    else this._camera.clearViewOffset();
+    this._camera.updateProjectionMatrix();
+    this._dirty = true;
+  }
+
+  _findObject(name) {
+    if (!name || !this._root) return null;
+    return (
+      this._root.getObjectByName(name) ||
+      this._root.getObjectByName(String(name).replace(/\s+/g, "_")) ||
+      this._root.getObjectByName(String(name).replace(/[\s.:/[\]]/g, "_"))
+    );
+  }
+
+  _findObjects(names, missing) {
+    const list = Array.isArray(names) ? names : names != null ? [names] : [];
+    const out = [];
+    for (const n of list) {
+      const o = this._findObject(n);
+      if (o) out.push(o);
+      else if (missing) missing.push(n);
+    }
+    return out;
+  }
+
+  _boxOf(objs) {
+    const box = new THREE.Box3();
+    for (const o of objs) {
+      o.updateMatrixWorld(true);
+      box.expandByObject(o);
+    }
+    return box;
+  }
+
+  _bindEntities() {
+    const missing = [];
+    this._proxies = [];
+    for (const cfg of this._config.entities) this._bindOne(cfg, missing);
+    this._bindReport(missing);
+  }
+
+  /** A spot in the room for a device with a `position:` instead of an `object:` (an invisible marker to hang it on). */
+  _posMarker(cfg) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(14, 14, 14), new THREE.MeshBasicMaterial({ visible: false }));
+    m.name = `__h3d_${cfg.entity}`;
+    m.userData.h3dMarker = true;
+    m.position.set(...cfg.position.map(Number));
+    this._root.add(m);
+    m.updateMatrixWorld(true);
+    return m;
+  }
+
+  /** Wire one device into the room: its glow, light, tap target and dot anchor. Returns the binding (or null). */
+  _bindOne(cfg, missing = []) {
+    {
+      let objs = cfg.object != null ? this._findObjects(cfg.object, missing) : [];
+      if (!objs.length && Array.isArray(cfg.position)) objs = [this._posMarker(cfg)];
+      if (!objs.length) return null;
+      const domain = cfg.entity.split(".")[0];
+      const isMedia = domain === "media_player";
+      const isScreen = isMedia || !!cfg.screen;
+      const readOnly = domain === "sensor" || domain === "binary_sensor";
+      const moving = !!(cfg.door || cfg.cover || cfg.rotate);
+      const glowOn = cfg.glow ?? (!!cfg.glow_objects || isScreen || (!moving && !readOnly && !["cover", "climate", "camera", "vacuum"].includes(domain)));
+      const lightOn = cfg.light === undefined ? glowOn : cfg.light !== false;
+
+      let meshes = [];
+      objs.forEach((obj) => obj.traverse((o) => o.isMesh && o.visible && meshes.push(o)));
+      const matName = (m) => (Array.isArray(m.material) ? m.material.map((x) => x.name).join(" ") : m.material?.name || "");
+      const glowMeshes = meshes.filter((m) => GLOW_NAME.test(m.name) || GLOW_NAME.test(m.parent?.name || "") || GLOW_NAME.test(matName(m)));
+      let glow = glowOn ? (glowMeshes.length && glowMeshes.length < meshes.length ? glowMeshes : meshes) : [];
+      if (glowOn && cfg.glow_objects) {
+        // explicit list of the parts that light up, e.g. a lamp's glass shade
+        glow = [];
+        this._findObjects(cfg.glow_objects, missing).forEach((o) => o.traverse((m) => m.isMesh && m.visible && glow.push(m)));
+      }
+      const mats = [];
+      for (const m of glow) {
+        const cloned = Array.isArray(m.material) ? m.material.map((x) => x.clone()) : m.material.clone();
+        m.material = cloned;
+        for (const mat of Array.isArray(cloned) ? cloned : [cloned]) {
+          if (mat.emissive) mats.push({ mat, emissive: mat.emissive.clone(), intensity: mat.emissiveIntensity ?? 1, map: !!mat.map });
+        }
+      }
+      // screens: matte, so they only show their own glow and never a reflection of the room's lights.
+      // A screen with a picture on it (a desktop, a wallpaper) shows that picture when it lights up.
+      if (isScreen && cfg.matte !== false) {
+        for (const { mat, map } of mats) {
+          if ("roughness" in mat) mat.roughness = 1;
+          if ("metalness" in mat) mat.metalness = 0;
+          if ("envMapIntensity" in mat) mat.envMapIntensity = 0;
+          if ("clearcoat" in mat) mat.clearcoat = 0;
+          if (mat.specular) mat.specular.set(0x000000);
+          if ("shininess" in mat) mat.shininess = 0;
+          if (map) mat.emissiveMap = mat.map;
+          mat.color?.multiplyScalar?.(0.2); // dark panel: room light barely shows on it
+          mat.needsUpdate = true;
+        }
+      }
+      const gbox = glow.length ? this._boxOf(glow) : this._boxOf(objs);
+      const full = this._boxOf(objs);
+
+      const lights = [];
+      if (lightOn) {
+        const count = Math.max(1, Math.round(cfg.light_count ?? 1));
+        const gs = gbox.getSize(new THREE.Vector3());
+        const long = gs.x >= gs.z ? "x" : "z";
+        for (let i = 0; i < count; i++) {
+          const light = new THREE.PointLight(0xffc87a, 0, cfg.light_distance ?? WORLD_SIZE * (isScreen ? 0.35 : 0.45), cfg.light_decay ?? 2);
+          const pos = gbox.getCenter(new THREE.Vector3());
+          if (count > 1) pos[long] = gbox.min[long] + (gs[long] * (i + 0.5)) / count;
+          light.position.copy(pos);
+          if (Array.isArray(cfg.light_offset)) {
+            // offset is in the model's own units (Sweet Home 3D: cm)
+            light.position.add(new THREE.Vector3(...cfg.light_offset).multiplyScalar(this._modelScale || 1));
+          } else if (isScreen) {
+            // screens face into the room: nudge the light off the thin side, towards the middle of the house
+            const axis = gs.x < gs.z ? "x" : "z";
+            light.position[axis] += (pos[axis] > 0 ? -1 : 1) * 0.45;
+          } else {
+            light.position.y -= Math.min(0.15, gs.y * 0.3);
+          }
+          this._scene.add(light);
+          lights.push(light);
+        }
+      }
+
+      // generous invisible hit box so thin lamps are easy to tap
+      const hb = full.clone().expandByScalar(0.18);
+      const hs = hb.getSize(new THREE.Vector3());
+      const proxy = new THREE.Mesh(new THREE.BoxGeometry(hs.x, hs.y, hs.z), new THREE.MeshBasicMaterial({ visible: false }));
+      proxy.position.copy(hb.getCenter(new THREE.Vector3()));
+      this._scene.add(proxy);
+
+      const binding = {
+        cfg, objs, obj: objs[0], mats, lights, proxy, key: "", readOnly, isMedia, isScreen,
+        seed: this._bindings.length * 1.7,
+      };
+      binding.anchor = new THREE.Vector3((full.min.x + full.max.x) / 2, full.max.y, (full.min.z + full.max.z) / 2);
+      if (cfg.door) binding.door = this._setupDoor(cfg.door, objs, missing);
+      if (cfg.cover) binding.cover = this._setupCover(cfg.cover, objs, missing);
+      if (cfg.rotate) binding.rotate = this._setupRotate(cfg.rotate, objs, missing);
+      if (cfg.airflow) binding.airflow = this._setupAirflow(cfg, binding, objs, missing);
+      if (domain === "vacuum" && cfg.drive !== false && !objs[0].userData.h3dMarker) binding.vac = this._setupVacuum(cfg, binding, objs[0]);
+      if (cfg.climate) {
+        // a heater fan glows warm orange while it's heating
+        const hm = [];
+        const parts = cfg.heat_objects ? this._findObjects(cfg.heat_objects, missing) : objs;
+        parts.forEach((o) => o.traverse((m) => {
+          if (!m.isMesh || !m.visible) return;
+          m.material = Array.isArray(m.material) ? m.material.map((x) => x.clone()) : m.material.clone();
+          for (const mat of Array.isArray(m.material) ? m.material : [m.material])
+            if (mat.emissive) hm.push({ mat, emissive: mat.emissive.clone(), intensity: mat.emissiveIntensity ?? 1 });
+        }));
+        const hl = new THREE.PointLight(0xff7a2a, 0, WORLD_SIZE * 0.2, 2);
+        hl.position.copy(full.getCenter(new THREE.Vector3()));
+        this._scene.add(hl);
+        binding.heat = { mats: hm, light: hl, on: null };
+      }
+      proxy.userData.binding = binding;
+      this._proxies.push(proxy);
+      this._bindings.push(binding);
+      return binding;
+    }
+  }
+
+  /** Take a device out of the room again (a device added from the dashboard that you removed or changed). */
+  _unbindOne(entity) {
+    const i = this._bindings.findIndex((b) => b.cfg.entity === entity);
+    if (i < 0) return;
+    const b = this._bindings[i];
+    if (this._menuFor === b) this._closeMenu();
+    this._scene.remove(b.proxy);
+    this._proxies = this._proxies.filter((x) => x !== b.proxy);
+    for (const l of b.lights) this._scene.remove(l);
+    if (b.heat?.light) this._scene.remove(b.heat.light);
+    this._lfades?.delete(b);
+    for (const m of b.mats) { m.mat.emissive.copy(m.emissive); m.mat.emissiveIntensity = m.intensity; }
+    for (const o of b.objs) if (o.userData.h3dMarker) o.parent?.remove(o);
+    b.hint?.remove();
+    this._bindings.splice(i, 1);
+  }
+
+  _bindReport(missing) {
+    if (missing.length) {
+      const names = [];
+      this._root.traverse((o) => o.name && names.push(o.name));
+      console.warn(`house3d-card: objects not found: ${missing.join(", ")}.\nAvailable object names:\n` + names.join("\n"));
+      if (!this._bindings.length) {
+        this._status.style.display = "flex";
+        this._status.textContent = `No matching objects (${missing.join(", ")}). See the browser console for the names in your model.`;
+      }
+    }
+  }
+
+  /* ------------------------------------------------------------ moving parts */
+
+  _parts(objs, pivotWorld) {
+    return objs.map((o) => ({
+      o,
+      pos: o.position.clone(),
+      quat: o.quaternion.clone(),
+      scale: o.scale.clone(),
+      pivot: pivotWorld ? o.parent.worldToLocal(pivotWorld.clone()) : null,
+    }));
+  }
+
+  /** Doors and windows swing around their hinge. The side they open to is worked out from the room. */
+  _setupDoor(d, objs, missing) {
+    const hinge = this._findObjects(d.hinge, missing)[0];
+    const paneBox = this._boxOf(objs);
+    const center = paneBox.getCenter(new THREE.Vector3());
+    let pivot;
+    if (hinge) pivot = this._boxOf([hinge]).getCenter(new THREE.Vector3());
+    else {
+      // no hinge given: use the end of the pane named by `side` (left/right along its long axis)
+      const s = paneBox.getSize(new THREE.Vector3());
+      const axis = s.x >= s.z ? "x" : "z";
+      pivot = center.clone();
+      pivot[axis] = d.side === "right" ? paneBox.max[axis] : paneBox.min[axis];
+    }
+    const deg = Math.abs(d.degrees ?? 90) * DEG;
+    const Y = new THREE.Vector3(0, 1, 0);
+    const distAfter = (sgn) => {
+      const v = center.clone().sub(pivot).applyAxisAngle(Y, sgn * deg).add(pivot);
+      return Math.hypot(v.x, v.z); // model is centred on the room, so smaller = swings inwards
+    };
+    let sign = distAfter(1) < distAfter(-1) ? 1 : -1;
+    if ((d.direction || "inner") === "outer") sign = -sign;
+    if (d.degrees < 0) sign = -sign;
+    return { parts: this._parts(objs, pivot), angle: sign * deg, cur: 0, target: 0, init: false };
+  }
+
+  /** Roller blinds: the fabric shortens towards the cassette and the bottom bar rides up with it. */
+  _setupCover(c, objs, missing) {
+    const fabric = c.fabric ? this._findObjects(c.fabric, missing) : objs;
+    const bar = c.bar ? this._findObjects(c.bar, missing) : [];
+    const fb = this._boxOf(fabric);
+    const up = (c.side || "up") !== "down";
+    const edgeW = new THREE.Vector3(0, up ? fb.max.y : fb.min.y, 0);
+    const lenW = fb.max.y - fb.min.y;
+    const parts = this._parts(fabric).map((p) => {
+      p.edge = p.o.parent.worldToLocal(edgeW.clone()).y;
+      return p;
+    });
+    const barParts = this._parts(bar).map((p) => {
+      const a = p.o.parent.worldToLocal(new THREE.Vector3(0, 0, 0)).y;
+      const b = p.o.parent.worldToLocal(new THREE.Vector3(0, lenW, 0)).y;
+      p.len = b - a;
+      return p;
+    });
+    // like a real motor: constant speed, `duration` seconds for a full run top to bottom
+    const duration = Math.max(0.1, Number(c.duration ?? 6));
+    return { parts, barParts, up, duration, cur: 0, target: 0, init: false, dir: 0, v: 1 / duration, rep: null, goal: null, goalT: 0 };
+  }
+
+  /**
+   * A real blind reports its position in steps while it moves (every second or so). Instead of hopping from
+   * step to step, the 3D blind keeps moving at the blind's own measured speed between reports.
+   */
+  _coverReport(c, p, state) {
+    const now = performance.now();
+    const dir = state === "opening" ? 1 : state === "closing" ? -1 : 0;
+    if (dir && c.rep && c.dir === dir && p !== c.rep.p) {
+      const dt = (now - c.rep.t) / 1000;
+      const measured = Math.abs(p - c.rep.p) / Math.max(dt, 0.05);
+      if (measured > 0.005 && measured < 2) c.v = c.v * 0.55 + measured * 0.45;
+    }
+    if (!c.rep || p !== c.rep.p || dir !== c.dir) c.rep = { p, t: now };
+    if (dir !== c.dir) c.moveTo = undefined; // restart the constant-speed glide from where it is now
+    if (!dir && now - c.goalT > 3000) { c.goal = null; c.goalSlider = false; }
+    c.dir = dir;
+    c.target = p;
+  }
+
+  /** Fans: `oscillate` swings side to side, `spin` turns continuously. */
+  _setupRotate(r, objs, missing) {
+    const parts = r.objects ? this._findObjects(r.objects, missing) : objs;
+    const pivot = this._boxOf(parts).getCenter(new THREE.Vector3());
+    const axis = { x: new THREE.Vector3(1, 0, 0), y: new THREE.Vector3(0, 1, 0), z: new THREE.Vector3(0, 0, 1) }[r.axis || "y"];
+    const mode = r.mode || (r.degrees != null ? "oscillate" : "spin");
+    const rps = Number(r.round_per_second ?? r.speed ?? (mode === "spin" ? 1 : 0.12));
+    return { parts: this._parts(parts, pivot), axis, mode, rps, deg: Math.abs(r.degrees ?? 40) * DEG, angle: 0, phase: 0, on: false };
+  }
+
+  /* ------------------------------------------------------------ airflow */
+
+  /**
+   * Soft wisps of air streaming out of a fan. Follows the fan's oscillation, speed and direction,
+   * and turns warm (and rises a little) while the linked climate entity is heating.
+   */
+  _setupAirflow(cfg, binding, objs, missing) {
+    const o = cfg.airflow === true ? {} : cfg.airflow || {};
+    const from = o.from ? this._findObjects(o.from, missing) : cfg.rotate?.objects ? this._findObjects(cfg.rotate.objects, []) : objs;
+    const box = this._boxOf(from.length ? from : objs);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    let dir;
+    if (Array.isArray(o.direction)) dir = new THREE.Vector3(...o.direction);
+    else dir = new THREE.Vector3(-center.x, 0, -center.z); // default: towards the middle of the room
+    dir.y = 0;
+    if (dir.lengthSq() < 1e-6) dir.set(0, 0, -1);
+    dir.normalize();
+    const side = new THREE.Vector3(-dir.z, 0, dir.x);
+
+    const count = Math.max(20, Math.min(600, Math.round(o.count ?? 320)));
+    const geo = new THREE.BufferGeometry();
+    const pos = new Float32Array(count * 3);
+    const col = new Float32Array(count * 3);
+    geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
+    const cnv = document.createElement("canvas");
+    cnv.width = cnv.height = 64;
+    const g = cnv.getContext("2d");
+    const grad = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grad.addColorStop(0, "rgba(255,255,255,.9)");
+    grad.addColorStop(0.35, "rgba(255,255,255,.35)");
+    grad.addColorStop(1, "rgba(255,255,255,0)");
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 64, 64);
+    const mat = new THREE.PointsMaterial({
+      size: o.size ?? 0.62,
+      map: new THREE.CanvasTexture(cnv),
+      vertexColors: true,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      sizeAttenuation: true,
+    });
+    const points = new THREE.Points(geo, mat);
+    points.frustumCulled = false;
+    points.visible = false;
+    points.renderOrder = 2;
+    this._scene.add(points);
+
+    const unit = this._modelScale || 1; // model units (cm) -> world
+    return {
+      points, pos, col, count,
+      parts: Array.from({ length: count }, () => ({ p: new THREE.Vector3(), v: new THREE.Vector3(), age: 0, life: 0, alive: false })),
+      origin: center.clone(),
+      pivot: center.clone(),
+      halfW: Math.max(size.x, size.z) * 0.32,
+      yMin: box.min.y + size.y * (o.low ?? 0.35),
+      yMax: box.min.y + size.y * (o.high ?? 0.9),
+      dir, side,
+      reach: (o.reach ?? 180) * unit,         // how far the air travels, model units (cm)
+      coolColor: new THREE.Color(o.color || "#bfe2ff"),
+      heatColor: new THREE.Color(o.heat_color || "#ffc9a3"),
+      strength: o.opacity ?? 0.2,
+      acc: 0, on: false, speed: 0.5, reverse: false, heat: false, heatMix: 0,
+    };
+  }
+
+  _updateAirflow(af, b, dt) {
+    if (this._reducedMotion) {
+      if (af.points.visible) af.points.visible = false;
+      return false;
+    }
+    const anyAlive = af.parts.some((q) => q.alive);
+    if (!af.on && !anyAlive) {
+      if (af.points.visible) {
+        af.points.visible = false;
+        return true;
+      }
+      return false;
+    }
+    af.points.visible = true;
+    af.heatMix += ((af.heat ? 1 : 0) - af.heatMix) * Math.min(1, dt * 2);
+    const Y = new THREE.Vector3(0, 1, 0);
+    const ang = b.rotate ? b.rotate.angle : 0;
+    const dir = af.dir.clone().applyAxisAngle(Y, ang);
+    const side = af.side.clone().applyAxisAngle(Y, ang);
+    if (af.reverse) dir.negate();
+    const worldPerUnit = 1;
+    const speedU = (af.reverse ? 0.9 : 1.6 + 2.6 * af.speed) * worldPerUnit;
+    const spread = af.reverse ? 0.55 : 0.16;
+
+    if (af.on) {
+      af.acc += dt * (af.reverse ? 40 : 50 + 130 * af.speed);
+      while (af.acc >= 1) {
+        af.acc -= 1;
+        const q = af.parts.find((x) => !x.alive);
+        if (!q) break;
+        const lat = (Math.random() * 2 - 1) * af.halfW;
+        q.p.copy(af.origin).addScaledVector(side, lat);
+        q.p.y = af.yMin + Math.random() * (af.yMax - af.yMin);
+        q.v.copy(dir).multiplyScalar(speedU * (0.8 + Math.random() * 0.4));
+        q.v.addScaledVector(side, (Math.random() * 2 - 1) * spread * speedU);
+        q.v.y = (Math.random() * 2 - 1) * 0.08 * speedU + (af.heat ? 0.18 * speedU : 0);
+        q.age = 0;
+        q.life = (af.reach * (af.reverse ? 0.45 : 1)) / speedU * (0.75 + Math.random() * 0.5);
+        q.alive = true;
+      }
+    }
+    const c = af.coolColor.clone().lerp(af.heatColor, af.heatMix);
+    for (let i = 0; i < af.count; i++) {
+      const q = af.parts[i];
+      if (q.alive) {
+        q.age += dt;
+        if (q.age >= q.life) q.alive = false;
+        else {
+          q.p.addScaledVector(q.v, dt);
+          // gentle turbulence so the stream billows instead of flying in straight lines
+          const k = 0.35 * speedU * dt;
+          q.v.x += Math.sin(q.age * 5.3 + i) * k;
+          q.v.z += Math.cos(q.age * 4.7 + i * 1.3) * k;
+          q.v.y += Math.sin(q.age * 3.1 + i * 0.7) * k * 0.5;
+          q.v.multiplyScalar(1 - Math.min(0.9, dt * 0.6)); // air slows down as it spreads
+          if (af.heat) q.v.y += 0.12 * dt; // warm air rises
+        }
+      }
+      const t = q.alive ? q.age / q.life : 1;
+      const a = q.alive ? Math.min(1, t / 0.15) * Math.min(1, (1 - t) / 0.45) * af.strength : 0;
+      af.pos[i * 3] = q.p.x;
+      af.pos[i * 3 + 1] = q.p.y;
+      af.pos[i * 3 + 2] = q.p.z;
+      af.col[i * 3] = c.r * a;
+      af.col[i * 3 + 1] = c.g * a;
+      af.col[i * 3 + 2] = c.b * a;
+    }
+    af.points.geometry.attributes.position.needsUpdate = true;
+    af.points.geometry.attributes.color.needsUpdate = true;
+    return true;
+  }
+
+  _applyRotation(parts, axis, angle) {
+    const q = new THREE.Quaternion().setFromAxisAngle(axis, angle);
+    for (const p of parts) {
+      p.o.position.copy(p.pos).sub(p.pivot).applyQuaternion(q).add(p.pivot);
+      p.o.quaternion.copy(q).multiply(p.quat);
+    }
+  }
+
+  _applyCover(c, open) {
+    const s = 1 - 0.97 * open; // fraction of the fabric still hanging
+    for (const p of c.parts) {
+      p.o.scale.y = p.scale.y * s;
+      p.o.position.y = p.edge * (1 - s) + p.pos.y * s;
+    }
+    for (const p of c.barParts) p.o.position.y = p.pos.y + (c.up ? 1 : -1) * p.len * (1 - s);
+  }
+
+  /** Advance door / blind / fan / wall animations. Returns true while anything is still moving. */
+  _stepAnims(dt) {
+    let vanishing = false;
+    let active = false;
+    const Y = new THREE.Vector3(0, 1, 0);
+    const approach = (a, t, rate) => {
+      const k = this._reducedMotion ? 1 : Math.min(1, dt * rate);
+      const n = a + (t - a) * k;
+      return Math.abs(t - n) < 0.002 ? t : n;
+    };
+    for (const b of this._bindings) {
+      const d = b.door;
+      if (d && d.cur !== d.target) {
+        d.cur = d.init ? approach(d.cur, d.target, 4) : d.target;
+        d.init = true;
+        this._applyRotation(d.parts, Y, d.angle * d.cur);
+        active = true;
+      }
+      const c = b.cover;
+      if (c && c.dir && c.init && !this._reducedMotion && c.rep) {
+        // moving: dead-reckon from the last report at the measured speed, never running far ahead of it
+        const now = performance.now();
+        const lead = Math.min(c.v * ((now - c.rep.t) / 1000), Math.max(0.06, c.v * 2.5));
+        let est = c.rep.p + c.dir * lead;
+        const end = c.goal ?? (c.dir > 0 ? 1 : 0);
+        est = c.dir > 0 ? Math.min(est, end, 1) : Math.max(est, end, 0);
+        const k = Math.min(1, dt * 5);
+        c.cur += (est - c.cur) * k;
+        this._applyCover(c, c.cur);
+        if (this._menuFor === b) this._syncBlindPanel(b);
+        if (this._dlOpen) this._syncBlindIcon(b);
+        active = true;
+      } else if (c && c.cur !== c.target) {
+        if (!c.init || this._reducedMotion) c.cur = c.target;
+        else {
+          // driven by the clock, not the frame rate, so a slow tablet still takes `duration` seconds
+          const now = performance.now();
+          if (c.moveTo !== c.target) {
+            c.moveTo = c.target;
+            c.from = c.cur;
+            c.t0 = now;
+          }
+          const travelled = (now - c.t0) / 1000 / c.duration;
+          const dist = Math.abs(c.target - c.from);
+          c.cur = travelled >= dist ? c.target : c.from + Math.sign(c.target - c.from) * travelled;
+        }
+        c.init = true;
+        this._applyCover(c, c.cur);
+        if (this._menuFor === b) this._syncBlindPanel(b);
+        active = true;
+      }
+      const r = b.rotate;
+      if (r && (r.on || r.angle !== 0) && !this._reducedMotion) {
+        if (r.on) {
+          if (r.mode === "spin") r.angle = (r.angle + Math.PI * 2 * r.rps * dt) % (Math.PI * 2);
+          else {
+            r.phase += Math.PI * 2 * r.rps * dt;
+            r.angle = Math.sin(r.phase) * r.deg;
+          }
+        } else if (r.mode === "oscillate") {
+          r.angle = approach(r.angle, 0, 2);
+          if (r.angle === 0) r.phase = 0;
+        } else {
+          r.angle = 0; // a switched-off spinner just stops where it is drawn at rest
+        }
+        this._applyRotation(r.parts, r.axis, r.angle);
+        active = true;
+      }
+    }
+    for (const b of this._bindings) {
+      if (b.airflow && this._updateAirflow(b.airflow, b, dt)) active = true;
+      if (b.vac && this._vanishStep(b, dt)) active = vanishing = true;
+      if (b.vac && this._driveVacuum(b, dt)) active = true;
+    }
+    this._vanishing = vanishing;
+    for (const w of this._walls || []) {
+      if (w.cur === w.target) continue;
+      w.cur = approach(w.cur, w.target, 7);
+      for (const m of w.mats) {
+        m.opacity = w.cur;
+        m.depthWrite = w.cur > 0.97;
+      }
+      for (const mesh of w.meshes) mesh.castShadow = w.shadows && w.cur > 0.5;
+      active = true;
+    }
+    return active;
+  }
+
+  /* ------------------------------------------------------------ robot vacuum */
+
+  /**
+   * A robot vacuum that drives about the room while it cleans and goes back to its dock (units: cm, like the room).
+   *   vacuum:
+   *     area: [x1, z1, x2, z2]      where it roams while cleaning (default: 1.2 m around the dock)
+   *     avoid: [[x1, z1, x2, z2]]   furniture legs, a chair... it turns away from these
+   *     speed: 26                   cm per second
+   *     front: 0                    which way the model faces (degrees), if it drives sideways
+   *     dock: true                  draw a charging dock behind it (false: you have one in the model)
+   * Where you put the model (its position and rotation) is where it docks, facing the room.
+   */
+  _setupVacuum(cfg, b, obj) {
+    const o = cfg.vacuum || {};
+    const par = obj.parent;
+    if (!par) return null;
+    obj.updateMatrixWorld(true);
+    const wb = new THREE.Box3().setFromObject(obj);
+    const ws = par.getWorldScale(new THREE.Vector3());
+    const c = par.worldToLocal(new THREE.Vector3((wb.min.x + wb.max.x) / 2, wb.min.y, (wb.min.z + wb.max.z) / 2));
+    // a pivot at the middle of its base, so it turns on the spot
+    const pivot = new THREE.Group();
+    pivot.name = `${obj.name || "vacuum"}_drive`;
+    pivot.position.copy(c);
+    par.add(pivot);
+    obj.position.sub(c);
+    pivot.add(obj);
+    const R = Math.max(wb.max.x - wb.min.x, wb.max.z - wb.min.z) / 2 / (ws.x || 1);
+    const H = (wb.max.y - wb.min.y) / (ws.y || 1);
+    const hd0 = ((Number(obj.rotation?.y) || 0) / 1) + (Number(o.front) || 0) * DEG;
+    const fwd = (h) => new THREE.Vector2(Math.sin(h), Math.cos(h));
+    const f0 = fwd(hd0);
+    const area = Array.isArray(o.area) && o.area.length === 4
+      ? { x1: Math.min(o.area[0], o.area[2]), z1: Math.min(o.area[1], o.area[3]), x2: Math.max(o.area[0], o.area[2]), z2: Math.max(o.area[1], o.area[3]) }
+      : { x1: c.x - 120, z1: c.z - 120, x2: c.x + 120, z2: c.z + 120 };
+    const avoid = (o.avoid || []).filter((r) => Array.isArray(r) && r.length === 4)
+      .map((r) => ({ x1: Math.min(r[0], r[2]), z1: Math.min(r[1], r[3]), x2: Math.max(r[0], r[2]), z2: Math.max(r[1], r[3]) }));
+
+    // status light on its button: blue cleaning, amber heading home, green charging, red when it needs help
+    const led = new THREE.Mesh(new THREE.CircleGeometry(1, 24), new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 }));
+    led.rotation.x = -Math.PI / 2;
+    led.scale.set(R * 0.05, R * 0.08, 1);
+    const fr = (Number(o.front) || 0) * DEG;
+    led.position.set(Math.sin(fr) * R * 0.64, H + 0.08, Math.cos(fr) * R * 0.64);
+    led.name = `${pivot.name}_led`;
+    const ledHolder = new THREE.Group();
+    ledHolder.rotation.y = Number(obj.rotation?.y) || 0;
+    ledHolder.add(led);
+    pivot.add(ledHolder);
+
+    // the charging dock, backed up against where it stands
+    let dock = null;
+    if (o.dock !== false) {
+      dock = new THREE.Group();
+      dock.name = `${pivot.name}_dock`;
+      const dark = new THREE.MeshStandardMaterial({ color: 0xf2f2f2, roughness: 0.5 });
+      const face = new THREE.MeshStandardMaterial({ color: 0x1f2126, roughness: 0.35 });
+      const tw = R * 0.95, th = H * 1.35, td = R * 0.42;
+      // seen from the front: a rounded arch, like most charging docks
+      const rr = tw * 0.32, sh = new THREE.Shape();
+      sh.moveTo(-tw / 2, 0);
+      sh.lineTo(tw / 2, 0);
+      sh.lineTo(tw / 2, th - rr);
+      sh.quadraticCurveTo(tw / 2, th, tw / 2 - rr, th);
+      sh.lineTo(-tw / 2 + rr, th);
+      sh.quadraticCurveTo(-tw / 2, th, -tw / 2, th - rr);
+      sh.closePath();
+      const bev = Math.min(0.8, td * 0.12);
+      const tg = new THREE.ExtrudeGeometry(sh, { depth: td - bev * 2, bevelEnabled: true, bevelThickness: bev, bevelSize: bev * 0.6, bevelSegments: 3, curveSegments: 12 });
+      tg.translate(0, 0, -(td - bev * 2) / 2);
+      const tower = new THREE.Mesh(tg, dark);
+      const front = new THREE.Mesh(new THREE.BoxGeometry(tw * 0.62, th * 0.5, 0.3), face);
+      front.position.set(0, th * 0.38, td / 2 + 0.1);
+      const ramp = new THREE.Mesh(new THREE.BoxGeometry(tw, 0.5, R * 0.4), dark);
+      ramp.position.set(0, 0.25, td / 2 + R * 0.2);
+      const dl = new THREE.Mesh(new THREE.BoxGeometry(tw * 0.25, 0.5, 0.3), new THREE.MeshBasicMaterial({ color: 0x46d160 }));
+      dl.position.set(0, th * 0.78, td / 2 + 0.12);
+      dl.name = `${dock.name}_led`;
+      dock.add(tower, front, ramp, dl);
+      dock.userData.led = dl;
+      const back = R + td / 2 + 1.5;
+      dock.position.set(c.x - f0.x * back, c.y, c.z - f0.y * back);
+      dock.rotation.y = hd0;
+      const shadows = !!this._config.shadows;
+      dock.traverse((m) => m.isMesh && ((m.castShadow = shadows), (m.receiveShadow = shadows)));
+      par.add(dock);
+    }
+    par.updateMatrixWorld(true);
+    const w0 = pivot.getWorldPosition(new THREE.Vector3());
+    return {
+      pivot, led, dock, R, H, area, avoid, hd0, y: c.y,
+      home: { x: c.x, z: c.z },
+      speed: Number(o.speed) || 26,
+      x: c.x, z: c.z, hd: hd0, mode: "dock", phase: "", turn: null, init: false, wander: 3,
+      proxyOff: b.proxy.position.clone().sub(w0),
+      anchorOff: b.anchor.clone().sub(w0),
+    };
+  }
+
+  /** What Home Assistant says it's doing decides where it drives. */
+  _vacReport(b, st) {
+    const v = b.vac;
+    const s = st?.state || "unknown";
+    const mode = s === "cleaning" ? "clean" : s === "returning" ? "return" : s === "docked" ? "dock" : "stop";
+    const bat = this._vacBattery(b, st);
+    const col = s === "cleaning" ? 0x49b8ff : s === "returning" ? 0xffb020 : s === "error" ? 0xff3b30
+      : s === "docked" ? (bat != null && bat < 100 ? 0x46d160 : 0xffffff) : 0xd8dde6;
+    v.led.material.color.setHex(col);
+    v.led.material.opacity = s === "docked" || s === "idle" ? 0.55 : 0.95;
+    if (v.dock?.userData.led) v.dock.userData.led.material.color.setHex(s === "docked" && bat != null && bat < 100 ? 0x46d160 : s === "docked" ? 0xffffff : 0x5a5f68);
+    if (!v.init) {
+      v.init = true;
+      // opened the dashboard mid-clean: it's already out in the room somewhere
+      if (mode === "clean" || mode === "return" || (mode === "stop" && s !== "idle")) {
+        const a = v.area;
+        v.x = (a.x1 + a.x2) / 2;
+        v.z = (a.z1 + a.z2) / 2;
+        v.hd = v.hd0 + Math.PI * 0.7;
+        v.phase = mode === "clean" ? "roam" : "";
+      }
+      this._vacPlace(b);
+    }
+    if (mode !== v.mode) {
+      const wasHoming = v.mode === "return" || v.mode === "dock";
+      if (mode === "clean") {
+        const home = Math.hypot(v.x - v.home.x, v.z - v.home.z) < 2;
+        v.phase = home ? "undock" : this._vacIn(v, v.x, v.z) ? "roam" : "out";
+        v.left = v.R * 1.6;
+        v.turn = null;
+      } else if ((mode === "return" || mode === "dock") && !(wasHoming && v.phase)) v.phase = "go";
+      v.mode = mode;
+    }
+    this._dirty = true;
+  }
+
+  _vacBattery(b, st) {
+    const e = b.cfg.battery ? this._stateOf(b.cfg.battery) : null;
+    const n = Number(e ? e.state : st?.attributes?.battery_level);
+    return Number.isFinite(n) && (e ? e.state !== "unavailable" : st?.attributes?.battery_level != null) ? Math.round(n) : null;
+  }
+
+  _vacIn(v, x, z) {
+    const a = v.area, r = v.R;
+    return x >= a.x1 + r && x <= a.x2 - r && z >= a.z1 + r && z <= a.z2 - r;
+  }
+
+  _vacClear(v, x, z) {
+    const r = v.R;
+    return !v.avoid.some((q) => x > q.x1 - r && x < q.x2 + r && z > q.z1 - r && z < q.z2 + r);
+  }
+
+  /** Bumped into something: turn away, towards whichever of a few directions has the most open floor. */
+  _vacBounce(v) {
+    let best = v.hd + Math.PI, bestScore = -1;
+    for (let i = 0; i < 10; i++) {
+      const h = v.hd + (Math.random() < 0.5 ? -1 : 1) * Math.PI * (0.35 + Math.random() * 0.65);
+      let free = 0;
+      for (let d = 5; d <= 200; d += 5) {
+        const x = v.x + Math.sin(h) * d, z = v.z + Math.cos(h) * d;
+        if (!this._vacIn(v, x, z) || !this._vacClear(v, x, z)) break;
+        free = d;
+      }
+      const score = free * (0.55 + Math.random() * 0.45);
+      if (score > bestScore) { bestScore = score; best = h; }
+    }
+    return wrapPi(best);
+  }
+
+  /** Hiding the vacuum: it hops up, spins and shrinks away in a puff, then the dock folds away (and back in reverse). */
+  _vanishStep(b, dt) {
+    const v = b.vac;
+    if (v.gone === v.goneTo) return false;
+    const DUR = 0.75;
+    v.gone = v.goneTo > v.gone ? Math.min(v.goneTo, v.gone + dt / DUR) : Math.max(v.goneTo, v.gone - dt / DUR);
+    this._vanishApply(b);
+    return true;
+  }
+
+  _vanishApply(b) {
+    const v = b.vac, k = v.gone;
+    if (!v.fade) {
+      // the vacuum's and dock's own copies of their materials, so they can fade out
+      v.fade = [];
+      const seen = new Set();
+      for (const root of [v.pivot, v.dock]) root?.traverse((m) => {
+        if (!m.isMesh || m === v.led) return;
+        m.material = Array.isArray(m.material) ? m.material.map((x) => x.clone()) : m.material.clone();
+        for (const mat of Array.isArray(m.material) ? m.material : [m.material])
+          if (!seen.has(mat)) { seen.add(mat); v.fade.push({ mat, root, op: mat.opacity ?? 1, tr: !!mat.transparent }); }
+      });
+      const ring = new THREE.Mesh(new THREE.RingGeometry(0.9, 1, 64),
+        new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending }));
+      ring.rotation.x = -Math.PI / 2;
+      ring.visible = false;
+      v.pivot.parent.add(ring);
+      v.ring = ring;
+    }
+    const clamp = (x) => Math.min(1, Math.max(0, x));
+    const backIn = (t) => 2.7 * t * t * t - 1.7 * t * t; // dips below 0 first: a little swell before it shrinks
+    const smooth = (t) => t * t * (3 - 2 * t);
+    const kr = clamp(k / 0.8);                  // the robot goes first
+    const kd = clamp((k - 0.3) / 0.7);          // then the dock
+    v.lift = smooth(kr) * v.R * 0.7;
+    v.spin = smooth(kr) * Math.PI * 1.25;
+    v.pivot.scale.setScalar(Math.max(0.001, 1 - backIn(kr)));
+    v.pivot.visible = kr < 1;
+    if (v.dock) {
+      v.dock.scale.set(Math.max(0.001, 1 - backIn(kd)), Math.max(0.001, 1 - smooth(kd)), Math.max(0.001, 1 - backIn(kd)));
+      v.dock.visible = kd < 1;
+    }
+    for (const f of v.fade) {
+      const kk = f.root === v.dock ? kd : kr;
+      const a = 1 - smooth(clamp((kk - 0.35) / 0.65));
+      f.mat.transparent = f.tr || a < 1;
+      f.mat.opacity = f.op * a;
+      if (f.mat.transparent !== f.was) { f.mat.needsUpdate = true; f.was = f.mat.transparent; }
+    }
+    // a soft ring of light spreading over the floor where it was
+    const kw = clamp((k - 0.15) / 0.75);
+    v.ring.visible = kw > 0 && kw < 1 && !this._reducedMotion;
+    if (v.ring.visible) {
+      v.ring.position.set(v.x, v.y + 0.3, v.z);
+      v.ring.scale.setScalar(v.R * (0.95 + 1.2 * smooth(kw)));
+      v.ring.material.opacity = 0.32 * Math.sin(Math.PI * kw);
+    }
+    this._vacPlace(b);
+    this._dirty = true;
+  }
+
+  _vacPlace(b) {
+    const v = b.vac;
+    v.pivot.position.set(v.x, v.y + (v.lift || 0), v.z);
+    v.pivot.rotation.y = v.hd - v.hd0 + (v.spin || 0);
+    v.pivot.updateMatrixWorld(true);
+    const w = v.pivot.getWorldPosition(new THREE.Vector3());
+    b.proxy.position.copy(w).add(v.proxyOff);
+    b.anchor.copy(w).add(v.anchorOff);
+  }
+
+  /** One frame of driving: roam and bounce off things while cleaning, find the way home, back into the dock. */
+  _driveVacuum(b, dt) {
+    const v = b.vac;
+    if (!v || !v.init || v.gone >= 1) return false;
+    const atHome = Math.hypot(v.x - v.home.x, v.z - v.home.z) < 0.5 && Math.abs(wrapPi(v.hd - v.hd0)) < 0.02;
+    if (v.mode === "stop" || ((v.mode === "dock" || v.mode === "return") && atHome)) return false;
+    if (this._reducedMotion) {
+      if (v.mode === "dock" || v.mode === "return") { v.x = v.home.x; v.z = v.home.z; v.hd = v.hd0; this._vacPlace(b); return true; }
+      return false;
+    }
+    const sp = v.speed, TURN = 2.6;
+    const turnTo = (h) => {
+      const d = wrapPi(h - v.hd);
+      const st = TURN * dt;
+      v.hd = wrapPi(Math.abs(d) <= st ? h : v.hd + Math.sign(d) * st);
+      return Math.abs(wrapPi(h - v.hd));
+    };
+    const step = (dist) => {
+      v.x += Math.sin(v.hd) * dist;
+      v.z += Math.cos(v.hd) * dist;
+    };
+    // drive towards a point, around anything in the way
+    const steer = (tx, tz, useArea) => {
+      const want = Math.atan2(tx - v.x, tz - v.z);
+      let pick = want;
+      for (const off of [0, 0.5, -0.5, 1, -1, 1.5, -1.5, 2.2, -2.2]) {
+        const h = want + off;
+        const px = v.x + Math.sin(h) * v.R * 0.9, pz = v.z + Math.cos(h) * v.R * 0.9;
+        if (this._vacClear(v, px, pz) && (!useArea || this._vacIn(v, px, pz))) { pick = h; break; }
+      }
+      const off = turnTo(pick);
+      if (off < 0.6) step(Math.min(Math.hypot(tx - v.x, tz - v.z), sp * dt * Math.cos(off)));
+    };
+    if (v.mode === "clean") {
+      if (v.phase === "undock") {
+        if (turnTo(v.hd0) < 0.05) { step(sp * dt); v.left -= sp * dt; }
+        if (v.left <= 0) v.phase = this._vacIn(v, v.x, v.z) ? "roam" : "out";
+      } else if (v.phase === "out") {
+        const a = v.area;
+        steer((a.x1 + a.x2) / 2, (a.z1 + a.z2) / 2, false);
+        if (this._vacIn(v, v.x, v.z)) v.phase = "roam";
+      } else {
+        if (v.turn != null) {
+          if (turnTo(v.turn) < 0.01) v.turn = null;
+        } else {
+          const d = sp * dt;
+          const nx = v.x + Math.sin(v.hd) * d, nz = v.z + Math.cos(v.hd) * d;
+          if (this._vacIn(v, nx, nz) && this._vacClear(v, nx, nz)) {
+            v.x = nx;
+            v.z = nz;
+            // now and then it changes course a little on its own
+            v.wander -= dt;
+            if (v.wander <= 0) { v.wander = 3 + Math.random() * 5; v.turn = v.hd + (Math.random() - 0.5) * 0.9; }
+          } else v.turn = this._vacBounce(v);
+        }
+      }
+    } else {
+      // home: to a spot in front of the dock, turn round, and reverse in
+      const ax = v.home.x + Math.sin(v.hd0) * v.R * 1.8, az = v.home.z + Math.cos(v.hd0) * v.R * 1.8;
+      if (v.phase === "go") {
+        steer(ax, az, false);
+        if (Math.hypot(ax - v.x, az - v.z) < 1) v.phase = "align";
+      } else if (v.phase === "align") {
+        if (turnTo(v.hd0) < 0.01) v.phase = "back";
+      } else {
+        // reversing straight onto the charging contacts
+        turnTo(v.hd0);
+        const dx = v.home.x - v.x, dz = v.home.z - v.z, left = Math.hypot(dx, dz);
+        const d = Math.min(left, sp * 0.6 * dt);
+        if (left > 0) { v.x += (dx / left) * d; v.z += (dz / left) * d; }
+        if (left - d < 0.3) { v.x = v.home.x; v.z = v.home.z; v.hd = v.hd0; v.phase = ""; }
+      }
+    }
+    this._vacPlace(b);
+    return true;
+  }
+
+  /* ------------------------------------------------------------ props */
+
+  /**
+   * Devices that aren't in the model can be added from the card, in model units (Sweet Home 3D: cm):
+   *   props: [{ type: unifi_ap, name: unifi_ap, position: [x, y, z], rotation: 0 }]
+   * Each part gets a name (<name>_body, <name>_ring, <name>_led ...) so it can be bound like any object.
+   */
+  _addProps(root) {
+    for (const p0 of this._config.props || []) {
+      const p = p0.url ? { ...p0, type: p0.type || "model", _scene: this._propScenes?.get(this._assetUrl(p0.url)) } : p0;
+      const build = PROPS[p.type];
+      if (!build) {
+        console.warn(`house3d-card: unknown prop type "${p.type}" (known: ${Object.keys(PROPS).join(", ")})`);
+        continue;
+      }
+      const g = build(p.name || p.type, p);
+      g.name = p.name || p.type;
+      if (Array.isArray(p.position)) g.position.set(...p.position.map(Number));
+      g.rotation.y = (Number(p.rotation) || 0) * DEG;
+      if (p.flip) g.rotation.x = Math.PI; // e.g. a ceiling AP lying on a shelf, light ring facing up
+      if (p.scale) g.scale.multiplyScalar(Number(p.scale));
+      const shadows = !!this._config.shadows;
+      g.traverse((o) => {
+        if (o.isMesh) {
+          o.castShadow = shadows;
+          o.receiveShadow = shadows;
+        }
+      });
+      root.add(g);
+    }
+    root.updateMatrixWorld(true);
+  }
+
+  /* ------------------------------------------------------------ device list */
+
+  /** Glass list of every device: live state, quick on/off, and tap a name to fly to it and open its panel. */
+  _buildDeviceList() {
+    const btn = this.shadowRoot.querySelector(".dl-btn");
+    const dl = this.shadowRoot.querySelector(".dl");
+    if (!dl) return;
+    if (btn) btn.hidden = true; // the list itself is the pill now
+    this._dlRows = this._bindings.filter((b) => b.cfg.list !== false);
+    if (this._config.device_list === false || !this._dlRows.length) {
+      dl.hidden = true;
+      return;
+    }
+    dl.hidden = false;
+    dl.classList.add("mini");
+    dl.classList.toggle("compact", this._dlCompact());
+    dl.onpointerdown = (e) => e.stopPropagation();
+    dl.onclick = (e) => {
+      e.stopPropagation();
+      if (this._scSuppress) { this._scSuppress = false; return; } // the tap that ended a long press
+      if (!this._dlOpen) return this._openDeviceList(); // tapping the pill anywhere opens it
+      if (!this._dlOpen) return;
+      // renaming a group while arranging: tap its heading
+      const head = this._dlEdit && e.target.closest(".dl-rows .dl-cat");  // device groups and the Sensors section
+      if (head && !head.querySelector("input")) return this._dlRename(head);
+      const el = e.target.closest("[data-dl]");
+      if (!el) {
+        if (this._dlMenuOpen) this._dlMenu(false);
+        return;
+      }
+      const b = this._dlRows[Number(el.dataset.i)];
+      if (this._dlSuppressClick) { this._dlSuppressClick = false; return; } // the click that ends a long press
+      if (el.dataset.dl === "menu") return this._dlMenu(!this._dlMenuOpen);
+      if (this._dlMenuOpen && !el.closest(".dl-menu")) this._dlMenu(false); // tapping elsewhere closes the menu
+      if (el.dataset.dl === "hide") {
+        // the card shrinks away, then it's gone from the list and the room
+        const card = el.closest(".dl-r, .dl-s");
+        const done = () => this._setHidden(el.dataset.e, true);
+        if (card && card.animate && !this._reducedMotion) {
+          card.animate([{ transform: "scale(1)", opacity: 1 }, { transform: "scale(.6)", opacity: 0 }], { duration: 180, easing: "ease-in", fill: "forwards" }).onfinish = done;
+        } else done();
+        if (navigator.vibrate) navigator.vibrate(10);
+        return;
+      }
+      if (el.dataset.dl === "unhide") {
+        this._setHidden(el.dataset.e, false);
+        if (navigator.vibrate) navigator.vibrate(10);
+        return;
+      }
+      if (el.dataset.dl === "hiddenlist") return this._dlMenuShow("hidden");
+      if (el.dataset.dl === "menuback") return this._dlMenuShow("");
+      if (el.dataset.dl === "tab") return this._auSetTab(el.dataset.t);
+      if (el.dataset.dl === "au-run") return this._auRunTile(el.dataset.sid);
+      if (el.dataset.dl === "au-edit") return this._auOpen(el.dataset.sid);
+      if (el.dataset.dl === "au-new") return this._auOpen(null, el.dataset.k);
+      if (el.dataset.dl === "au-en") {
+        const on = el.getAttribute("aria-pressed") === "true";
+        el.setAttribute("aria-pressed", String(!on)); // at once; Home Assistant confirms a moment later
+        el.closest(".au-t")?.classList.toggle("off", on);
+        return this._call("automation", on ? "turn_off" : "turn_on", { entity_id: el.dataset.e });
+      }
+      if (el.dataset.dl === "au-info") {
+        const ev = new Event("hass-more-info", { bubbles: true, composed: true });
+        ev.detail = { entityId: el.dataset.e };
+        return this.dispatchEvent(ev);
+      }
+      if (el.dataset.dl === "add") return this._auTab() === "auto" ? this._auOpen() : this._adOpen();
+      if (el.dataset.dl === "close") return this._closeDeviceList();
+      if (el.dataset.dl === "sensor") {
+        if (this._dlEdit) return;
+        const ev = new Event("hass-more-info", { bubbles: true, composed: true });
+        ev.detail = { entityId: el.dataset.s };
+        return this.dispatchEvent(ev);
+      }
+      if (el.dataset.dl === "arrange") {
+        this._dlMenu(false);
+        return this._dlSetEdit(true);
+      }
+      if (el.dataset.dl === "done") return this._dlSetEdit(false);
+      if (el.dataset.dl === "reset") {
+        this._dlSaveLayout(null);
+        this._dlReflow(this._dlLayout(this._dlData));
+        return;
+      }
+      if (this._dlEdit && el.closest(".dl-rows")) return; // arranging: taps don't switch things
+      if (el.dataset.dl === "expand") return this._setDlCompact(!this._dlCompact());
+      if (el.dataset.dl === "phone") {
+        this._dlMenu(false);
+        this._setPhone(!this._phone);
+        return;
+      }
+      if (el.dataset.dl === "snap") {
+        const on = !this._snapOn();
+        this._setSnap(on);
+        el.setAttribute("aria-pressed", String(on));
+        el.setAttribute("aria-checked", String(on));
+        if (navigator.vibrate) navigator.vibrate(12);
+        return;
+      }
+      if (el.dataset.dl === "temp") {
+        this._setTempShown(!this._tempShown());
+        if (navigator.vibrate) navigator.vibrate(12);
+        return;
+      }
+      if (el.dataset.dl === "bg") {
+        this._setBgShown(!this._bgShown());
+        if (navigator.vibrate) navigator.vibrate(12);
+        return;
+      }
+      if (el.dataset.dl === "overlay") {
+        this._setOverlays(!this._overlaysShown());
+        if (navigator.vibrate) navigator.vibrate(12);
+        return;
+      }
+      if (!b) return;
+      if (el.dataset.dl === "up" || el.dataset.dl === "down" || el.dataset.dl === "stop") {
+        const act = el.dataset.dl;
+        if (b.cover) {
+          b.cover.goal = act === "up" ? 1 : act === "down" ? 0 : null;
+          b.cover.goalT = performance.now();
+          b.cover.goalSlider = false;
+        }
+        this._call("cover", act === "up" ? "open_cover" : act === "down" ? "close_cover" : "stop_cover", { entity_id: b.cfg.entity });
+        if (navigator.vibrate) navigator.vibrate(10);
+        return;
+      }
+      if (el.dataset.dl === "vstart" || el.dataset.dl === "vpause" || el.dataset.dl === "vhome") {
+        if (el.getAttribute("aria-disabled") === "true") return;
+        this._call("vacuum", { vstart: "start", vpause: "pause", vhome: "return_to_base" }[el.dataset.dl], { entity_id: b.cfg.entity });
+        if (navigator.vibrate) navigator.vibrate(10);
+        return;
+      }
+      if (el.dataset.dl === "slower" || el.dataset.dl === "faster") {
+        if (el.getAttribute("aria-disabled") === "true") return;
+        const st = this._stateOf(b.cfg.entity), a = st?.attributes || {};
+        const on = this._isOn(st, b.cfg.entity, b.cfg);
+        const step = a.percentage_step || 10;
+        const cur = on ? a.percentage ?? 0 : 0;
+        const next = Math.max(0, Math.min(100, Math.round((cur + (el.dataset.dl === "faster" ? step : -step)) / step) * step));
+        if (next <= 0) this._call("fan", "turn_off", { entity_id: b.cfg.entity });
+        else this._call("fan", "set_percentage", { entity_id: b.cfg.entity, percentage: next });
+        if (navigator.vibrate) navigator.vibrate(10);
+        return;
+      }
+      if (el.dataset.dl === "toggle") {
+        this._toggleEntity(b);
+        if (navigator.vibrate) navigator.vibrate(12);
+      } else if (el.dataset.dl === "go") this._goToDevice(b);
+    };
+    dl.onkeydown = (e) => {
+      if (e.key === "Escape" && this._dlOpen) this._closeDeviceList();
+      if (!this._dlOpen && (e.key === "Enter" || e.key === " ") && e.target.closest(".dl-h")) {
+        e.preventDefault();
+        this._openDeviceList();
+      }
+    };
+    this._dlWireSlide(dl);
+    this._dlWireArrange(dl);
+    this._scWire(dl);
+    this._renderDeviceList(true);
+    this._dlSizes();
+  }
+
+  /** Panel width (fits the card) and pill width (fits "Devices" and its badge), for the grow/shrink animation. */
+  _dlSizes() {
+    const dl = this.shadowRoot?.querySelector(".dl");
+    if (!dl || !this._wrap) return;
+    const W = this._wrap.clientWidth || 320;
+    dl.style.setProperty("--dlw", `${Math.min(this._dlCompact() ? 256 : 300, W - 24)}px`);
+    this._wrap.style.setProperty("--h3d-dlw", `${Math.min(this._dlCompact() ? 256 : 300, W - 24)}px`);
+    const x = this._dlMeasure || (this._dlMeasure = document.createElement("canvas").getContext("2d"));
+    x.font = `700 13px ${getComputedStyle(dl).fontFamily || "system-ui"}`;
+    dl.style.setProperty("--pw", "38px"); // closed: just the round ☰ button
+  }
+
+  _openDeviceList() {
+    const dl = this.shadowRoot.querySelector(".dl");
+    if (!dl || dl.hidden) return;
+    this._dlOpen = true;
+    if (this._wxOpen) this._setWeatherOpen(false); // the forecast shrinks to its pill as the list opens
+    this._wrap.classList.add("dl-open");
+    this._dlFreeze = false;
+    this._closeMenu();
+    this._renderDeviceList(true);
+    if (!dl._h3dTouch) {
+      // using the list counts as interaction: the camera waits before returning home
+      dl._h3dTouch = true;
+      for (const ev of ["pointerdown", "wheel"]) dl.addEventListener(ev, () => this._scheduleReturn(), { passive: true });
+    }
+    this._dlSizes();
+    dl.classList.remove("mini");
+    this._dlMorphing(() => { if (this._dlOpen) this._dlPanelRes = true; }); // then the room may glide aside
+    dl.querySelector(".dl-x")?.focus?.({ preventScroll: true });
+  }
+
+  _closeDeviceList() {
+    const dl = this.shadowRoot.querySelector(".dl");
+    if (!dl || !this._dlOpen) return;
+    if (this._dlEdit) this._dlSetEdit(false);
+    this._dlMenu(false);
+    if (this._ad) this._adClose();
+    this._dlOpen = false;
+    this._wrap.classList.remove("dl-open");
+    this._dlSizes();
+    dl.classList.add("mini");
+    const h = dl.querySelector(".dl-h");
+    h?.setAttribute("aria-expanded", "false");
+    h?.setAttribute("role", "button");
+    this._dlMorphing(() => {
+      if (this._dlOpen) return;
+      this._dlPanelRes = false; // the room glides back once it's a pill again
+      dl.querySelector(".dl-rows")?.scrollTo?.(0, 0);
+    });
+  }
+
+  /**
+   * While the pill grows or shrinks, the room holds still and the scene isn't redrawn behind it,
+   * so the frosted glass stays smooth. `done` runs when the animation has finished.
+   */
+  _dlMorphing(done) {
+    clearTimeout(this._dlMorphT);
+    this._dlMorph = !this._reducedMotion;
+    this._dlMorphT = setTimeout(() => {
+      this._dlMorph = false;
+      done?.();
+      this._dirty = true;
+    }, this._reducedMotion ? 0 : 520);
+  }
+
+  /**
+   * `device_list_anchor`: the list floats next to that device (e.g. the door, like a panel by the entrance),
+   * follows it in 3D and switches sides when the door crosses the middle of the screen.
+   */
+  _dlAnchorPoint() {
+    // `device_list_layout: anchored` floats the list beside `device_list_anchor`; the default is a full-height side panel
+    return null; // the list grows out of its pill now; floating it beside a device is retired
+    const a = this._config.device_list_anchor;
+    if (!a || !this._root) return null;
+    if (this._dlAnchorKey !== a) {
+      this._dlAnchorKey = a;
+      const b = this._bindings.find((x) => x.cfg.entity === a);
+      const objs = b ? b.objs : this._findObjects(a, []);
+      this._dlAnchorW = objs.length ? this._boxOf(objs).getCenter(new THREE.Vector3()) : null;
+      if (b?.door) {
+        // hinge-side door leaf moves; anchor on the doorway itself (its closed position)
+        const bb = this._boxOf(objs);
+        this._dlAnchorW = new THREE.Vector3((bb.min.x + bb.max.x) / 2, bb.min.y + (bb.max.y - bb.min.y) * 0.55, (bb.min.z + bb.max.z) / 2);
+      }
+    }
+    return this._dlAnchorW;
+  }
+
+  /** Screen rectangle of the whole room (its bounding box's 8 corners, projected). */
+  _dlRoomRect(W, H) {
+    if (!this._dlRoomBox) this._dlRoomBox = new THREE.Box3().setFromObject(this._root);
+    const bb = this._dlRoomBox, v = new THREE.Vector3();
+    let x0 = Infinity, x1 = -Infinity;
+    for (let i = 0; i < 8; i++) {
+      v.set(i & 1 ? bb.max.x : bb.min.x, i & 2 ? bb.max.y : bb.min.y, i & 4 ? bb.max.z : bb.min.z).project(this._camera);
+      const x = ((v.x + 1) / 2) * W;
+      x0 = Math.min(x0, x); x1 = Math.max(x1, x);
+    }
+    return { x0: Math.max(x0, 0), x1: Math.min(x1, W) };
+  }
+
+  _positionDeviceList() {
+    const dl = this.shadowRoot?.querySelector(".dl");
+    if (!dl || dl.hidden || this._dlFreeze) return;
+    const W = this._wrap.clientWidth, H = this._wrap.clientHeight;
+    const pt = this._dlAnchorPoint();
+    let v = null;
+    if (pt && W >= 560) {
+      this._updateCamera();
+      v = pt.clone().project(this._camera);
+      if (v.z > 1 || v.x < -1.15 || v.x > 1.15 || v.y < -1.2 || v.y > 1.2) v = null;
+    }
+    if (!v) {
+      if (dl.classList.contains("anchored")) {
+        dl.classList.remove("anchored", "side-l", "side-r", "spinning");
+        dl.style.left = dl.style.top = dl.style.width = "";
+        this._dlSide = null;
+      }
+      return;
+    }
+    // while the room is spinning the list blurs out and stays where it is;
+    // once the room settles it glides to its new place beside the door and sharpens again
+    const spinning = !!this._tween || !!(this._drag && this._drag.moved >= 4);
+    const wasAnchored = dl.classList.contains("anchored");
+    dl.classList.add("anchored");
+    if (spinning && wasAnchored) {
+      if (!this._dlSpin) { this._dlSpin = true; dl.classList.add("spinning"); }
+      return;
+    }
+    if (this._dlSpin) {
+      this._dlSpin = false;
+      dl.classList.remove("spinning");
+      dl.classList.add("gliding");
+      clearTimeout(this._dlGlideT);
+      this._dlGlideT = setTimeout(() => dl.classList.remove("gliding"), 480);
+    }
+    const x = ((v.x + 1) / 2) * W, y = ((1 - v.y) / 2) * H;
+    let mw = dl.offsetWidth; const mh = dl.offsetHeight, gap = 22, pad = 12;
+    // outside the room: to the right of its right edge, or left of its left edge
+    const room = this._dlRoomRect(W, H);
+    const roomRight = W - pad - (room.x1 + gap), roomLeft = room.x0 - gap - pad; // free space on each side
+    const mid = (room.x0 + room.x1) / 2, hyst = (room.x1 - room.x0) * 0.06;
+    let side = this._dlSide || (x >= mid ? "r" : "l");
+    if (side === "l" && x > mid + hyst) side = "r";
+    if (side === "r" && x < mid - hyst) side = "l";
+    // the door's side doesn't have room for the list but the other side does: use that one
+    if (side === "r" && roomRight < mw && roomLeft >= mw) side = "l";
+    if (side === "l" && roomLeft < mw && roomRight >= mw) side = "r";
+    if (side !== this._dlSide) {
+      if (this._dlSide && !dl.classList.contains("gliding")) {
+        dl.classList.add("gliding");
+        clearTimeout(this._dlGlideT);
+        this._dlGlideT = setTimeout(() => dl.classList.remove("gliding"), 480);
+      }
+      this._dlSide = side;
+      dl.classList.toggle("side-r", side === "r");
+      dl.classList.toggle("side-l", side === "l");
+    }
+    // narrow the list a little (down to 236 px) if that's what it takes to clear the room
+    const free = side === "r" ? roomRight : roomLeft;
+    const fitW = Math.round(Math.min(290, Math.max(236, free)));
+    if (dl.style.width !== `${fitW}px`) dl.style.width = `${fitW}px`;
+    mw = fitW;
+    const want = side === "r" ? room.x1 + gap : room.x0 - gap - mw;
+    const left = Math.min(Math.max(want, pad), Math.max(pad, W - mw - pad));
+    // centred on the door's height, kept below the Devices button and inside the card
+    const top = Math.min(Math.max(y - mh / 2, 58), Math.max(pad, H - mh - pad));
+    dl.style.left = `${left.toFixed(1)}px`;
+    dl.style.top = `${top.toFixed(1)}px`;
+    dl.style.setProperty("--ty", `${Math.min(Math.max(y - top, 22), mh - 22).toFixed(1)}px`);
+  }
+
+  /** Fly the camera to a device, then open its panel (or its history for sensors). */
+  _goToDevice(b) {
+    const narrow = this._wrap.clientWidth < 700;
+    if (narrow) this._closeDeviceList(); // the list would cover the room on a phone
+    const box = this._boxOf(b.objs);
+    const target = box.getCenter(new THREE.Vector3());
+    this._animateTo({ target, dist: this._home.dist * (b.cfg.focus_zoom ?? 0.55), el: 32 * DEG }, 750, easeInOutCubic);
+    clearTimeout(this._goT);
+    this._goT = setTimeout(() => {
+      if (this._menuEnabled(b)) this._openMenu(b);
+      else this._moreInfo(b);
+    }, 700);
+    // look at it for 3 s after arriving, then glide back to the start view; the list stays put meanwhile
+    this._dlHold = true;
+    this._dlFreeze = true;
+    this._scheduleReturn(750);
+  }
+
+  _endDlHold() {
+    clearTimeout(this._dlHoldT);
+    if (!this._dlHold && !this._dlFreeze) return;
+    this._dlHold = false;
+    this._dlFreeze = false;
+    if (this._dlOpen) this._positionDeviceList();
+  }
+
+  /** Icon markup for the list: blinds get a live little window, everything else its symbol. */
+  _dlIcSvg(b) {
+    if (b.cover && this._dlIcon(b) === "blind") {
+      return `<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="2.4" rx="1"/>
+        <rect x="5" y="5.4" width="14" height="15.6" rx="1" fill="none" stroke="currentColor" stroke-width="1.5" opacity=".45"/>
+        <rect class="bl-fab" x="5" y="5.4" width="14" height="15.6"/><rect class="bl-bar" x="5" y="4.4" width="14" height="2" rx="1"/></svg>`;
+    }
+    return svg(this._dlIcon(b));
+  }
+
+  _dlIcon(b) {
+    if (b.cfg.list_icon && ICON[b.cfg.list_icon]) return b.cfg.list_icon;
+    const d = b.cfg.entity.split(".")[0];
+    // plugs and switches: guess what's plugged in from the name (English or Finnish)
+    const nm = `${b.cfg.name || ""} ${this._stateOf(b.cfg.entity)?.attributes?.friendly_name || ""} ${b.cfg.entity}`.toLowerCase();
+    const dc = this._stateOf(b.cfg.entity)?.attributes?.device_class || "";
+    if (d === "switch" || d === "input_boolean") {
+      if (/lamp|light|valo|lamppu|led/.test(nm)) return "bulb";
+      if (/fan|tuuletin|purifier|puhdistin|dyson/.test(nm)) return "fan";
+      if (/heat|radiator|lämmi|patteri/.test(nm)) return "thermo";
+      if (/tv|pc|computer|tietokone|monitor|speaker|kaiutin|console|playstation|xbox/.test(nm)) return "pc";
+      return "plug";
+    }
+    if (d === "binary_sensor" && !b.door) {
+      if (/window|ikkuna/.test(nm) || dc === "window") return "window";
+      if (/door|ovi/.test(nm) || ["door", "garage_door", "opening"].includes(dc)) return "door";
+    }
+    if (d === "humidifier") return "fan";
+    if (d === "vacuum") return "vacuum";
+    if (b.cfg.network || b.cfg.presence) return "wifi";
+    if (b.door) return /window|ikkuna/i.test(b.cfg.name || "") ? "window" : /door|ovi/i.test(b.cfg.name || b.cfg.entity) ? "door" : "window";
+    if (b.isScreen && !b.isMedia) return "pc";
+    return { light: "bulb", cover: "blind", fan: "fan", camera: "camera", climate: "thermo", media_player: "pc" }[d] || "dot";
+  }
+
+  /** A few characters for the compact list: 78%, Speed 4, Closed, ↓ 420… */
+  _dlShort(b, s) {
+    const st = this._stateOf(b.cfg.entity);
+    const a = st?.attributes || {};
+    const d = b.cfg.entity.split(".")[0];
+    const on = this._isOn(st, b.cfg.entity, b.cfg);
+    if (s.cls === "bad") return st ? "Offline" : "Missing";
+    if (b.cfg.network) return on ? `↓ ${this._fmtNum(this._stateOf(b.cfg.network.download), 0)}` : "Offline";
+    if (b.cfg.presence) return on ? "Online" : "Offline";
+    if (b.door) return on ? "Open" : "Closed";
+    if (d === "light") return on ? (a.brightness != null ? `${Math.round((a.brightness / 255) * 100)}%` : "On") : "Off";
+    if (d === "cover") return a.current_position != null ? (a.current_position > 0 ? `${a.current_position}%` : "Closed") : s.text;
+    if (d === "fan") {
+      if (!on) return "Off";
+      const step = a.percentage_step || 1;
+      return a.percentage != null ? (step >= 5 ? `Speed ${Math.max(1, Math.round(a.percentage / step))}` : `${a.percentage}%`) : "On";
+    }
+    if (d === "camera") return st?.state === "unavailable" ? "Offline" : "Live";
+    if (d === "vacuum") {
+      const bat = this._vacBattery(b, st);
+      return st?.state === "docked" && bat != null ? `${bat}%` : this._vacWord(st, true);
+    }
+    return s.text.split(" · ")[0];
+  }
+
+  _dlState(b) {
+    const st = this._stateOf(b.cfg.entity);
+    const a = st?.attributes || {};
+    const d = b.cfg.entity.split(".")[0];
+    const on = this._isOn(st, b.cfg.entity, b.cfg);
+    if (b.alert && b.sinceText) return { text: b.sinceText, cls: "bad" };
+    if (!st) return { text: "Not found", cls: "bad" };
+    if (b.cfg.network) {
+      const dn = this._fmtNum(this._stateOf(b.cfg.network.download), 0);
+      return { text: on ? `Online · ↓ ${dn} Mbps` : "Offline", cls: on ? "good" : "bad" };
+    }
+    if (b.door) return { text: on ? "Open" : "Closed", cls: on ? "warn" : "" };
+    if (d === "light") return { text: on ? `On${a.brightness != null ? ` · ${Math.round((a.brightness / 255) * 100)}%` : ""}` : "Off", cls: on ? "on" : "" };
+    if (d === "cover") return { text: a.current_position != null ? (a.current_position > 0 ? `Open · ${a.current_position}%` : "Closed") : st.state, cls: on ? "on" : "" };
+    if (d === "fan") {
+      const step = a.percentage_step || 1;
+      const lvl = a.percentage != null && step >= 5 ? ` · speed ${Math.max(1, Math.round(a.percentage / step))}` : a.percentage != null ? ` · ${a.percentage}%` : "";
+      const heat = b.cfg.climate && this._isHeating(this._stateOf(b.cfg.climate)) ? " · heating" : "";
+      return { text: on ? `On${lvl}${heat}` : "Off", cls: on ? "on" : "" };
+    }
+    if (d === "camera") return { text: st.state === "unavailable" ? "Offline" : "Live view", cls: "" };
+    if (d === "vacuum") {
+      const bat = this._vacBattery(b, st);
+      return { text: `${this._vacWord(st)}${bat != null ? ` · ${bat}%` : ""}`, cls: st.state === "error" ? "warn" : on ? "on" : "" };
+    }
+    if (b.cfg.on_state != null) return { text: st.state, cls: on ? "on" : "" };
+    const s = String(st.state).replace(/_/g, " ");
+    return { text: s.charAt(0).toUpperCase() + s.slice(1), cls: on ? "on" : "" };
+  }
+
+  /** Cleaning, Docked, Charging, Heading home… (`short` for the compact list). */
+  _vacWord(st, short = false) {
+    const s = st?.state || "unknown";
+    const bat = Number(st?.attributes?.battery_level);
+    if (s === "cleaning") return "Cleaning";
+    if (s === "returning") return short ? "Going home" : "Returning to dock";
+    if (s === "docked") return !short && Number.isFinite(bat) && bat < 100 ? "Charging" : "Docked";
+    if (s === "paused") return "Paused";
+    if (s === "idle") return "Idle";
+    if (s === "error") return short ? "Needs help" : `Error${st.attributes?.error ? `: ${st.attributes.error}` : ""}`;
+    return s.charAt(0).toUpperCase() + s.slice(1).replace(/_/g, " ");
+  }
+
+  _canToggle(b) {
+    const d = b.cfg.entity.split(".")[0];
+    if (b.readOnly || b.cfg.network || b.cfg.presence) return false;
+    if (!this._stateOf(b.cfg.entity) || this._stateOf(b.cfg.entity).state === "unavailable") return false;
+    return ["light", "switch", "fan", "cover", "media_player", "input_boolean", "climate", "humidifier"].includes(d);
+  }
+
+  /**
+   * The list icon follows the device: a light's icon takes the light's colour and brightness,
+   * a fan's icon spins at the fan's speed (and stops when it's off).
+   */
+  _dlIcLive(b, on) {
+    const d = b.cfg.entity.split(".")[0];
+    const out = { cls: "", style: "" };
+    if (d === "light" && on && b.baseCss) {
+      const x = this._bgParse || (this._bgParse = document.createElement("canvas").getContext("2d"));
+      x.fillStyle = "#ffb56b";
+      x.fillStyle = b.baseCss;
+      const h = /^#([0-9a-f]{6})$/i.test(x.fillStyle) ? x.fillStyle.slice(1) : "ffb56b";
+      const [r, g, bl] = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+      const f = Math.min(1, Math.max(0.25, b.baseFactor ?? 1)); // dim lamp: a deeper, less bright tile
+      const lum = (0.299 * r + 0.587 * g + 0.114 * bl) / 255;
+      out.cls = "tint";
+      out.style = `--ic-bg:rgb(${r},${g},${bl});--ic-a:${Math.round(55 + 45 * f)}%;--ic-fg:${lum * (0.55 + 0.45 * f) > 0.55 ? "#2a1c00" : "#fff"};`;
+    } else if (d === "cover" && b.cover) {
+      // closed fraction: the 3D blind's animated value while it moves, otherwise the reported position
+      const st = this._stateOf(b.cfg.entity);
+      const p = st?.attributes?.current_position;
+      const open = b.cover.dir ? b.cover.cur : p != null ? p / 100 : on ? 1 : 0;
+      out.cls = "blind" + (b.cover.dir ? " live" : "");
+      out.style = `--bl:${(1 - Math.min(1, Math.max(0, open))).toFixed(3)};`;
+    } else if (d === "vacuum" && this._stateOf(b.cfg.entity)?.state === "cleaning") {
+      out.cls = "roam";
+    } else if (d === "fan" && on) {
+      const pct = this._stateOf(b.cfg.entity)?.attributes?.percentage;
+      const k = pct == null ? 0.5 : Math.min(1, Math.max(0.05, pct / 100));
+      out.cls = "spin";
+      out.style = `--spin:${(2.4 - 2.05 * k).toFixed(2)}s;`; // slowest about 2.3 s a turn, fastest about 0.35 s
+    }
+    return out;
+  }
+
+  /** Which heading a device goes under in the list (`category:` on an entity overrides it). */
+  _dlCat(b) {
+    if (b.cfg.category) return String(b.cfg.category);
+    const ic = this._dlIcon(b);
+    const d = b.cfg.entity.split(".")[0];
+    if (ic === "bulb" || d === "light") return "Lights";
+    if (ic === "blind" || d === "cover") return "Blinds";
+    if (ic === "door" || ic === "window" || b.door) return "Doors & windows";
+    if (ic === "fan" || ic === "thermo" || d === "climate" || d === "fan") return "Climate";
+    if (ic === "camera" || d === "camera" || d === "alarm_control_panel" || d === "lock") return "Security";
+    if (ic === "wifi" || b.cfg.network || b.cfg.presence) return "Network";
+    if (ic === "pc" || d === "media_player") return "Computer & media";
+    if (ic === "plug" || d === "switch" || d === "input_boolean") return "Switches";
+    if (ic === "vacuum" || d === "vacuum") return "Cleaning";
+    return "Other";
+  }
+
+  /**
+   * Devices (and sensor readings) you've hidden: they leave the list, and in the room they lose their dot, their
+   * floating readouts and their panel (the object itself stays). Remembered per screen; `hidden:` in the config
+   * sets the starting list. Brought back from ☰ → Hidden devices.
+   */
+  _hiddenSet() {
+    if (!this._hid) {
+      let v = null;
+      try { v = JSON.parse(localStorage.getItem(`house3d-card:hidden:${this._config.model || ""}`) || "null"); } catch (e) {}
+      this._hid = new Set(Array.isArray(v) ? v : this._config.hidden || []);
+    }
+    return this._hid;
+  }
+
+  _isHidden(entity) {
+    return !!entity && this._hiddenSet().has(entity);
+  }
+
+  _setHidden(entity, hide) {
+    const set = this._hiddenSet();
+    hide ? set.add(entity) : set.delete(entity);
+    try { localStorage.setItem(`house3d-card:hidden:${this._config.model || ""}`, JSON.stringify([...set])); } catch (e) {}
+    if (hide && this._menuFor?.cfg.entity === entity) this._closeMenu();
+    this._applyHidden();
+    this._dlShape = null;
+    if (this._dlOpen) this._renderDeviceList(true);
+    else this._renderDeviceList();
+    if (this._dlMenuOpen) {
+      const m = this.shadowRoot.querySelector(".dl-menu");
+      if (m) m.innerHTML = this._dlMenuHtml(this._dlMenuView);
+    }
+    this._dirty = true;
+  }
+
+  /** Hidden devices: no dot in the room, no floating readouts that belong to them. */
+  _applyHidden() {
+    for (const b of this._bindings || []) {
+      b.hiddenByUser = this._isHidden(b.cfg.entity);
+      // a hidden robot vacuum leaves the room too (with its dock); on page load it's simply gone
+      if (b.vac) {
+        b.vac.goneTo = b.hiddenByUser ? 1 : 0;
+        if (!b.vac.vanInit || this._reducedMotion) { b.vac.vanInit = true; b.vac.gone = b.vac.goneTo; this._vanishApply(b); }
+      }
+    }
+    for (const l of this._labels || []) {
+      const ents = [l.cfg.entity, l.cfg.menu_of].filter(Boolean);
+      l.hiddenByUser = ents.some((e) => this._isHidden(e));
+      l.el.classList.toggle("off", l.hiddenByUser);
+    }
+    this._dirty = true;
+  }
+
+  /** Name for the ☰ switch of the floating readouts that aren't the network one (e.g. "Room temperature"). */
+  _plainLabels() {
+    const plain = (this._config.labels || []).filter((l) => !l.parts && !l.menu_of);
+    if (!plain.length) return "";
+    return plain.length === 1 ? plain[0].name || "Room temperature" : "Room readouts";
+  }
+
+  _tempShown() {
+    if (this._tempOn == null) {
+      let v = null;
+      try { v = localStorage.getItem(`house3d-card:readouts:${this._config.model || ""}`); } catch (e) {}
+      this._tempOn = v == null ? true : v === "1";
+    }
+    return this._tempOn;
+  }
+
+  _setTempShown(show) {
+    this._tempOn = show;
+    try { localStorage.setItem(`house3d-card:readouts:${this._config.model || ""}`, show ? "1" : "0"); } catch (e) {}
+    this._wrap.classList.toggle("no-readouts", !show);
+    for (const el of this.shadowRoot.querySelectorAll('.dl [data-dl="temp"]')) { el.setAttribute("aria-pressed", String(show)); el.setAttribute("aria-checked", String(show)); }
+  }
+
+  /** The motion background can be switched off from the device list; remembered per screen like the dots. */
+  _bgShown() {
+    if (this._bgOn == null) {
+      let v = null;
+      try { v = localStorage.getItem(`house3d-card:background:${this._config.model || ""}`); } catch (e) {}
+      this._bgOn = v == null ? true : v === "1";
+    }
+    return this._bgOn;
+  }
+
+  _setBgShown(show) {
+    this._bgOn = show;
+    try { localStorage.setItem(`house3d-card:background:${this._config.model || ""}`, show ? "1" : "0"); } catch (e) {}
+    this._wrap.classList.toggle("no-bg", !show);
+    if (show && this._bg) this._bg.dirty = true; // redraw it now, it wasn't kept up to date while hidden
+    for (const el of this.shadowRoot.querySelectorAll('.dl [data-dl="bg"]')) { el.setAttribute("aria-pressed", String(show)); el.setAttribute("aria-checked", String(show)); }
+  }
+
+  /** Compact (one line per device, the default) or detailed rows; remembered per screen. */
+  _dlCompact() {
+    if (this._dlComp == null) {
+      let v = null;
+      try { v = localStorage.getItem(`house3d-card:list:${this._config.model || ""}`); } catch (e) {}
+      this._dlComp = v == null ? this._config.device_list_compact !== false : v === "compact";
+    }
+    return this._dlComp;
+  }
+
+  _setDlCompact(compact) {
+    this._dlComp = compact;
+    if (!compact && this._dlEdit) this._dlSetEdit(false);
+    try { localStorage.setItem(`house3d-card:list:${this._config.model || ""}`, compact ? "compact" : "detailed"); } catch (e) {}
+    const dl = this.shadowRoot.querySelector(".dl");
+    if (!dl) return;
+    dl.classList.toggle("compact", compact);
+    this._dlSizes();
+    const x = dl.querySelector(".dl-exp");
+    x?.setAttribute("aria-pressed", String(!compact));
+    x?.setAttribute("aria-label", compact ? "Show details" : "Compact list");
+    if (x) x.innerHTML = svg(compact ? "expand" : "collapse");
+    const chips = dl.querySelector(".dl-chips");
+    if (chips) chips.innerHTML = this._dlChipsHtml();
+  }
+
+  _overlaysShown() {
+    if (this._overlays == null) {
+      let v = null;
+      try { v = localStorage.getItem(`house3d-card:overlays:${this._config.model || ""}`); } catch (e) {}
+      this._overlays = v == null ? this._config.show_overlays !== false : v === "1";
+    }
+    return this._overlays;
+  }
+
+  _setOverlays(show) {
+    this._overlays = show;
+    try { localStorage.setItem(`house3d-card:overlays:${this._config.model || ""}`, show ? "1" : "0"); } catch (e) {}
+    this._wrap.classList.toggle("no-overlays", !show);
+    for (const el of this.shadowRoot.querySelectorAll('.dl [data-dl="overlay"]')) { el.setAttribute("aria-pressed", String(show)); el.setAttribute("aria-checked", String(show)); }
+  }
+
+  _renderDeviceList(force = false) {
+    const dl = this.shadowRoot?.querySelector(".dl");
+    if (!dl || !this._dlRows) return;
+    const esc = (v) => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    const rows = this._dlRows.map((b, i) => [b, i]).filter(([b]) => !this._isHidden(b.cfg.entity)).map(([b, i]) => {
+      const st = this._stateOf(b.cfg.entity);
+      const on = this._isOn(st, b.cfg.entity, b.cfg);
+      const s = this._dlState(b);
+      const cov = !!b.cover && b.cfg.entity.startsWith("cover.");
+      const fan = b.cfg.entity.startsWith("fan.") && b.cfg.list_speed !== false && (st?.attributes?.percentage != null || st?.attributes?.percentage_step != null);
+      const dim = b.cfg.entity.startsWith("light.") && b.cfg.list_slide !== false &&
+        (st?.attributes?.brightness != null || (st?.attributes?.supported_color_modes || ["brightness"]).some((m) => m !== "onoff"));
+      const vac = b.cfg.entity.startsWith("vacuum.") && b.cfg.list_buttons !== false && !!st && st.state !== "unavailable";
+      return { b, i, on, s, cov, fan, dim, vac, vst: st?.state, lv: on ? (st?.attributes?.brightness != null ? Math.round((st.attributes.brightness / 255) * 100) : 100) : 0, pct: on ? st?.attributes?.percentage ?? 0 : 0, mv: cov ? st?.state === "opening" ? 1 : st?.state === "closing" ? -1 : 0 : 0, short: this._dlShort(b, s), name: b.cfg.name || st?.attributes?.friendly_name || b.cfg.entity, tog: this._canToggle(b), cat: this._dlCat(b), live: this._dlIcLive(b, on) };
+    });
+    // grouped by category, in a fixed order; devices keep their config order inside each group
+    const ORDER = ["Lights", "Blinds", "Climate", "Doors & windows", "Security", "Network", "Computer & media", "Switches", "Cleaning", "Other"];
+    const rank = (c) => (ORDER.includes(c) ? ORDER.indexOf(c) : ORDER.length - 1.5); // custom categories go before "Other"
+    rows.sort((a, z) => rank(a.cat) - rank(z.cat) || (rank(a.cat) === rank(z.cat) && a.cat !== z.cat ? a.cat.localeCompare(z.cat) : 0) || a.i - z.i);
+    const activeCount = rows.filter((r) => r.on && r.tog).length;
+    const badCount = rows.filter((r) => r.s.cls === "bad").length;
+    const htxt = `${activeCount} on${badCount ? ` · <b>${badCount} offline</b>` : ""}`;
+    const n = dl.querySelector(".dl-h .dl-n");
+    if (n) {
+      const txt = badCount ? String(badCount) : activeCount ? String(activeCount) : "";
+      if (n.textContent !== txt) {
+        n.textContent = txt;
+        this._dlSizes(); // the pill fits its badge
+      }
+      n.className = `dl-n ${badCount ? "bad" : ""}`;
+    }
+    const sum = dl.querySelector(".dl-sum");
+    if (sum && sum.innerHTML !== htxt) sum.innerHTML = htxt;
+    this._auRefresh();
+    if (!this._dlOpen && !force) return;
+    this._dlData = rows;
+    const layout = this._dlLayout(rows);
+    // same rows and switches as before: update text and state in place, so taps are never lost to a rebuild
+    const shape = JSON.stringify([rows.map((r) => [r.i, r.tog, r.name, r.cat, r.mv]), layout.map((l) => l.map((r) => r.i)), this._dlSensorList().map((x) => x.entity)]);
+    if (this._dlDrag) return; // mid-drag: the badge and summary above are enough
+    if (!force && shape === this._dlShape && dl.querySelector(".dl-rows")) {
+      this._dlUpdateInPlace(rows);
+      return;
+    }
+    if (!force && this._dlEdit && dl.querySelector(".dl-rows")) {
+      // arranging: keep the tiles (and their wiggle) and just put them in their places
+      this._dlShape = shape;
+      this._dlUpdateInPlace(rows);
+      this._dlReflow(layout, false);
+      return;
+    }
+    this._dlShape = shape;
+    const badge = badCount ? String(badCount) : activeCount ? String(activeCount) : "";
+    dl.innerHTML = `
+      <div class="dl-h" tabindex="0" ${this._dlOpen ? 'aria-expanded="true"' : 'role="button" aria-expanded="false"'} aria-label="Devices">
+        <button class="dl-hi" data-dl="menu" aria-label="List options" aria-expanded="false">${svg("list")}</button><span class="dl-title">${this._auTab() === "auto" ? "Shortcuts" : "Devices"}</span><i class="dl-n ${badCount ? "bad" : ""}">${badge}</i>
+        <small class="dl-sum">${htxt}</small>
+        <button class="dl-addb" data-dl="add" aria-label="${this._auTab() === "auto" ? "New shortcut" : "Add a device"}">${svg("plus")}</button>
+        <button class="dl-exp" data-dl="expand" aria-pressed="${!this._dlCompact()}" aria-label="${this._dlCompact() ? "Show details" : "Compact list"}">${svg(this._dlCompact() ? "expand" : "collapse")}</button>
+        <button class="dl-x" data-dl="close" aria-label="Close">${svg("close")}</button></div>
+      <div class="ad" hidden role="dialog" aria-label="Add a device"></div>
+      <div class="ad au" hidden role="dialog" aria-label="Shortcut"></div>
+      <div class="dl-menu" role="menu" hidden>${this._dlMenuHtml()}</div>
+      <div class="dl-body"><div class="dl-in">
+      ${this._auTabsHtml()}
+      <div class="dl-chips">${this._dlChipsHtml()}</div>
+      <div class="dl-rows">${this._dlRowsHtml(layout)}${this._dlSensorsHtml()}</div>
+      <div class="dl-auto" role="tabpanel" aria-label="Shortcuts">${this._auPaneHtml()}</div></div></div>`;
+    this._auRefresh(true);
+    if (this._ad) this._adRender();
+    if (this._au) this._auRender();
+  }
+
+  /** Update each tile's state, switch and icon where it is (found by entity), so taps are never lost to a rebuild. */
+  _dlUpdateInPlace(rows) {
+    const dl = this.shadowRoot.querySelector(".dl");
+    for (const x of this._dlSensorList()) {
+      const el = dl.querySelector(`.dl-s[data-s="${CSS.escape(x.entity)}"]`);
+      if (!el) continue;
+      const r = this._dlSensorRead(x);
+      const b = el.querySelector("b");
+      if (b && b.innerHTML !== r.html) b.innerHTML = r.html;
+      if (el.dataset.q !== r.q) el.dataset.q = r.q;
+    }
+    for (const r of rows) {
+      const el = dl.querySelector(`.dl-rows .dl-r[data-e="${CSS.escape(r.b.cfg.entity)}"]`);
+      if (!el) continue;
+      el.classList.toggle("is-on", r.on);
+      el.classList.toggle("is-bad", r.s.cls === "bad");
+      const sm = el.querySelector(".dl-t small");
+      if (sm.textContent !== r.s.text) sm.textContent = r.s.text;
+      if (sm.className !== r.s.cls) sm.className = r.s.cls;
+      const q = el.querySelector(".dl-q");
+      if (q && q.textContent !== r.short) q.textContent = r.short;
+      if (q && q.className !== `dl-q ${r.s.cls}`) q.className = `dl-q ${r.s.cls}`;
+      const ic = this._dlIcon(r.b);
+      if (el.dataset.ic !== ic) {
+        el.dataset.ic = ic;
+        el.querySelector(".dl-ic").innerHTML = this._dlIcSvg(r.b);
+      }
+      const icEl = el.querySelector(".dl-ic");
+      const cls = `dl-ic ${r.live.cls}`.trim();
+      if (icEl.className !== cls) icEl.className = cls;
+      if ((icEl.getAttribute("style") || "") !== r.live.style) icEl.setAttribute("style", r.live.style);
+      const sw = el.querySelector(".sw2");
+      if (sw) {
+        sw.setAttribute("aria-pressed", String(r.on));
+        sw.setAttribute("aria-label", `Turn ${r.name} ${r.on ? "off" : "on"}`);
+      }
+      if (r.dim && this._dlSlide?.e !== r.b.cfg.entity) {
+        el.style.setProperty("--lvn", (r.lv / 100).toFixed(3));
+        if (r.b.baseCss) el.style.setProperty("--lc", r.b.baseCss);
+      }
+      if (r.vac) {
+        const box = el.querySelector(".dl-arw");
+        const h = this._vacRowBtns(r);
+        if (box && box._h !== h) { box.innerHTML = h; box._h = h; }
+      }
+      if (r.fan) {
+        el.querySelector('[data-dl="slower"]')?.setAttribute("aria-disabled", String(!r.on));
+        el.querySelector('[data-dl="faster"]')?.setAttribute("aria-disabled", String(r.pct >= 100));
+      }
+    }
+  }
+
+  /** While arranging: Done and Reset layout above the list (the other options live behind the ☰ button). */
+  /**
+   * The sensors shown in the list's Sensors section: the room readouts (labels with a sensor) and every entity's
+   * `sensors:` (the Dyson's air quality). `list_sensors:` in the config replaces that with your own list.
+   */
+  _dlSensorList() {
+    if (this._dlSens) return this._dlSens.filter((x) => !this._isHidden(x.entity));
+    const c = this._config, out = [], seen = new Set();
+    const add = (entity, name, unit) => {
+      if (!entity || seen.has(entity)) return;
+      seen.add(entity);
+      out.push({ entity, name, unit });
+    };
+    if (Array.isArray(c.list_sensors)) {
+      for (const x of c.list_sensors) typeof x === "string" ? add(x) : add(x.entity, x.name, x.unit);
+    } else {
+      for (const l of c.labels || []) if (l.entity && !l.parts && String(l.entity).startsWith("sensor.")) add(l.entity, l.name, l.unit);
+      // a device's own readings (the air purifier's air quality...), but not a robot vacuum's brush hours
+      for (const e of c.entities || []) if (!String(e.entity).startsWith("vacuum.") && e.list_sensors !== false) for (const x of e.sensors || []) add(x.entity, x.name, x.unit);
+      for (const x of this._extraSensors || []) add(x.entity, x.name, x.unit);
+    }
+    this._dlSens = out;
+    return out.filter((x) => !this._isHidden(x.entity));
+  }
+
+  /** A sensor's value for the list, and how good it is (air quality, humidity) for its little dot. */
+  _dlSensorRead(x) {
+    const st = this._stateOf(x.entity);
+    const unit = x.unit ?? st?.attributes?.unit_of_measurement ?? "";
+    const raw = st ? st.state : "–";
+    const num = Number(raw);
+    const ok = st && raw !== "" && raw !== "unavailable" && raw !== "unknown" && !Number.isNaN(num);
+    const val = ok ? String(Math.round(num * 10) / 10) : st ? "–" : "?";
+    const u = unit === "%" || unit === "°C" || unit === "°F" ? unit.replace("°C", "°").replace("°F", "°") : unit ? `<small>${unit}</small>` : "";
+    const key = `${x.entity} ${x.name || ""} ${st?.attributes?.device_class || ""}`.toLowerCase();
+    let q = "";
+    if (ok) {
+      const band = (g, m) => (num <= g ? "good" : num <= m ? "fair" : "poor");
+      if (/pm_?2|pm2\.5|pm25/.test(key)) q = band(12, 35);
+      else if (/pm_?10/.test(key)) q = band(54, 154);
+      else if (/no2|no₂|voc|aqi|index/.test(key)) q = band(3, 6);
+      else if (/humid/.test(key)) q = num >= 30 && num <= 60 ? "good" : num >= 20 && num <= 70 ? "fair" : "poor";
+    }
+    return { html: `${val}${u}`, q };
+  }
+
+  _dlSensorsHtml() {
+    const list = this._dlSensorList();
+    if (!list.length || this._config.list_sensors === false) return "";
+    const esc = (v) => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    // a temperature leads on its own line; the rest sit three to a line (the last line shares its width)
+    const isTemp = (x) => /temp/.test(`${x.entity} ${x.name || ""} ${this._stateOf(x.entity)?.attributes?.device_class || ""}`.toLowerCase());
+    const first = list.findIndex(isTemp);
+    const order = first > 0 ? [list[first], ...list.filter((_, i) => i !== first)] : list;
+    const lines = [];
+    let rest = order;
+    if (first >= 0) { lines.push([order[0]]); rest = order.slice(1); }
+    for (let i = 0; i < rest.length; i += 3) lines.push(rest.slice(i, i + 3));
+    let html = "";
+    for (const line of lines) {
+      for (const x of line) {
+        const r = this._dlSensorRead(x);
+        const name = x.name || this._stateOf(x.entity)?.attributes?.friendly_name || x.entity;
+        html += `<div class="dl-s s${6 / line.length}" role="button" tabindex="0" data-dl="sensor" data-s="${esc(x.entity)}" data-q="${r.q}" aria-label="${esc(name)}">
+          <button class="dl-rm" data-dl="hide" data-e="${esc(x.entity)}" aria-label="Hide ${esc(name)}">${svg("minus")}</button>
+          <span><i></i>${esc(name)}</span><b>${r.html}</b></div>`;
+      }
+    }
+    return `<div class="dl-sec"><div class="dl-cat" role="heading" aria-level="3" data-cat="Sensors">${esc(this._dlGroupName("Sensors"))}</div>
+      <div class="dl-sg">${html}</div></div>`;
+  }
+
+  _dlChipsHtml() {
+    if (!this._dlEdit) return "";
+    return `<button class="dl-chip done" data-dl="done" aria-pressed="true">${svg("check")}<span>Done</span></button>
+      <button class="dl-chip" data-dl="reset" aria-pressed="false">${svg("undo")}<span>Reset layout</span></button>`;
+  }
+
+  /** The ☰ menu: show/hide the dots, the moving background, and arranging the devices. */
+  _dlMenuHtml(view = "") {
+    const esc = (v) => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    const hidden = [...this._hiddenSet()];
+    if (view === "hidden") {
+      const nameOf = (e) => {
+        const b = this._bindings.find((x) => x.cfg.entity === e);
+        const sx = (this._dlSens || []).find((x) => x.entity === e);
+        return b?.cfg.name || sx?.name || this._stateOf(e)?.attributes?.friendly_name || e;
+      };
+      const iconOf = (e) => {
+        const b = this._bindings.find((x) => x.cfg.entity === e);
+        return b ? this._dlIcon(b) : "thermo";
+      };
+      return `<button class="dl-mi back" role="menuitem" data-dl="menuback">${svg("chev")}<span>Hidden devices</span></button>
+        ${hidden.length
+          ? hidden.map((e) => `<div class="dl-mi hid">${svg(iconOf(e))}<span>${esc(nameOf(e))}</span>
+              <button class="dl-add" data-dl="unhide" data-e="${esc(e)}" aria-label="Show ${esc(nameOf(e))} again">${svg("plus")}</button></div>`).join("")
+          : `<div class="dl-mi none"><span>Nothing hidden. While arranging, tap − on a card to hide it.</span></div>`}`;
+    }
+    const hasBg = !!(this._bgCanvas || this.shadowRoot.querySelector("canvas.bg"));
+    return `<button class="dl-mi" role="menuitemcheckbox" data-dl="overlay" aria-pressed="${this._overlaysShown()}" aria-checked="${this._overlaysShown()}">${svg("eye")}<span>Dots &amp; network</span><i></i></button>
+      ${hasBg ? `<button class="dl-mi" role="menuitemcheckbox" data-dl="bg" aria-pressed="${this._bgShown()}" aria-checked="${this._bgShown()}">${svg("sparkle")}<span>Background</span><i></i></button>` : ""}
+      ${this._plainLabels() ? `<button class="dl-mi" role="menuitemcheckbox" data-dl="temp" aria-pressed="${this._tempShown()}" aria-checked="${this._tempShown()}">${svg("thermo")}<span>${this._plainLabels()}</span><i></i></button>` : ""}
+      <button class="dl-mi" role="menuitemcheckbox" data-dl="snap" aria-pressed="${this._snapOn()}" aria-checked="${this._snapOn()}">${svg("topview")}<span>Snap to angles</span><i></i></button>
+      <button class="dl-mi" role="menuitemcheckbox" data-dl="phone" aria-pressed="${!!this._phone}" aria-checked="${!!this._phone}">${svg("phone")}<span>Phone view</span><i></i></button>
+      <button class="dl-mi go" role="menuitem" data-dl="arrange">${svg("grid")}<span>Arrange devices</span>${svg("chev")}</button>
+      <button class="dl-mi go" role="menuitem" data-dl="hiddenlist">${svg("eyeoff")}<span>Hidden devices</span><em>${hidden.length || ""}</em>${svg("chev")}</button>`;
+  }
+
+  _dlMenuShow(view) {
+    this._dlMenuView = view;
+    const m = this.shadowRoot.querySelector(".dl-menu");
+    if (!m) return;
+    m.innerHTML = this._dlMenuHtml(view);
+    m.animate?.([{ opacity: 0, transform: `translateX(${view ? 10 : -10}px)` }, { opacity: 1, transform: "none" }], { duration: 180, easing: "ease-out" });
+  }
+
+  _dlMenu(open) {
+    const m = this.shadowRoot.querySelector(".dl-menu");
+    const b = this.shadowRoot.querySelector(".dl-hi");
+    if (!m) return;
+    this._dlMenuOpen = open;
+    if (open) {
+      this._dlMenuView = "";
+      m.innerHTML = this._dlMenuHtml();
+      m.hidden = false;
+      m.classList.remove("out");
+    } else if (!m.hidden) {
+      m.classList.add("out");
+      setTimeout(() => { if (!this._dlMenuOpen) { m.hidden = true; m.classList.remove("out"); } }, 160);
+    }
+    b?.setAttribute("aria-expanded", String(open));
+  }
+
+  /**
+   * The list as rows of up to three devices; the devices in a row share its width.
+   * Default: grouped by type (one device - a full line, two - halves, three or more - thirds).
+   * After arranging, the order and rows you made (remembered per screen); new devices are added at the end.
+   */
+  _dlLayout(rows) {
+    const byE = new Map(rows.map((r) => [r.b.cfg.entity, r]));
+    let saved = this._dlSaved;
+    if (saved === undefined) {
+      try { saved = JSON.parse(localStorage.getItem(`house3d-card:layout:${this._config.model || ""}`) || "null"); } catch (e) { saved = null; }
+      this._dlSaved = saved;
+    }
+    const out = [];
+    const used = new Set();
+    if (Array.isArray(saved)) {
+      for (const line of saved) {
+        const l = (Array.isArray(line) ? line : []).map((e) => byE.get(e)).filter((r) => r && !used.has(r.b.cfg.entity)).slice(0, 3);
+        l.forEach((r) => used.add(r.b.cfg.entity));
+        if (l.length) out.push(l);
+      }
+    }
+    // everything not placed yet: all of it by default, or devices added to the config after you arranged the list
+    const rest = rows.filter((r) => !used.has(r.b.cfg.entity));
+    if (!out.length) {
+      const groups = [];
+      for (const r of rest) {
+        const g = groups.find((x) => x.cat === r.cat);
+        g ? g.items.push(r) : groups.push({ cat: r.cat, items: [r] });
+      }
+      for (const g of groups) for (let i = 0; i < g.items.length; i += 3) out.push(g.items.slice(i, i + 3));
+      return out;
+    }
+    // a new device joins its group: into the group's last row if there's room there, else a row right after it;
+    // a type you don't have yet gets its own row where that type belongs in the usual order
+    const ORDER = ["Lights", "Blinds", "Climate", "Doors & windows", "Security", "Network", "Computer & media", "Switches", "Cleaning", "Other"];
+    const rank = (c) => (ORDER.includes(c) ? ORDER.indexOf(c) : ORDER.length - 1.5);
+    for (const r of rest) {
+      let last = -1;
+      out.forEach((line, i) => { if (line.some((x) => x.cat === r.cat)) last = i; });
+      if (last >= 0) {
+        const line = out[last];
+        if (line.length < 3 && line.every((x) => x.cat === r.cat)) line.push(r);
+        else out.splice(last + 1, 0, [r]);
+      } else {
+        const at = out.findIndex((line) => rank(line[0].cat) > rank(r.cat));
+        at < 0 ? out.push([r]) : out.splice(at, 0, [r]);
+      }
+    }
+    return out;
+  }
+
+  /** Group names: your own (renamed while arranging, remembered per screen), `group_names:` in the config, or the type. */
+  _dlGroupName(cat) {
+    if (this._dlNames === undefined) {
+      try { this._dlNames = JSON.parse(localStorage.getItem(`house3d-card:groups:${this._config.model || ""}`) || "{}") || {}; } catch (e) { this._dlNames = {}; }
+    }
+    return this._dlNames[cat] || this._config.group_names?.[cat] || cat;
+  }
+
+  _dlRename(head) {
+    const cat = head.dataset.cat;
+    const input = document.createElement("input");
+    input.className = "dl-cat-in";
+    input.value = this._dlGroupName(cat);
+    input.setAttribute("aria-label", `Name for the ${cat} group`);
+    input.maxLength = 40;
+    head.textContent = "";
+    head.appendChild(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const finish = (save) => {
+      if (done) return;
+      done = true;
+      if (save) {
+        const v = input.value.trim();
+        if (v && v !== (this._config.group_names?.[cat] || cat)) this._dlNames[cat] = v;
+        else delete this._dlNames[cat]; // empty (or the original): back to the default name
+        try { localStorage.setItem(`house3d-card:groups:${this._config.model || ""}`, JSON.stringify(this._dlNames)); } catch (e) {}
+      }
+      // every heading of this group shows the new name
+      for (const h of this.shadowRoot.querySelectorAll(`.dl-rows .dl-cat[data-cat="${CSS.escape(cat)}"]`)) h.textContent = this._dlGroupName(cat);
+    };
+    input.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Enter") finish(true);
+      if (e.key === "Escape") finish(false);
+    });
+    input.addEventListener("blur", () => finish(true));
+    input.addEventListener("pointerdown", (e) => e.stopPropagation());
+  }
+
+  _vacRowBtns(r) {
+    const run = r.vst === "cleaning";
+    return `<button data-dl="${run ? "vpause" : "vstart"}" data-i="${r.i}" aria-label="${run ? "Pause" : "Start cleaning"}" class="${run ? "run" : ""}">${svg(run ? "pause" : "play")}</button>
+      <button data-dl="vhome" data-i="${r.i}" aria-label="Send home" aria-disabled="${r.vst === "docked" || r.vst === "returning"}">${svg("home")}</button>`;
+  }
+
+  _dlRowsHtml(layout) {
+    const esc = (v) => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    let html = "", k = 0, prevCat = null;
+    for (const line of layout) {
+      // a heading wherever the type changes (a mixed row is headed by its first device's type)
+      const cat = line[0].cat;
+      if (cat !== prevCat) html += `<div class="dl-cat" role="heading" aria-level="3" data-cat="${esc(cat)}">${esc(this._dlGroupName(cat))}</div>`;
+      prevCat = cat;
+      const span = 6 / line.length;
+      for (const r of line) {
+        k++;
+        html += `<div class="dl-r s${span} ${r.dim ? "dim" : ""} ${r.on ? "is-on" : ""} ${r.s.cls === "bad" ? "is-bad" : ""} ${this._dlDrag?.e === r.b.cfg.entity ? "ph" : ""}" data-ic="${this._dlIcon(r.b)}" data-e="${esc(r.b.cfg.entity)}" style="--i:${k};${r.dim ? `--lvn:${(r.lv / 100).toFixed(3)};--lc:${r.b.baseCss || "var(--accent)"}` : ""}">${r.dim ? `<span class="dl-lv" aria-hidden="true"></span>` : ""}
+            <button class="dl-rm" data-dl="hide" data-e="${esc(r.b.cfg.entity)}" aria-label="Hide ${esc(r.name)}">${svg("minus")}</button>
+            <button class="dl-go" data-dl="go" data-i="${r.i}" aria-label="Show ${esc(r.name)}">
+              <span class="dl-ic ${r.live.cls}" style="${r.live.style}">${this._dlIcSvg(r.b)}</span>
+              <span class="dl-t"><b>${esc(r.name)}</b><small class="${r.s.cls}">${esc(r.s.text)}</small></span>
+              <em class="dl-q ${r.s.cls}">${esc(r.short)}</em>
+              ${r.tog || r.cov || r.fan || r.dim || r.vac ? "" : `<span class="dl-ch">${svg("chev")}</span>`}
+            </button>
+            ${r.cov
+              ? `<span class="dl-arw">
+                  <button data-dl="${r.mv > 0 ? "stop" : "up"}" data-i="${r.i}" aria-label="${r.mv > 0 ? "Stop" : "Open"} ${esc(r.name)}">${svg(r.mv > 0 ? "stop" : "up")}</button>
+                  <button data-dl="${r.mv < 0 ? "stop" : "down"}" data-i="${r.i}" aria-label="${r.mv < 0 ? "Stop" : "Close"} ${esc(r.name)}">${svg(r.mv < 0 ? "stop" : "down")}</button>
+                </span>`
+              : r.fan
+              ? `<span class="dl-arw">
+                  <button data-dl="slower" data-i="${r.i}" aria-label="Slower" aria-disabled="${!r.on}">${svg("down")}</button>
+                  <button data-dl="faster" data-i="${r.i}" aria-label="Faster" aria-disabled="${r.pct >= 100}">${svg("up")}</button>
+                </span>`
+              : r.vac
+              ? `<span class="dl-arw">${this._vacRowBtns(r)}</span>`
+              : r.tog && !r.dim ? `<button class="sw2" data-dl="toggle" data-i="${r.i}" aria-pressed="${r.on}" aria-label="Turn ${esc(r.name)} ${r.on ? "off" : "on"}"></button>` : ""}
+          </div>`;
+      }
+    }
+    return html;
+  }
+
+  /* ------------------------------------------------------------ arranging the device list */
+
+  _dlSetEdit(on) {
+    this._dlEdit = on;
+    const dl = this.shadowRoot?.querySelector(".dl");
+    if (!dl) return;
+    dl.classList.toggle("editing", on);
+    if (!on && this._dlOpen) this._renderDeviceList(true); // back in reading order for screen readers
+    const chips = dl.querySelector(".dl-chips");
+    if (chips) chips.innerHTML = this._dlChipsHtml();
+    if (on && !this._dlCompact()) this._setDlCompact(true); // rows and tiles are arranged in the compact list
+    if (navigator.vibrate) navigator.vibrate(on ? 18 : 8);
+  }
+
+  _dlSaveLayout(layout) {
+    const ids = layout ? layout.map((l) => l.map((r) => r.b.cfg.entity)) : null;
+    this._dlSaved = ids;
+    try {
+      const key = `house3d-card:layout:${this._config.model || ""}`;
+      ids ? localStorage.setItem(key, JSON.stringify(ids)) : localStorage.removeItem(key);
+    } catch (e) {}
+  }
+
+  /**
+   * Put every tile in its place without rebuilding anything: the grid order and each tile's share of its row
+   * change, headings are re-made, and the tiles glide (and grow or shrink) from where they were.
+   * Keeping the same elements means nothing flickers and the wiggle doesn't restart.
+   */
+  _dlReflow(layout, animate = true) {
+    const box = this.shadowRoot.querySelector(".dl-rows");
+    if (!box) return;
+    const tiles = new Map([...box.querySelectorAll(".dl-r")].map((el) => [el.dataset.e, el]));
+    if (layout.some((l) => l.some((r) => !tiles.has(r.b.cfg.entity)))) {
+      box.innerHTML = this._dlRowsHtml(layout); // a device appeared: build afresh
+      return;
+    }
+    const before = animate && !this._reducedMotion ? new Map([...tiles].map(([e, el]) => [e, el.getBoundingClientRect()])) : null;
+    // stop the slides already running first: the new ones then start from where each tile is on screen now and
+    // end exactly where it goes (measured without a half-finished slide on it), so nothing jumps
+    for (const el of tiles.values()) el.getAnimations().forEach((x) => x.cancel());
+    for (const h of box.querySelectorAll(":scope > .dl-cat")) h.remove();
+    let n = 0, prevCat = null;
+    for (const line of layout) {
+      const cat = line[0].cat;
+      if (cat !== prevCat) {
+        const h = document.createElement("div");
+        h.className = "dl-cat";
+        h.setAttribute("role", "heading");
+        h.setAttribute("aria-level", "3");
+        h.dataset.cat = cat;
+        h.textContent = this._dlGroupName(cat);
+        h.style.order = String(n++);
+        box.appendChild(h);
+      }
+      prevCat = cat;
+      const span = 6 / line.length;
+      for (const r of line) {
+        const el = tiles.get(r.b.cfg.entity);
+        el.style.order = String(n++);
+        if (!el.classList.contains(`s${span}`)) {
+          el.classList.remove("s2", "s3", "s6");
+          el.classList.add(`s${span}`);
+        }
+      }
+    }
+    this._dlGeoSave(box, tiles);
+    if (!before) return;
+    for (const [e, el] of tiles) {
+      const a = before.get(e), b = el.getBoundingClientRect();
+      const dx = a.left - b.left, dy = a.top - b.top, grow = Math.abs(a.width - b.width) > 1;
+      if (Math.abs(dx) < 1 && Math.abs(dy) < 1 && !grow) continue;
+      el.getAnimations().forEach((x) => x.cancel());
+      // sliding is done on the GPU; only a tile that changes size animates its width
+      el.animate(
+        grow
+          ? [{ transform: `translate(${dx}px, ${dy}px)`, width: `${a.width}px` }, { transform: "none", width: `${b.width}px` }]
+          : [{ transform: `translate(${dx}px, ${dy}px)` }, { transform: "none" }],
+        { duration: 260, easing: "cubic-bezier(.25,.8,.25,1)" }
+      );
+    }
+  }
+
+  /**
+   * Where each tile will sit once the slides finish, relative to the list's content (so scrolling doesn't matter).
+   * Drop targets are worked out from this, not from where the tiles are mid-slide: otherwise a neighbour sliding
+   * out of the way changes the answer, it slides back, and the tiles flicker back and forth.
+   */
+  _dlGeoSave(box, tiles) {
+    const br = box.getBoundingClientRect();
+    this._dlGeo = new Map([...tiles].map(([e, el]) => {
+      const r = el.getBoundingClientRect();
+      return [e, { l: r.left - br.left, t: r.top - br.top + box.scrollTop, w: r.width, h: r.height }];
+    }));
+  }
+
+  _dlGeoRect(box, e, el) {
+    if (!this._dlGeo) this._dlGeoSave(box, new Map([...box.querySelectorAll(".dl-r")].map((x) => [x.dataset.e, x])));
+    const g = this._dlGeo.get(e);
+    if (!g) return el.getBoundingClientRect();
+    const br = box.getBoundingClientRect(), top = br.top + g.t - box.scrollTop, left = br.left + g.l;
+    return { left, top, width: g.w, height: g.h, right: left + g.w, bottom: top + g.h };
+  }
+
+  /** Where would a device dropped at (x, y) go: into a row (at a position), or as a row of its own? */
+  _dlDropTarget(layout, dragE, x, y) {
+    const box = this.shadowRoot.querySelector(".dl-rows");
+    const lines = layout.map((line, li) => {
+      const els = line.map((r) => box.querySelector(`.dl-r[data-e="${CSS.escape(r.b.cfg.entity)}"]`)).filter(Boolean);
+      const rects = els.map((e) => this._dlGeoRect(box, e.dataset.e, e));
+      const top = Math.min(...rects.map((q) => q.top)), bottom = Math.max(...rects.map((q) => q.bottom));
+      return { li, line, rects, top, bottom };
+    });
+    if (!lines.length) return { row: 0, newRow: true };
+    for (const L of lines) {
+      if (y < L.top - 2) return { row: L.li, newRow: true }; // in the gap (or heading) above this row
+      if (y <= L.bottom + 2) {
+        const h = L.bottom - L.top, others = L.line.filter((r) => r.b.cfg.entity !== dragE);
+        const inRow = others.length < L.line.length; // it's this row we started from
+        // near the top or bottom edge: a row of its own; in the middle: join the row
+        if (y < L.top + h * 0.22 && !(inRow && L.line.length === 1)) return { row: L.li, newRow: true };
+        if (y > L.bottom - h * 0.22 && !(inRow && L.line.length === 1)) return { row: L.li + 1, newRow: true };
+        if (others.length >= 3) return { row: y < L.top + h / 2 ? L.li : L.li + 1, newRow: true };
+        let pos = 0;
+        L.line.forEach((r, i) => {
+          if (r.b.cfg.entity !== dragE && x > L.rects[i].left + L.rects[i].width / 2) pos++;
+        });
+        return { row: L.li, pos };
+      }
+    }
+    return { row: lines.length, newRow: true };
+  }
+
+  /** Apply a drop target: take the dragged device out and put it where the target says. */
+  _dlMove(layout, dragE, t) {
+    let dragged = null;
+    const src = layout.findIndex((l) => l.some((r) => r.b.cfg.entity === dragE));
+    const next = layout.map((l) => l.filter((r) => {
+      if (r.b.cfg.entity === dragE) { dragged = r; return false; }
+      return true;
+    }));
+    if (!dragged) return layout;
+    let row = t.row;
+    if (next[src] && !next[src].length) {
+      next.splice(src, 1); // its old row is now empty
+      if (row > src) row--;
+    }
+    if (t.newRow) next.splice(Math.max(0, Math.min(row, next.length)), 0, [dragged]);
+    else next[row] ? next[row].splice(Math.min(t.pos, next[row].length), 0, dragged) : next.push([dragged]);
+    return next;
+  }
+
+
+  /* ------------------------------------------------------------ adding devices from the dashboard */
+
+  _adKey() {
+    return `house3d-card-added:${this._config.model || "demo"}`;
+  }
+
+  /**
+   * Devices you add with the + button are saved in Home Assistant with your user (so every screen you're signed
+   * into shows them), with this screen's storage as a fallback. Copy YAML puts them in the card's config for good.
+   */
+  async _adLoad() {
+    if (this._adLoaded || !this._modelReady) return;
+    let list = null;
+    if (this._hass?.callWS) {
+      try {
+        const r = await this._hass.callWS({ type: "frontend/get_user_data", key: this._adKey() });
+        if (Array.isArray(r?.value)) list = r.value;
+      } catch (e) { /* older Home Assistant: fall back to this screen */ }
+    } else if (!this._hass) return; // wait for Home Assistant
+    if (!list) {
+      try { list = JSON.parse(localStorage.getItem(this._adKey()) || "[]"); } catch (e) { list = []; }
+    }
+    if (this._adLoaded) return;
+    this._adLoaded = true;
+    this._added = [];
+    for (const cfg of list || []) if (cfg?.entity) this._adApply(cfg, false);
+    this._adRefresh();
+  }
+
+  _adSave() {
+    const value = this._added || [];
+    try { localStorage.setItem(this._adKey(), JSON.stringify(value)); } catch (e) {}
+    if (this._hass?.callWS) this._hass.callWS({ type: "frontend/set_user_data", key: this._adKey(), value }).catch(() => {});
+  }
+
+  /** Put an added device (or reading) into the room, the list and the Sensors section. */
+  _adApply(cfg, refresh = true) {
+    const onCard = this._config.entities.some((e) => e.entity === cfg.entity && !e.__added);
+    if (onCard) return; // it's already in the card's own config
+    this._adRemoveRuntime(cfg.entity);
+    const live = { ...cfg, __added: true };
+    this._added = (this._added || []).filter((x) => x.entity !== cfg.entity).concat([cfg]);
+    if (cfg.kind === "sensor") {
+      if (cfg.readout && Array.isArray(cfg.position)) this._config.labels.push({ entity: cfg.entity, name: cfg.name, position: cfg.position, __added: true });
+      else (this._extraSensors = this._extraSensors || []).push({ entity: cfg.entity, name: cfg.name, __added: true });
+    } else {
+      this._config.entities.push(live);
+      this._bindOne(live);
+    }
+    if (refresh) this._adRefresh();
+  }
+
+  _adRemoveRuntime(entity) {
+    this._config.entities = this._config.entities.filter((e) => !(e.__added && e.entity === entity));
+    this._config.labels = this._config.labels.filter((l) => !(l.__added && l.entity === entity));
+    this._extraSensors = (this._extraSensors || []).filter((x) => x.entity !== entity);
+    if (this._bindings.some((b) => b.cfg.entity === entity && b.cfg.__added)) this._unbindOne(entity);
+  }
+
+  /** After adding or removing: dots, readouts, lights and the list catch up. */
+  _adRefresh() {
+    this._refreshFade();
+    this._buildHints();
+    this._buildLabels();
+    this._updateLabels();
+    this._applyHidden();
+    this._dlSens = null;
+    this._dlRows = this._bindings.filter((b) => b.cfg.list !== false);
+    this._dlShape = null;
+    const dl = this.shadowRoot.querySelector(".dl");
+    if (dl && this._dlRows.length) dl.hidden = false;
+    this._renderDeviceList(this._dlOpen);
+    this._dirty = true;
+  }
+
+  _adOpen(edit) {
+    const cur = edit ? (this._added || []).find((x) => x.entity === edit) : null;
+    this._ad = cur
+      ? { step: "details", entity: cur.entity, preset: cur.preset, cfg: { ...cur }, editing: true }
+      : { step: "pick", q: "", entity: null, preset: null, cfg: {} };
+    if (this._dlMenuOpen) this._dlMenu(false);
+    if (this._dlEdit) this._dlSetEdit(false);
+    this._adRender();
+  }
+
+  _adClose() {
+    const el = this.shadowRoot.querySelector(".ad");
+    this._ad = null;
+    this.shadowRoot.querySelector(".dl")?.classList.remove("adding");
+    this._adMarkW = null;
+    const mk = this.shadowRoot.querySelector(".ad-mark");
+    if (mk) mk.hidden = true;
+    if (el && !el.hidden) {
+      el.classList.add("out");
+      setTimeout(() => { if (!this._ad) { el.hidden = true; el.classList.remove("out"); } }, 200);
+    }
+    this._dirty = true;
+  }
+
+  /** What kind of thing an entity is, for the pick list's headings. */
+  _adDomainLabel(d) {
+    return { light: "Lights", switch: "Switches & plugs", input_boolean: "Helpers", fan: "Fans", humidifier: "Humidifiers",
+      cover: "Blinds & covers", climate: "Climate", media_player: "Media", camera: "Cameras", lock: "Locks",
+      binary_sensor: "On/off sensors", sensor: "Readings", vacuum: "Vacuums" }[d] || d;
+  }
+
+  /** Presets for a type of device, best guess first (from the device's name and device class). */
+  _adPresets(entity) {
+    const d = entity.split(".")[0];
+    const st = this._stateOf(entity), a = st?.attributes || {};
+    const nm = `${a.friendly_name || ""} ${entity}`.toLowerCase(), dc = a.device_class || "";
+    const P = (id, title, desc, icon, cat, o = {}) => ({ id, title, desc, icon, cat, place: "object", dot: true, ...o });
+    let list = [];
+    if (d === "light") list = [
+      P("table_lamp", "Table lamp", "Glows and lights up the room around it", "bulb", "Lights", { light: true, reach: "medium", match: /table|desk|lamp|lamppu|pöytä|bedside|yö/ }),
+      P("floor_lamp", "Floor lamp", "A tall lamp that lights most of the room", "bulb", "Lights", { light: true, reach: "large", match: /floor|jalka|standing/ }),
+      P("ceiling", "Ceiling light", "Lights the whole room from above", "bulb", "Lights", { light: true, reach: "large", place: "point", match: /ceiling|katto|kattovalo|main/ }),
+      P("strip", "LED strip", "A soft glow along furniture or a wall", "bulb", "Lights", { light: true, reach: "small", place: "point", match: /strip|led|nauha|lightstrip/ }),
+      P("accent", "Accent light", "Glows itself, but doesn't light up the room", "sparkle", "Lights", { light: false, match: /accent|night|yövalo|mood/ }),
+    ];
+    else if (d === "switch" || d === "input_boolean") list = [
+      P("lamp_plug", "Lamp plug", "A smart plug with a lamp plugged in", "bulb", "Lights", { light: true, reach: "medium", match: /lamp|light|valo|lamppu/ }),
+      P("tv_plug", "TV / media plug", "A plug for a TV, speakers or a console", "pc", "Computer & media", { match: /tv|media|speaker|kaiutin|console|pc|monitor/ }),
+      P("fan_plug", "Fan or heater plug", "A plug for a fan, heater or purifier", "fan", "Climate", { match: /fan|heat|lämm|tuuletin|purifier/ }),
+      P("appliance", "Appliance", "Coffee machine, kettle, washing machine…", "plug", "Switches", { match: /coffee|kahvi|kettle|vedenkeitin|wash|pesukone|dish/ }),
+      P("plug", "Smart plug", "Any other plug or switch", "plug", "Switches", { place: "point" }),
+      ...(d === "input_boolean" ? [P("mode", "Mode switch", "A helper like guest mode: in the list, no dot in the room", "power", "Switches", { place: "none", dot: false, match: /mode|tila|guest|vieras|away|poissa/ })] : []),
+    ];
+    else if (d === "fan" || d === "humidifier") list = [
+      P("fan", "Fan", "Switch it and set its speed", "fan", "Climate", { match: /fan|tuuletin/ }),
+      P("purifier", "Air purifier", "A purifier or humidifier", "fan", "Climate", { match: /purif|puhdist|dyson|humid|kostutin/ }),
+    ];
+    else if (d === "cover") list = [
+      P("blind", "Blind", "A roller blind or shade", "blind", "Blinds", { place: "point", match: /blind|shade|rullaverho|verho|sälekaihdin|kaihdin/ }),
+      P("curtain", "Curtain", "Curtains that open and close", "blind", "Blinds", { place: "point", match: /curtain|verho/ }),
+      P("garage", "Garage door or gate", "Opens and closes", "door", "Security", { place: "point", match: /garage|gate|autotalli|portti/ }),
+    ];
+    else if (d === "climate") list = [
+      P("thermostat", "Thermostat", "Set the temperature", "thermo", "Climate", { place: "point", match: /thermo|termostaatti/ }),
+      P("heater", "Heater", "A radiator or heater", "thermo", "Climate", { match: /heat|radiator|lämmi|patteri/ }),
+      P("ac", "Air conditioner / heat pump", "Cooling and heating", "fan", "Climate", { match: /ac|air|ilmalämpö|heat pump|conditioner/ }),
+    ];
+    else if (d === "media_player") list = [
+      P("tv", "TV", "Its screen lights up when it's on", "pc", "Computer & media", { screen: true, match: /tv|television|telkkari/ }),
+      P("speaker", "Speaker", "Music, play / pause and volume", "pc", "Computer & media", { match: /speaker|kaiutin|sonos|homepod|nest|echo/ }),
+    ];
+    else if (d === "camera") list = [P("camera", "Camera", "Live view when you tap it", "camera", "Security")];
+    else if (d === "lock") list = [P("lock", "Lock", "Lock and unlock", "door", "Security", { place: "point" })];
+    else if (d === "vacuum") list = [P("vacuum", "Robot vacuum", "Start, pause and send it home, with its battery", "vacuum", "Cleaning", { place: "point" })];
+    else if (d === "binary_sensor") list = [
+      P("door", "Door sensor", "Shows if the door is open", "door", "Doors & windows", { place: "point", match: /door|ovi/, dc: ["door", "garage_door", "opening"] }),
+      P("window", "Window sensor", "Shows if the window is open", "window", "Doors & windows", { place: "point", match: /window|ikkuna/, dc: ["window"] }),
+      P("motion", "Motion sensor", "Shows movement in the room", "dot", "Security", { place: "point", match: /motion|liike|presence|occupancy|läsnä/, dc: ["motion", "occupancy", "presence"] }),
+      P("leak", "Leak or smoke sensor", "Warns you (its dot pulses red)", "dot", "Security", { place: "point", match: /leak|vuoto|smoke|savu|water/, dc: ["moisture", "smoke", "gas", "safety"], alert: true }),
+      P("bsensor", "Other sensor", "Any on/off sensor", "dot", "Other", { place: "point" }),
+    ];
+    else if (d === "sensor") list = [
+      P("temp", "Temperature", "A reading in the Sensors list, and a floating readout if you like", "thermo", "Sensors", { kind: "sensor", place: "none", match: /temp|lämpö/, dc: ["temperature"] }),
+      P("humidity", "Humidity", "Relative humidity", "fan", "Sensors", { kind: "sensor", place: "none", match: /humid|kosteus/, dc: ["humidity"] }),
+      P("air", "Air quality", "CO₂, PM2.5, VOC…", "sparkle", "Sensors", { kind: "sensor", place: "none", match: /co2|pm2|pm10|voc|aqi|air|ilma/, dc: ["carbon_dioxide", "pm25", "pm10", "volatile_organic_compounds", "aqi"] }),
+      P("power", "Power or energy", "Watts or kWh from a plug or meter", "plug", "Sensors", { kind: "sensor", place: "none", match: /power|energy|teho|energia|kwh|watt/, dc: ["power", "energy"] }),
+      P("reading", "Other reading", "Any value with a unit", "dot", "Sensors", { kind: "sensor", place: "none" }),
+    ];
+    else list = [P("device", "Device", "Shown in the list with a dot in the room", "dot", "Other", { place: "point" })];
+    // best guess first
+    const score = (p) => (p.dc?.includes(dc) ? 2 : 0) + (p.match?.test(nm) ? 1 : 0);
+    const best = list.reduce((m, p) => (score(p) > score(m) ? p : m), list[0]);
+    return [best, ...list.filter((p) => p !== best)].map((p, i) => ({ ...p, suggested: i === 0 && (score(p) > 0 || list.length === 1) }));
+  }
+
+  /** Candidates for adding: everything Home Assistant has that could go on the card and isn't on it yet. */
+  _adCandidates() {
+    const on = new Set([...this._bindings.map((b) => b.cfg.entity), ...this._dlSensorList().map((x) => x.entity), ...(this._config.labels || []).map((l) => l.entity)]);
+    const mentioned = JSON.stringify({ ...this._config, entities: this._config.entities.filter((e) => !e.__added), labels: this._config.labels.filter((l) => !l.__added) });
+    const doms = ["light", "switch", "input_boolean", "fan", "humidifier", "cover", "climate", "media_player", "camera", "lock", "vacuum", "binary_sensor", "sensor"];
+    const out = [];
+    for (const [id, st] of Object.entries(this._hass?.states || {})) {
+      const d = id.split(".")[0];
+      if (!doms.includes(d) || on.has(id) || mentioned.includes(`"${id}"`)) continue;
+      if (d === "sensor" && (st.attributes?.unit_of_measurement == null || isNaN(Number(st.state)))) continue; // only readings with a value
+      out.push({ id, d, name: st.attributes?.friendly_name || id, state: st.state });
+    }
+    out.sort((a, b) => doms.indexOf(a.d) - doms.indexOf(b.d) || a.name.localeCompare(b.name));
+    return out;
+  }
+
+  _adIconFor(entity, name) {
+    const d = entity.split(".")[0];
+    if (d === "sensor") return /temp|lämpö/i.test(entity + name) ? "thermo" : "dot";
+    return this._dlIcon({ cfg: { entity, name } });
+  }
+
+  _adRender() {
+    const el = this.shadowRoot.querySelector(".ad");
+    const ad = this._ad;
+    if (!el || !ad) return;
+    const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    const head = (title, back) => `<div class="ad-h">${back ? `<button class="ad-back" data-ad="${back}" aria-label="Back">${svg("chev")}</button>` : ""}
+      <b>${esc(title)}</b><button class="ad-x" data-ad="close" aria-label="Close">${svg("close")}</button></div>`;
+    const steps = ["pick", "preset", "details", "place"];
+    const dots = `<div class="ad-steps">${steps.map((x) => `<i class="${x === ad.step ? "on" : steps.indexOf(x) < steps.indexOf(ad.step) ? "done" : ""}"></i>`).join("")}</div>`;
+    let html = "";
+    if (ad.step === "pick") {
+      const mine = this._added || [];
+      html = `${head("Add a device")}${dots}
+        <div class="ad-body">
+          <input class="ad-q" type="search" placeholder="Search your Home Assistant…" value="${esc(ad.q)}" aria-label="Search devices">
+          ${mine.length ? `<div class="ad-sub">Added by you</div>${mine.map((x) => `<div class="ad-mine"><span class="ad-ic">${svg(x.list_icon || this._adIconFor(x.entity, x.name))}</span>
+              <span class="ad-t"><b>${esc(x.name || x.entity)}</b><small>${esc(x.entity)}</small></span>
+              <button class="ad-sm" data-ad="edit" data-e="${esc(x.entity)}">Edit</button>
+              <button class="ad-sm danger" data-ad="remove" data-e="${esc(x.entity)}" aria-label="Remove ${esc(x.name || x.entity)}">${svg("minus")}</button></div>`).join("")}
+            <button class="ad-yaml" data-ad="yaml">${svg("undo")}<span>Copy YAML to keep them in the card's config</span></button>` : ""}
+          <div class="ad-list">${this._adListHtml()}</div>
+        </div>`;
+    } else if (ad.step === "preset") {
+      const st = this._stateOf(ad.entity);
+      html = `${head("What is it?", "back-pick")}${dots}
+        <div class="ad-body"><div class="ad-for">${esc(st?.attributes?.friendly_name || ad.entity)}<small>${esc(ad.entity)}</small></div>
+        <div class="ad-presets">${this._adPresets(ad.entity).map((p) => `<button class="ad-p ${ad.preset === p.id ? "sel" : ""}" data-ad="preset" data-p="${p.id}">
+            <span class="ad-ic">${svg(p.icon)}</span><span class="ad-t"><b>${esc(p.title)}${p.suggested ? `<em>Suggested</em>` : ""}</b><small>${esc(p.desc)}</small></span></button>`).join("")}</div></div>`;
+    } else if (ad.step === "details") {
+      const c = ad.cfg, p = this._adPreset();
+      const sensor = p.kind === "sensor";
+      const groups = [...new Set([...(this._dlData || []).map((r) => r.cat), p.cat, c.category].filter((g) => g && g !== "Sensors"))];
+      const icons = ["bulb", "plug", "fan", "thermo", "blind", "door", "window", "pc", "camera", "wifi", "sparkle", "power", "dot"];
+      const tog = (key, label, sub, on) => `<div class="ad-row"><span class="ad-t"><b>${label}</b>${sub ? `<small>${sub}</small>` : ""}</span>
+        <button class="sw2" data-ad="tog" data-k="${key}" aria-pressed="${!!on}" aria-label="${label}"></button></div>`;
+      const d = ad.entity.split(".")[0];
+      const canPower = ["light", "switch", "fan", "media_player", "input_boolean", "humidifier"].includes(d);
+      const lightish = p.light !== undefined || d === "light";
+      html = `${head(ad.editing ? "Edit device" : "Details", ad.editing ? "close" : "back-preset")}${dots}
+        <div class="ad-body">
+          <label class="ad-f"><span>Name</span><input class="ad-name" value="${esc(c.name)}" maxlength="40"></label>
+          ${sensor ? "" : `<div class="ad-f"><span>Group</span><div class="ad-chips">${groups.map((g) => `<button class="ad-chip ${c.category === g ? "sel" : ""}" data-ad="group" data-g="${esc(g)}">${esc(this._dlGroupName(g))}</button>`).join("")}
+            <input class="ad-newg" placeholder="New group…" maxlength="30" value="${groups.includes(c.category) ? "" : esc(c.category || "")}"></div></div>
+          <div class="ad-f"><span>Icon</span><div class="ad-icons">${icons.map((i) => `<button class="ad-icb ${c.list_icon === i ? "sel" : ""}" data-ad="icon" data-i="${i}" aria-label="${i}">${svg(i)}</button>`).join("")}</div></div>`}
+          <div class="ad-sec">
+            ${sensor
+              ? tog("readout", "Floating readout in the room", "Pinned where you tap, like the room temperature", c.readout)
+              : `${p.place !== "none" ? tog("dot", "Dot in the room", "Tap it to open the device", c.dot) : ""}
+                 ${canPower ? tog("compact", "Power button when off", "Grows into the full panel when you switch it on", c.compact) : ""}
+                 ${lightish ? tog("light", "Lights up the room", "Like a real lamp, in its colour", c.light) : ""}`}
+          </div>
+          ${!sensor && lightish && c.light ? `<div class="ad-f"><span>How far the light reaches</span><div class="ad-seg">${["small", "medium", "large"].map((r) => `<button class="${c.reach === r ? "sel" : ""}" data-ad="reach" data-r="${r}">${r[0].toUpperCase() + r.slice(1)}</button>`).join("")}</div></div>
+            <div class="ad-f"><span>Colour when it has none of its own</span><div class="ad-sw">${[["#ffc87a", "Warm"], ["#fff0d8", "Neutral"], ["#d8e6ff", "Cool"], ["#ff9ad5", "Pink"], ["#9ad7ff", "Blue"]].map(([col, n]) => `<button class="${c.color === col ? "sel" : ""}" data-ad="color" data-c="${col}" style="--c:${col}" aria-label="${n}" title="${n}"></button>`).join("")}</div></div>` : ""}
+          ${!sensor && p.place !== "none" ? `<div class="ad-f"><span>In the room</span><div class="ad-seg"><button class="${c.place === "object" ? "sel" : ""}" data-ad="place-mode" data-m="object">Use a 3D object</button><button class="${c.place === "point" ? "sel" : ""}" data-ad="place-mode" data-m="point">Tap a spot</button></div>
+            <small class="ad-hint">${c.place === "object" ? "Tap the object in the room: it becomes the device (it glows, and tapping it opens the panel)." : "Tap where it is: its dot sits there."}</small></div>` : ""}
+          <div class="ad-go">${(sensor && !c.readout) || p.place === "none" && !sensor
+            ? `<button class="ad-main" data-ad="finish">${svg("check")}<span>${ad.editing ? "Save" : "Add device"}</span></button>`
+            : `<button class="ad-main" data-ad="to-place">${svg("chev")}<span>Place it in the room</span></button>`}</div>
+        </div>`;
+    } else if (ad.step === "place") {
+      const c = ad.cfg, placed = !!(c.object || c.position);
+      html = `${head("Place it", "back-details")}${dots}
+        <div class="ad-body"><div class="ad-place ${placed ? "ok" : ""}">
+          <div class="ad-tap">${svg(c.list_icon || "dot")}</div>
+          <b>${placed ? (c.object ? `On “${esc(c.object)}”` : "Spot chosen") : `Tap ${c.place === "object" ? "the object" : "the spot"} in the room`}</b>
+          <small>${placed ? "Tap somewhere else to move it." : `Where ${esc(c.name)} is. You can still turn the room to find it.`}</small></div>
+          <div class="ad-go"><button class="ad-main" data-ad="finish" ${placed ? "" : "disabled"}>${svg("check")}<span>${ad.editing ? "Save" : "Add device"}</span></button></div>
+        </div>`;
+    }
+    el.innerHTML = html;
+    this.shadowRoot.querySelector(".dl")?.classList.add("adding");
+    const go = el.querySelector(".ad-body > .ad-go");
+    if (go) el.appendChild(go); // the main button stays in view at the bottom, whatever you scroll
+    el.hidden = false;
+    el.classList.remove("out");
+    if (!el.dataset.wired) this._adWire(el);
+    const q = el.querySelector(".ad-q");
+    if (q && ad.focusQ) { q.focus(); q.setSelectionRange(q.value.length, q.value.length); ad.focusQ = false; }
+  }
+
+  _adListHtml() {
+    const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    const q = (this._ad?.q || "").trim().toLowerCase();
+    const all = this._adCandidates().filter((x) => !q || x.name.toLowerCase().includes(q) || x.id.includes(q));
+    if (!all.length) return `<div class="ad-empty">${q ? "Nothing matches." : "Everything in your Home Assistant is already on the card."}</div>`;
+    let html = "", last = null;
+    for (const x of all.slice(0, 120)) {
+      if (x.d !== last) { html += `<div class="ad-sub">${esc(this._adDomainLabel(x.d))}</div>`; last = x.d; }
+      html += `<button class="ad-e" data-ad="pick" data-e="${esc(x.id)}"><span class="ad-ic">${svg(this._adIconFor(x.id, x.name))}</span>
+        <span class="ad-t"><b>${esc(x.name)}</b><small>${esc(x.id)} · ${esc(x.state)}</small></span>${svg("chev")}</button>`;
+    }
+    return html;
+  }
+
+  _adPreset() {
+    const ad = this._ad;
+    return this._adPresets(ad.entity).find((p) => p.id === ad.preset) || this._adPresets(ad.entity)[0];
+  }
+
+  _adWire(el) {
+    el.dataset.wired = "1";
+    el.addEventListener("pointerdown", (e) => e.stopPropagation());
+    el.addEventListener("input", (e) => {
+      const ad = this._ad;
+      if (!ad) return;
+      if (e.target.classList.contains("ad-q")) {
+        ad.q = e.target.value;
+        el.querySelector(".ad-list").innerHTML = this._adListHtml();
+      } else if (e.target.classList.contains("ad-name")) ad.cfg.name = e.target.value;
+      else if (e.target.classList.contains("ad-newg")) {
+        ad.cfg.category = e.target.value.trim() || this._adPreset().cat;
+        el.querySelectorAll(".ad-chip").forEach((c) => c.classList.toggle("sel", c.dataset.g === ad.cfg.category));
+      }
+    });
+    el.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") this._adClose();
+    });
+    el.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const b = e.target.closest("[data-ad]");
+      const ad = this._ad;
+      if (!b || !ad || b.disabled) return;
+      const act = b.dataset.ad;
+      if (act === "close") return this._adClose();
+      if (act === "back-pick") { ad.step = "pick"; return this._adRender(); }
+      if (act === "back-preset") { ad.step = "preset"; return this._adRender(); }
+      if (act === "back-details") { ad.step = "details"; this._adMarkW = null; return this._adRender(); }
+      if (act === "pick") {
+        ad.entity = b.dataset.e;
+        ad.preset = null;
+        ad.step = "preset";
+        return this._adRender();
+      }
+      if (act === "preset") {
+        // a preset fills in sensible settings; everything stays editable on the next step
+        const p = this._adPresets(ad.entity).find((x) => x.id === b.dataset.p);
+        const st = this._stateOf(ad.entity);
+        ad.preset = p.id;
+        ad.cfg = {
+          entity: ad.entity, preset: p.id, kind: p.kind, name: ad.cfg.name && ad.cfg.entity === ad.entity ? ad.cfg.name : st?.attributes?.friendly_name || ad.entity,
+          category: p.cat, list_icon: p.icon, dot: p.dot !== false && p.place !== "none", compact: true,
+          light: !!p.light, reach: p.reach || "medium", color: "#ffc87a", place: p.place === "none" ? "point" : p.place,
+          screen: !!p.screen, alert: !!p.alert, readout: p.kind === "sensor" && /temp/.test(p.id),
+        };
+        ad.step = "details";
+        return this._adRender();
+      }
+      const c = ad.cfg;
+      if (act === "group") { c.category = b.dataset.g; return this._adRender(); }
+      if (act === "icon") { c.list_icon = b.dataset.i; return this._adRender(); }
+      if (act === "tog") { c[b.dataset.k] = !c[b.dataset.k]; return this._adRender(); }
+      if (act === "reach") { c.reach = b.dataset.r; return this._adRender(); }
+      if (act === "color") { c.color = b.dataset.c; return this._adRender(); }
+      if (act === "place-mode") {
+        if (c.place !== b.dataset.m) { c.place = b.dataset.m; delete c.object; delete c.position; }
+        return this._adRender();
+      }
+      if (act === "to-place") {
+        ad.step = "place";
+        this._adShowExisting();
+        return this._adRender();
+      }
+      if (act === "finish") return this._adFinish();
+      if (act === "edit") return this._adOpen(b.dataset.e);
+      if (act === "remove") {
+        this._adRemoveRuntime(b.dataset.e);
+        this._added = (this._added || []).filter((x) => x.entity !== b.dataset.e);
+        this._adSave();
+        this._adRefresh();
+        return this._adRender();
+      }
+      if (act === "yaml") return this._adCopyYaml(b);
+    });
+  }
+
+  /** Editing a placed device: show where it is now. */
+  _adShowExisting() {
+    const c = this._ad.cfg;
+    this._adMarkW = null;
+    if (c.object) {
+      const o = this._findObject(c.object);
+      if (o) { const bb = this._boxOf([o]); this._adMarkW = new THREE.Vector3((bb.min.x + bb.max.x) / 2, bb.max.y, (bb.min.z + bb.max.z) / 2); }
+    } else if (c.position) this._adMarkW = this._root.localToWorld(new THREE.Vector3(...c.position));
+    this._dirty = true;
+  }
+
+  /** A tap on the room while placing: the object under your finger, or the spot on its surface. */
+  _adPlace(e) {
+    const ad = this._ad, c = ad.cfg;
+    const rect = this._canvas.getBoundingClientRect();
+    const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
+    this._updateCamera();
+    this._raycaster.setFromCamera(ndc, this._camera);
+    const hits = this._raycaster.intersectObject(this._root, true).filter((h) => {
+      if (!h.object.isMesh || h.object.userData.h3dMarker) return false;
+      for (let o = h.object; o; o = o.parent) if (!o.visible) return false;
+      const m = Array.isArray(h.object.material) ? h.object.material[0] : h.object.material;
+      return !(m && m.transparent && m.opacity < 0.3); // not through a faded wall
+    });
+    if (!hits.length) return;
+    const h = hits[0];
+    if (c.place === "object") {
+      // the named thing you tapped: climb up to the model's top-level object
+      let o = h.object;
+      while (o.parent && o.parent !== this._root) o = o.parent;
+      if (!o.name || o === this._root) return;
+      c.object = o.name;
+      delete c.position;
+      const bb = this._boxOf([o]);
+      this._adMarkW = new THREE.Vector3((bb.min.x + bb.max.x) / 2, bb.max.y, (bb.min.z + bb.max.z) / 2);
+    } else {
+      const local = this._root.worldToLocal(h.point.clone());
+      c.position = [local.x, local.y + 6, local.z].map((v) => Math.round(v * 10) / 10); // cm, just above the surface
+      delete c.object;
+      this._adMarkW = h.point.clone();
+    }
+    if (navigator.vibrate) navigator.vibrate(12);
+    this._dirty = true;
+    this._adRender();
+  }
+
+  _adPositionMark() {
+    const mk = this.shadowRoot?.querySelector(".ad-mark");
+    if (!mk) return;
+    if (!this._adMarkW || this._ad?.step !== "place") { if (!mk.hidden) mk.hidden = true; return; }
+    const v = this._adMarkW.clone().project(this._camera);
+    const w = this._wrap.clientWidth, h = this._wrap.clientHeight;
+    mk.hidden = v.z > 1;
+    mk.style.left = `${(((v.x + 1) / 2) * w).toFixed(1)}px`;
+    mk.style.top = `${(((1 - v.y) / 2) * h).toFixed(1)}px`;
+    mk.querySelector("span").textContent = this._ad.cfg.name || "";
+  }
+
+  /** Turn the wizard's choices into a device config, add it, and save it. */
+  _adFinish() {
+    const ad = this._ad, c = ad.cfg, p = this._adPreset();
+    const reach = { small: [5, 6, 2], medium: [9, 12, 2], large: [14, 24, 1] }[c.reach || "medium"];
+    const out = { entity: c.entity, name: (c.name || "").trim() || c.entity, preset: c.preset };
+    if (p.kind === "sensor") {
+      out.kind = "sensor";
+      if (c.readout) { out.readout = true; out.position = c.position; }
+    } else {
+      if (c.object) out.object = c.object;
+      else if (c.position) out.position = c.position;
+      else out.position = this._root ? (() => { const bb = this._boxOf([this._root]); const m = this._root.worldToLocal(bb.getCenter(new THREE.Vector3())); return [m.x, m.y, m.z]; })() : [0, 0, 0];
+      out.category = c.category || p.cat;
+      out.list_icon = c.list_icon || p.icon;
+      if (!c.dot || p.place === "none") out.hint = false;
+      if (!c.compact) out.compact_off = false;
+      if (c.screen) out.screen = true;
+      const d = c.entity.split(".")[0];
+      if (p.light !== undefined || d === "light") {
+        if (c.light) {
+          out.light = true;
+          [out.light_distance, out.intensity, out.light_decay] = reach;
+          out.color = c.color;
+        } else out.light = false;
+      }
+    }
+    this._adApply(out);
+    this._adSave();
+    const e = out.entity;
+    this._adClose();
+    // the new device: its row and its dot give a little flash
+    setTimeout(() => {
+      this.shadowRoot.querySelector(`.dl-r[data-e="${CSS.escape(e)}"], .dl-s[data-s="${CSS.escape(e)}"]`)?.classList.add("flash");
+      this._bindings.find((b) => b.cfg.entity === e)?.hint?.classList.add("flash");
+    }, 60);
+  }
+
+  /** The added devices as YAML for the card's config (entities:, labels:, list_sensors:). */
+  _adCopyYaml(btn) {
+    const list = this._added || [];
+    const q = (v) => (/^[\w.\- ]+$/.test(String(v)) && !/^(yes|no|on|off|true|false)$/i.test(String(v)) ? String(v) : JSON.stringify(v));
+    const ents = list.filter((x) => x.kind !== "sensor"), labs = list.filter((x) => x.kind === "sensor" && x.readout), sens = list.filter((x) => x.kind === "sensor" && !x.readout);
+    let y = "# Added from the dashboard: paste these into the card's config\n";
+    if (ents.length) {
+      y += "entities:\n";
+      for (const x of ents) {
+        y += `  - entity: ${x.entity}\n    name: ${q(x.name)}\n`;
+        for (const k of ["object", "position", "category", "list_icon", "hint", "compact_off", "screen", "light", "light_distance", "intensity", "light_decay", "color"])
+          if (x[k] !== undefined) y += `    ${k}: ${Array.isArray(x[k]) ? `[${x[k].join(", ")}]` : q(x[k])}\n`;
+      }
+    }
+    if (labs.length) {
+      y += "labels:\n";
+      for (const x of labs) y += `  - entity: ${x.entity}\n    name: ${q(x.name)}\n    position: [${(x.position || []).join(", ")}]\n`;
+    }
+    if (sens.length) y += `list_sensors: # keep your other sensors listed here too\n${sens.map((x) => `  - { entity: ${x.entity}, name: ${q(x.name)} }`).join("\n")}\n`;
+    const done = () => { const sp = btn.querySelector("span"); const t = sp.textContent; sp.textContent = "Copied ✓"; setTimeout(() => (sp.textContent = t), 1600); };
+    if (navigator.clipboard?.writeText) navigator.clipboard.writeText(y).then(done).catch(() => { console.info(y); done(); });
+    else { console.info(y); done(); }
+  }
+
+  /* ------------------------------------------------------------ shortcuts tab */
+
+  /**
+   * The list's second tab. A shortcut is a few device actions you run with one tap ("Movie time": blind down, lamp
+   * to 20 %, TV on). Give it a "when" (a time, sunset or sunrise, or a door, phone or sensor changing) and it is also
+   * saved in Home Assistant as a real automation, so it runs with no dashboard open. Your other Home Assistant
+   * automations are listed below yours, with a switch. Shortcuts are saved with your user, like added devices.
+   */
+  _auKey() {
+    return `house3d-card-shortcuts:${this._config.model || "demo"}`;
+  }
+
+  async _auLoad() {
+    if (this._auLoaded || this._auLoading || !this._hass) return;
+    this._auLoading = true;
+    let list = null;
+    if (this._hass.callWS) {
+      try {
+        const r = await this._hass.callWS({ type: "frontend/get_user_data", key: this._auKey() });
+        if (Array.isArray(r?.value)) list = r.value;
+      } catch (e) { /* older Home Assistant: fall back to this screen */ }
+    }
+    if (!list) {
+      try { list = JSON.parse(localStorage.getItem(this._auKey()) || "[]"); } catch (e) { list = []; }
+    }
+    this._auLoaded = true;
+    this._auLoading = false;
+    this._shortcuts = (list || []).filter((s) => s?.id && Array.isArray(s.actions)).map((s) => this._auMigrate(s));
+    this._auRefresh(true);
+  }
+
+  _auSave() {
+    const value = this._shortcuts || [];
+    try { localStorage.setItem(this._auKey(), JSON.stringify(value)); } catch (e) {}
+    if (this._hass?.callWS) this._hass.callWS({ type: "frontend/set_user_data", key: this._auKey(), value }).catch(() => {});
+  }
+
+  _auTab() {
+    if (this._dlTab == null) {
+      let v = null;
+      try { v = localStorage.getItem(`house3d-card:tab:${this._config.model || ""}`); } catch (e) {}
+      this._dlTab = v === "auto" ? "auto" : "devices";
+    }
+    return this._dlTab;
+  }
+
+  _auSetTab(t) {
+    if (t === this._auTab()) return;
+    this._dlTab = t;
+    try { localStorage.setItem(`house3d-card:tab:${this._config.model || ""}`, t); } catch (e) {}
+    if (this._dlMenuOpen) this._dlMenu(false);
+    if (t === "auto" && this._dlEdit) this._dlSetEdit(false);
+    this._auRefresh(true);
+    const pane = this.shadowRoot.querySelector(t === "auto" ? ".dl-auto" : ".dl-rows");
+    pane?.animate?.([{ opacity: 0, transform: `translateX(${t === "auto" ? 12 : -12}px)` }, { opacity: 1, transform: "none" }], { duration: 200, easing: "ease-out" });
+    if (navigator.vibrate) navigator.vibrate(8);
+  }
+
+  _auTabsHtml() {
+    const a = this._auTab() === "auto", n = (this._shortcuts || []).length;
+    return `<div class="dl-tabs" role="tablist" aria-label="Show">
+      <button role="tab" data-dl="tab" data-t="devices" aria-selected="${!a}">Devices</button>
+      <button role="tab" data-dl="tab" data-t="auto" aria-selected="${a}">Shortcuts<em>${n || ""}</em></button><i></i></div>`;
+  }
+
+  /** Keep the tab, the header and the Shortcuts pane in step with the state. */
+  _auRefresh(force = false) {
+    const dl = this.shadowRoot?.querySelector(".dl");
+    if (!dl) return;
+    const a = this._auTab() === "auto";
+    dl.classList.toggle("tab-auto", a);
+    for (const b of dl.querySelectorAll(".dl-tabs [data-t]")) b.setAttribute("aria-selected", String((b.dataset.t === "auto") === a));
+    const em = dl.querySelector(".dl-tabs em");
+    const n = String((this._shortcuts || []).length || "");
+    if (em && em.textContent !== n) em.textContent = n;
+    const title = dl.querySelector(".dl-h .dl-title");
+    if (title && this._dlOpen) title.textContent = a ? "Shortcuts" : "Devices";
+    dl.querySelector(".dl-h .dl-addb")?.setAttribute("aria-label", a ? "New shortcut" : "Add a device");
+    const pane = dl.querySelector(".dl-auto");
+    if (!pane || (!a && !force)) return;
+    const h = this._auPaneHtml();
+    if (pane._h !== h) { pane.innerHTML = h; pane._h = h; }
+  }
+
+  _auName(e) {
+    const b = this._bindings.find((x) => x.cfg.entity === e);
+    return b?.cfg.name || this._stateOf(e)?.attributes?.friendly_name || e;
+  }
+
+  /** What a shortcut can make a device do, as [key, label]. */
+  _auOps(entity) {
+    const d = entity.split(".")[0], st = this._stateOf(entity);
+    const dim = st?.attributes?.brightness != null || (st?.attributes?.supported_color_modes || []).some((m) => m !== "onoff");
+    if (d === "light") return [["on", "On"], ...(dim ? [["b20", "20 %"], ["b50", "50 %"]] : []), ["off", "Off"], ["toggle", "Toggle"]];
+    if (d === "cover") return [["open", "Open"], ["p50", "Halfway"], ["close", "Close"]];
+    if (d === "fan") return [["on", "On"], ["p30", "30 %"], ["p100", "Full"], ["off", "Off"]];
+    if (d === "climate") return [["h20", "Heat to 20°"], ["h22", "Heat to 22°"], ["off", "Off"]];
+    if (d === "media_player") return [["on", "On"], ["pp", "Play / pause"], ["off", "Off"]];
+    if (d === "vacuum") return [["start", "Clean"], ["dock", "Go home"]];
+    if (d === "lock") return [["lock", "Lock"], ["unlock", "Unlock"]];
+    if (d === "scene" || d === "script") return [["run", "Run"]];
+    return [["on", "On"], ["off", "Off"], ["toggle", "Toggle"]];
+  }
+
+  /** The Home Assistant service calls for one step of a shortcut: [[domain, service, data], ...]. */
+  _auSteps(a) {
+    const e = a.entity, d = e.split(".")[0], t = { entity_id: e }, n = Number(String(a.op).slice(1));
+    if (d === "light" && /^b\d+$/.test(a.op)) return [["light", "turn_on", { ...t, brightness_pct: n }]];
+    if (d === "cover") {
+      if (a.op === "open") return [["cover", "open_cover", t]];
+      if (a.op === "close") return [["cover", "close_cover", t]];
+      return [["cover", "set_cover_position", { ...t, position: n }]];
+    }
+    if (d === "fan" && /^p\d+$/.test(a.op)) return [["fan", "set_percentage", { ...t, percentage: n }]];
+    if (d === "climate") {
+      if (a.op === "off") return [["climate", "set_hvac_mode", { ...t, hvac_mode: "off" }]];
+      return [["climate", "set_hvac_mode", { ...t, hvac_mode: "heat" }], ["climate", "set_temperature", { ...t, temperature: n }]];
+    }
+    if (a.op === "pp") return [["media_player", "media_play_pause", t]];
+    if (a.op === "start") return [["vacuum", "start", t]];
+    if (a.op === "dock") return [["vacuum", "return_to_base", t]];
+    if (a.op === "lock" || a.op === "unlock") return [["lock", a.op, t]];
+    if (a.op === "run") return [[d, "turn_on", t]];
+    return [[d, a.op === "off" ? "turn_off" : a.op === "toggle" ? "toggle" : "turn_on", t]];
+  }
+
+  _auRun(s) {
+    for (const a of s.actions || []) for (const [d, sv, data] of this._auSteps(a)) {
+      try { this._call(d, sv, data); } catch (err) { console.warn("house3d-card: shortcut step failed", err); }
+    }
+  }
+
+  /** How a trigger reads: "When Door opens". */
+  _auToOpts(e) {
+    if (!e) return [];
+    const d = e.split(".")[0], st = this._stateOf(e);
+    const key = `${e} ${st?.attributes?.friendly_name || ""} ${st?.attributes?.device_class || ""}`.toLowerCase();
+    if (d === "binary_sensor") {
+      if (/door|window|opening|garage|ovi|ikkuna/.test(key)) return [["on", "Opens"], ["off", "Closes"]];
+      if (/motion|occupancy|presence|liike/.test(key)) return [["on", "Sees motion"], ["off", "Sees no motion"]];
+      if (/internet|connect|wan|ping/.test(key)) return [["off", "Goes offline"], ["on", "Comes back online"]];
+      return [["on", "Turns on"], ["off", "Turns off"]];
+    }
+    if (d === "device_tracker" || d === "person") return [["home", "Comes home"], ["not_home", "Leaves"]];
+    if (d === "lock") return [["unlocked", "Unlocks"], ["locked", "Locks"]];
+    if (d === "cover") return [["open", "Opens"], ["closed", "Closes"]];
+    if (d === "sensor") {
+      const pair = { Unlocked: "Locked", Locked: "Unlocked", on: "off", off: "on", open: "closed", closed: "open" };
+      const vals = st?.attributes?.options?.length ? st.attributes.options : [st?.state, pair[st?.state]];
+      return [...new Set(vals)].filter((v) => v && v !== "unavailable" && v !== "unknown").map((v) => [v, `Becomes ${v}`]);
+    }
+    return [["on", "Turns on"], ["off", "Turns off"]];
+  }
+
+  /** "is" wording for a rule: "Window is open". */
+  _auIsOpts(e) {
+    if (!e) return [];
+    const d = e.split(".")[0], st = this._stateOf(e);
+    const key = `${e} ${st?.attributes?.friendly_name || ""} ${st?.attributes?.device_class || ""}`.toLowerCase();
+    if (d === "binary_sensor") {
+      if (/door|window|opening|garage|ovi|ikkuna/.test(key)) return [["on", "is open"], ["off", "is closed"]];
+      if (/motion|occupancy|presence|liike/.test(key)) return [["on", "sees motion"], ["off", "sees no motion"]];
+      if (/internet|connect|wan|ping/.test(key)) return [["on", "is online"], ["off", "is offline"]];
+      return [["on", "is on"], ["off", "is off"]];
+    }
+    if (d === "device_tracker" || d === "person") return [["home", "is home"], ["not_home", "is away"]];
+    if (d === "lock") return [["locked", "is locked"], ["unlocked", "is unlocked"]];
+    if (d === "cover") return [["open", "is open"], ["closed", "is closed"]];
+    if (d === "sensor") return this._auToOpts(e).map(([v]) => [v, `is ${v}`]);
+    if (d === "media_player") return [["playing", "is playing"], ["off", "is off"]];
+    return [["on", "is on"], ["off", "is off"]];
+  }
+
+  _auUnit(e) {
+    const u = this._stateOf(e)?.attributes?.unit_of_measurement || "";
+    return u === "°C" || u === "°F" ? "°" : u ? ` ${u}` : "";
+  }
+
+  _auWhenText(w) {
+    if (!w || w.type === "tap") return "Tap to run";
+    if (w.type === "time") return `Every day at ${w.at || "–"}`;
+    if (w.type === "sunset") return "At sunset";
+    if (w.type === "sunrise") return "At sunrise";
+    if (w.type === "num") return `When ${this._auName(w.entity)} goes ${w.dir === "below" ? "below" : "above"} ${w.value}${this._auUnit(w.entity)}`;
+    const o = this._auToOpts(w.entity).find((x) => x[0] === w.to);
+    return `When ${this._auName(w.entity)} ${o ? o[1].toLowerCase() : `is ${w.to}`}`;
+  }
+
+  /** What "Else" means for a trigger: the moment its "If" stops being true (none for times and the sun). */
+  _auElseText(w) {
+    if (w?.type === "num") return `when it goes ${w.dir === "below" ? "back above" : "back below"} ${w.value}${this._auUnit(w.entity)}`;
+    if (w?.type === "state" && w.entity) {
+      const other = this._auToOpts(w.entity).find((x) => x[0] !== w.to);
+      return other ? `when it ${other[1].toLowerCase()}` : "when that stops";
+    }
+    return "";
+  }
+
+  _auCondText(c) {
+    let t = "";
+    if (c.type === "sun") t = c.sun === "light" ? "it's light out" : "it's dark out";
+    else if (c.type === "time") t = `it's between ${c.after || "–"} and ${c.before || "–"}`;
+    else if (c.type === "num") t = `${this._auName(c.entity)} is ${c.dir === "below" ? "below" : "above"} ${c.value}${this._auUnit(c.entity)}`;
+    else {
+      const o = this._auIsOpts(c.entity).find((x) => x[0] === c.state);
+      t = `${this._auName(c.entity)} ${o ? o[1] : `is ${c.state}`}`;
+    }
+    return `${c.mode === "not" ? "Not if" : "Only if"} ${t}`;
+  }
+
+  _auEntity(s) {
+    for (const [id, st] of Object.entries(this._hass?.states || {})) if (id.startsWith("automation.") && st.attributes?.id === s.id) return { id, st };
+    return null;
+  }
+
+  _auAgo(iso) {
+    if (!iso) return "Never ran";
+    const m = Math.round((Date.now() - Date.parse(iso)) / 60000);
+    if (!(m >= 0)) return "Never ran";
+    if (m < 1) return "Ran just now";
+    if (m < 60) return `Ran ${m} min ago`;
+    if (m < 60 * 24) return `Ran ${Math.round(m / 60)} h ago`;
+    return `Ran ${Math.round(m / 1440)} d ago`;
+  }
+
+
+  _auPaneHtml() {
+    const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    const all = this._shortcuts || [];
+    const row = (s) => {
+      const auto = s.when?.type && s.when.type !== "tap";
+      const ae = auto ? this._auEntity(s) : null;
+      const on = !ae || ae.st.state !== "off";
+      const ran = this._auRan?.id === s.id;
+      const extra = [s.else?.length && this._auElseText(s.when) ? "else" : "", (s.conds || []).length ? `${s.conds.length} rule${s.conds.length > 1 ? "s" : ""}` : ""].filter(Boolean);
+      const sub = `${auto ? svg("bolt") : ""}${esc(this._auWhenText(s.when))}${extra.length ? ` · ${extra.join(" · ")}` : ""}`;
+      return `<div class="au-t ${on ? "" : "off"} ${ran ? "ran" : ""}" data-sid="${esc(s.id)}">
+        <button class="au-run" data-dl="au-run" data-sid="${esc(s.id)}" aria-label="Run ${esc(s.name)} now"><span class="dl-ic">${svg(ran ? "check" : ICON[s.icon] ? s.icon : "sparkle")}</span>
+          <span class="au-n"><b>${esc(s.name)}</b><small>${sub}</small></span></button>
+        ${ae ? `<button class="sw2" data-dl="au-en" data-e="${esc(ae.id)}" aria-pressed="${on}" aria-label="${on ? "Pause" : "Resume"} ${esc(s.name)}"></button>` : ""}
+        <button class="au-ed" data-dl="au-edit" data-sid="${esc(s.id)}" aria-label="Edit ${esc(s.name)}">${svg("edit")}</button></div>`;
+    };
+    const taps = all.filter((s) => !s.when?.type || s.when.type === "tap"), autos = all.filter((s) => s.when?.type && s.when.type !== "tap");
+    const ids = new Set(all.map((s) => s.id));
+    const others = Object.entries(this._hass?.states || {}).filter(([id, st]) => id.startsWith("automation.") && !ids.has(st.attributes?.id))
+      .sort((a, b) => (a[1].attributes?.friendly_name || a[0]).localeCompare(b[1].attributes?.friendly_name || b[0]));
+    const ha = others.map(([id, st]) => {
+      const on = st.state === "on", name = st.attributes?.friendly_name || id;
+      return `<div class="au-t ${on ? "" : "off"}">
+        <button class="au-run" data-dl="au-info" data-e="${esc(id)}" aria-label="${esc(name)}: details"><span class="dl-ic">${svg("bolt")}</span>
+          <span class="au-n"><b>${esc(name)}</b><small>${esc(this._auAgo(st.attributes?.last_triggered))}</small></span></button>
+        <button class="sw2" data-dl="au-en" data-e="${esc(id)}" aria-pressed="${on}" aria-label="${on ? "Turn off" : "Turn on"} ${esc(name)}"></button></div>`;
+    }).join("");
+    return `<div class="dl-cat">Shortcuts</div>
+      ${taps.length ? taps.map(row).join("") : `<div class="au-empty"><b>Several things, one tap</b><span>Make “Movie time”: blind down, lamp to 20 %, TV on.</span></div>`}
+      <button class="au-new" data-dl="au-new" data-k="tap">${svg("plus")}<span>New shortcut</span></button>
+      <div class="dl-cat">Automations</div>
+      ${autos.length ? autos.map(row).join("") : `<div class="au-empty"><b>If this, then that</b><span>Like: if the room gets warmer than 23°, turn the fan on. Else turn it off. But not if the window is open.</span></div>`}
+      <button class="au-new" data-dl="au-new" data-k="auto">${svg("plus")}<span>New automation</span></button>
+      ${ha ? `<div class="dl-cat">Also in Home Assistant</div>${ha}` : ""}`;
+  }
+
+  /** Tap a shortcut: it runs, its icon ticks for a moment (kept through any redraw of the list). */
+  _auRunTile(id) {
+    const s = (this._shortcuts || []).find((x) => x.id === id);
+    if (!s) return;
+    this._auRun(s);
+    if (navigator.vibrate) navigator.vibrate(12);
+    clearTimeout(this._auRan?.t);
+    this._auRan = { id, t: setTimeout(() => { this._auRan = null; this._auRefresh(true); }, 1100) };
+    this._auRefresh(true);
+  }
+
+  /** Older shortcuts kept "only after dark" on the trigger; now it's a rule like any other. */
+  _auMigrate(s) {
+    s.conds = s.conds || [];
+    s.else = s.else || [];
+    if (s.when?.night) { s.conds.push({ mode: "only", type: "sun", sun: "dark" }); delete s.when.night; }
+    return s;
+  }
+
+  /* ---------------- the editor, on the same glass as "Add a device" */
+
+  _auOpen(id, kind = "tap") {
+    const cur = id ? (this._shortcuts || []).find((x) => x.id === id) : null;
+    const s = cur ? this._auMigrate(JSON.parse(JSON.stringify(cur)))
+      : { id: `h3d_${Date.now().toString(36)}`, name: "", icon: kind === "auto" ? "bolt" : "sparkle", actions: [], else: [], conds: [], when: { type: kind === "auto" ? "state" : "tap" } };
+    this._au = { s, isNew: !cur, kind: cur ? (cur.when?.type && cur.when.type !== "tap" ? "auto" : "tap") : kind, view: "main", pickFor: "actions", q: "", err: "", busy: false };
+    if (this._dlMenuOpen) this._dlMenu(false);
+    if (this._dlEdit) this._dlSetEdit(false);
+    this._auRender();
+    if (!cur && kind === "tap") setTimeout(() => this.shadowRoot.querySelector(".au .au-nm")?.focus({ preventScroll: true }), 60);
+  }
+
+  _auClose() {
+    const el = this.shadowRoot.querySelector(".au");
+    this._au = null;
+    this.shadowRoot.querySelector(".dl")?.classList.remove("adding");
+    if (el && !el.hidden) {
+      el.classList.add("out");
+      setTimeout(() => { if (!this._au) { el.hidden = true; el.classList.remove("out"); } }, 200);
+    }
+    this._dirty = true;
+  }
+
+  /** Things a shortcut can control: the card's devices first, then the rest of Home Assistant. */
+  _auPickable() {
+    const doms = ["light", "switch", "input_boolean", "fan", "cover", "climate", "media_player", "vacuum", "lock", "humidifier", "scene", "script"];
+    const inCard = this._bindings.map((b) => b.cfg.entity).filter((e) => doms.includes(e.split(".")[0]));
+    const rest = Object.keys(this._hass?.states || {}).filter((e) => doms.includes(e.split(".")[0]) && !inCard.includes(e))
+      .sort((a, b) => doms.indexOf(a.split(".")[0]) - doms.indexOf(b.split(".")[0]) || this._auName(a).localeCompare(this._auName(b)));
+    return { inCard: [...new Set(inCard)], rest };
+  }
+
+
+  _auPickHtml() {
+    const au = this._au, esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    const q = au.q.trim().toLowerCase(), used = new Set(au.s[au.pickFor].map((a) => a.entity));
+    const ok = (e) => !used.has(e) && (!q || `${e} ${this._auName(e)}`.toLowerCase().includes(q));
+    const item = (e) => `<button class="ad-e" data-au="pickdev" data-e="${esc(e)}"><span class="ad-ic">${svg(this._adIconFor(e, this._auName(e)))}</span>
+      <span class="ad-t"><b>${esc(this._auName(e))}</b><small>${esc(e)}</small></span>${svg("plus")}</button>`;
+    const { inCard, rest } = this._auPickable();
+    const a = inCard.filter(ok), b = rest.filter(ok);
+    return `${a.length ? `<div class="ad-sub">In this room</div>${a.map(item).join("")}` : ""}
+      ${b.length ? `<div class="ad-sub">Everything else</div>${b.map(item).join("")}` : ""}
+      ${a.length + b.length ? "" : `<div class="ad-empty">Nothing matches “${esc(au.q)}”.</div>`}`;
+  }
+
+  /** On/off things and states a trigger or rule can watch (doors, phones, locks, the PC session...). */
+  _auTriggerEntities() {
+    const doms = ["binary_sensor", "device_tracker", "person", "lock", "cover", "light", "switch", "fan", "media_player", "input_boolean", "sensor"];
+    return Object.entries(this._hass?.states || {})
+      .filter(([id, st]) => { const d = id.split(".")[0]; return doms.includes(d) && (d !== "sensor" || Number.isNaN(Number(st.state))); })
+      .map(([id, st]) => ({ id, d: id.split(".")[0], name: st.attributes?.friendly_name || id }))
+      .sort((a, b) => doms.indexOf(a.d) - doms.indexOf(b.d) || a.name.localeCompare(b.name));
+  }
+
+  /** Readings with a number: temperature, humidity, air quality, bandwidth... (temperatures first). */
+  _auNumEntities() {
+    // this room's own readings first (the ones the card shows), then temperatures; outdoor ones last
+    const mine = new Set([...this._dlSensorList().map((x) => x.entity), ...(this._config.labels || []).map((l) => l.entity)]);
+    const rank = (x) => (mine.has(x.id) ? 0 : 2) + (/temp|lämpö/i.test(`${x.id} ${x.name} ${this._stateOf(x.id)?.attributes?.device_class || ""}`) ? 0 : 1)
+      + (/outdoor|outside|balcony|parveke|ulko/i.test(`${x.id} ${x.name}`) ? 4 : 0);
+    return Object.entries(this._hass?.states || {})
+      .filter(([id, st]) => id.startsWith("sensor.") && st.state !== "" && !Number.isNaN(Number(st.state)))
+      .map(([id, st]) => ({ id, name: st.attributes?.friendly_name || id }))
+      .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
+  }
+
+  /** Ready-made automations built from what this home has (shown on a new, empty automation). */
+  _auIdeas() {
+    const st = this._hass?.states || {}, ids = Object.keys(st);
+    // by name first (entity ids like "door_and_window_sensor" say little), then by id
+    const first = (re, d) => { const c = ids.filter((e) => e.startsWith(`${d}.`)); return c.find((e) => re.test(st[e].attributes?.friendly_name || "")) || c.find((e) => re.test(e)); };
+    const temp = this._auNumEntities().find((x) => this._auUnit(x.id) === "°")?.id;
+    const fan = ids.find((e) => e.startsWith("fan.")), light = this._bindings.map((b) => b.cfg.entity).find((e) => e.startsWith("light.")) || ids.find((e) => e.startsWith("light."));
+    const win = first(/window|ikkuna/i, "binary_sensor"), door = first(/door|ovi/i, "binary_sensor");
+    const phone = ids.find((e) => e.startsWith("person.")) || first(/phone|puhelin/i, "device_tracker");
+    const out = [];
+    if (temp && fan) out.push({ name: "Cool down when it's warm", icon: "fan", when: { type: "num", entity: temp, dir: "above", value: 23 },
+      actions: [{ entity: fan, op: "on" }], else: [{ entity: fan, op: "off" }], conds: win ? [{ mode: "not", type: "state", entity: win, state: "on" }] : [] });
+    if (door && light) out.push({ name: "Light when the door opens", icon: "door", when: { type: "state", entity: door, to: "on" },
+      actions: [{ entity: light, op: "on" }], else: [{ entity: light, op: "off" }], conds: [{ mode: "only", type: "sun", sun: "dark" }] });
+    const lights = this._bindings.map((b) => b.cfg.entity).filter((e) => e.startsWith("light."));
+    if (phone && lights.length) out.push({ name: "Lights off when I leave", icon: "home", when: { type: "state", entity: phone, to: "not_home" },
+      actions: [...new Set(lights)].map((e) => ({ entity: e, op: "off" })), else: [], conds: [] });
+    return out;
+  }
+
+  _auRender() {
+    const el = this.shadowRoot.querySelector(".au");
+    const au = this._au;
+    if (!el || !au) return;
+    const s = au.s, w = s.when, auto = au.kind === "auto";
+    const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    const head = (title, back) => `<div class="ad-h">${back ? `<button class="ad-back" data-au="back" aria-label="Back">${svg("chev")}</button>` : ""}
+      <b>${esc(title)}</b><button class="ad-x" data-au="close" aria-label="Close">${svg("close")}</button></div>`;
+    const chips = (list, cur, act, extra = "") => `<div class="ad-chips">${list.map(([k, l]) => `<button class="ad-chip ${String(cur) === String(k) ? "sel" : ""}" data-au="${act}" data-k="${esc(k)}" ${extra} aria-pressed="${String(cur) === String(k)}">${esc(l)}</button>`).join("")}</div>`;
+    const seg = (list, cur, bind) => `<div class="ad-seg">${list.map(([k, l]) => `<button class="${cur === k ? "sel" : ""}" data-au="set" data-bind="${bind}" data-v="${k}" aria-pressed="${cur === k}">${esc(l)}</button>`).join("")}</div>`;
+    const select = (bind, list, cur, placeholder) => `<select class="ad-name au-sel" data-bind="${bind}" aria-label="${esc(placeholder)}">${cur ? "" : `<option value="" selected disabled>${esc(placeholder)}</option>`}
+      ${list.map((x) => `<option value="${esc(x.id)}" ${x.id === cur ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select>`;
+    const num = (bind, v, entity) => `<label class="au-numw"><input class="ad-name au-in" type="number" step="any" inputmode="decimal" data-bind="${bind}" value="${esc(v ?? "")}" aria-label="Value"><span>${esc(this._auUnit(entity).trim())}</span></label>`;
+    const actList = (key) => s[key].map((a, i) => {
+      const name = this._auName(a.entity);
+      return `<div class="au-a"><div class="au-ah"><span class="ad-ic">${svg(this._adIconFor(a.entity, name))}</span>
+          <span class="ad-t"><b>${esc(name)}</b><small>${esc(a.entity)}</small></span>
+          <button class="ad-sm danger" data-au="rmact" data-list="${key}" data-i="${i}" aria-label="Remove ${esc(name)}">${svg("minus")}</button></div>
+        ${chips(this._auOps(a.entity), a.op, "op", `data-list="${key}" data-i="${i}"`)}</div>`;
+    }).join("");
+    let html;
+    if (au.view === "pick") {
+      html = `${head(au.pickFor === "else" ? "Else: choose a device" : "Choose a device", true)}
+        <div class="ad-body"><input class="ad-q au-q" type="search" placeholder="Search your Home Assistant…" value="${esc(au.q)}" aria-label="Search devices">
+          <div class="ad-list">${this._auPickHtml()}</div></div>`;
+    } else {
+      const icons = ["sparkle", "bulb", "power", "home", "moon", "clock", "blind", "fan", "pc", "play", "thermo", "door", "vacuum", "bolt"];
+      // IF
+      let ifHtml = "";
+      if (auto) {
+        const whens = [["state", "Something changes"], ["num", "A reading passes a value"], ["time", "It's a set time"], ["sunset", "The sun sets"], ["sunrise", "The sun rises"]];
+        ifHtml = `<div class="au-sec"><div class="au-sh"><em class="au-k if">If</em></div>${chips(whens, w.type, "when")}`;
+        if (w.type === "time") ifHtml += `<input class="ad-name au-in" type="time" data-bind="when.at" value="${esc(w.at || "07:00")}" aria-label="Time">`;
+        if (w.type === "state") {
+          ifHtml += select("when.entity", this._auTriggerEntities(), w.entity, "Choose a sensor or device…");
+          if (w.entity) ifHtml += chips(this._auToOpts(w.entity), w.to, "to");
+        }
+        if (w.type === "num") {
+          ifHtml += select("when.entity", this._auNumEntities(), w.entity, "Choose a reading…");
+          if (w.entity) ifHtml += `<div class="au-inl">${seg([["above", "Above"], ["below", "Below"]], w.dir || "above", "when.dir")}${num("when.value", w.value, w.entity)}</div>
+            <small class="ad-hint">Now ${esc(this._stateOf(w.entity)?.state ?? "–")}${esc(this._auUnit(w.entity))}</small>`;
+        }
+        ifHtml += `</div>`;
+      }
+      // THEN
+      const thenHtml = `<div class="au-sec"><div class="au-sh">${auto ? `<em class="au-k then">Then</em>` : `<span class="ad-sub">Do this</span>`}</div>
+        ${actList("actions") || `<div class="au-hint">Add the devices ${auto ? "it" : "this shortcut"} controls, then choose what each one does.</div>`}
+        <button class="au-new" data-au="add" data-list="actions">${svg("plus")}<span>Add a device</span></button></div>`;
+      // ELSE
+      const elseWhen = auto ? this._auElseText(w) : "";
+      const elseHtml = elseWhen ? `<div class="au-sec"><div class="au-sh"><em class="au-k else">Else</em><small>${esc(elseWhen)}</small></div>
+        ${actList("else")}
+        <button class="au-new" data-au="add" data-list="else">${svg("plus")}<span>${s.else.length ? "Add a device" : "Add something to do instead"}</span></button></div>` : "";
+      // RULES
+      const condHtml = auto ? `<div class="au-sec"><div class="au-sh"><em class="au-k rule">Rules</em><small>Checked every time it starts</small></div>
+        ${s.conds.map((c, i) => {
+          const b = `c.${i}`;
+          let f = "";
+          if (c.type === "state") f = select(`${b}.entity`, this._auTriggerEntities(), c.entity, "Choose a sensor or device…") + (c.entity ? chips(this._auIsOpts(c.entity), c.state, "cstate", `data-i="${i}"`) : "");
+          if (c.type === "num") f = select(`${b}.entity`, this._auNumEntities(), c.entity, "Choose a reading…") + (c.entity ? `<div class="au-inl">${seg([["above", "Above"], ["below", "Below"]], c.dir || "above", `${b}.dir`)}${num(`${b}.value`, c.value, c.entity)}</div>` : "");
+          if (c.type === "time") f = `<div class="au-inl"><input class="ad-name au-in" type="time" data-bind="${b}.after" value="${esc(c.after || "22:00")}" aria-label="From"><span class="au-to">to</span><input class="ad-name au-in" type="time" data-bind="${b}.before" value="${esc(c.before || "07:00")}" aria-label="Until"></div>`;
+          if (c.type === "sun") f = chips([["dark", "It's dark"], ["light", "It's light"]], c.sun, "csun", `data-i="${i}"`);
+          return `<div class="au-a au-c ${c.mode}"><div class="au-inl">${seg([["only", "Only if"], ["not", "Do not do if"]], c.mode, `${b}.mode`)}
+              <button class="ad-sm danger" data-au="rmcond" data-i="${i}" aria-label="Remove rule">${svg("minus")}</button></div>
+            ${chips([["state", "Device or sensor"], ["num", "Reading"], ["time", "Time of day"], ["sun", "Dark / light"]], c.type, "ctype", `data-i="${i}"`)}${f}</div>`;
+        }).join("")}
+        <div class="au-two"><button class="au-new" data-au="addcond" data-k="only">${svg("plus")}<span>Only if…</span></button>
+          <button class="au-new" data-au="addcond" data-k="not">${svg("minus")}<span>Do not do if…</span></button></div></div>` : "";
+      // ideas for a new, empty automation
+      const ideas = auto && au.isNew && !s.actions.length ? this._auIdeas() : [];
+      const ideasHtml = ideas.length ? `<div class="au-ideas"><span class="ad-sub">Start from an idea</span>${ideas.map((x, i) => `<button class="ad-e" data-au="idea" data-i="${i}"><span class="ad-ic">${svg(x.icon)}</span>
+          <span class="ad-t"><b>${esc(x.name)}</b><small>${esc(this._auWhenText(x.when))}${x.conds.length ? ` · ${esc(this._auCondText(x.conds[0]).toLowerCase())}` : ""}</small></span>${svg("chev")}</button>`).join("")}</div>` : "";
+      au.ideas = ideas;
+      const summary = auto && s.actions.length ? `<div class="au-sum">${esc(this._auSummary(s))}</div>` : "";
+      html = `${head(au.isNew ? (auto ? "New automation" : "New shortcut") : (auto ? "Edit automation" : "Edit shortcut"))}
+        <div class="ad-body">
+          ${ideasHtml}
+          <input class="ad-name au-nm" type="text" maxlength="40" placeholder="${auto ? "Name, like Cool down" : "Name, like Movie time"}" value="${esc(s.name)}" aria-label="Name">
+          <div class="ad-icons" role="group" aria-label="Icon">${icons.map((ic) => `<button class="ad-icb ${s.icon === ic ? "sel" : ""}" data-au="icon" data-ic="${ic}" aria-label="${ic}" aria-pressed="${s.icon === ic}">${svg(ic)}</button>`).join("")}</div>
+          ${ifHtml}${thenHtml}${elseHtml}${condHtml}${summary}
+          ${auto ? `<small class="ad-hint">${svg("bolt")} Saved in Home Assistant as an automation, so it runs even when no dashboard is open. Tap it in the list to run its “Then” now.</small>` : ""}
+          ${au.err ? `<div class="au-err" role="alert">${esc(au.err)}</div>` : ""}
+          ${au.isNew ? "" : `<button class="au-del" data-au="del">Delete ${auto ? "automation" : "shortcut"}</button>`}
+        </div>
+        <div class="ad-go"><button class="ad-main" data-au="save" ${au.busy ? "disabled" : ""}>${svg("check")}<span>${au.busy ? "Saving…" : au.isNew ? (auto ? "Create automation" : "Create shortcut") : "Save"}</span></button></div>`;
+    }
+    const body = el.querySelector(".ad-body"), top = body && el.dataset.view === au.view ? body.scrollTop : 0;
+    el.innerHTML = html;
+    el.dataset.view = au.view;
+    if (top) el.querySelector(".ad-body").scrollTop = top;
+    this.shadowRoot.querySelector(".dl")?.classList.add("adding");
+    el.hidden = false;
+    el.classList.remove("out");
+    if (!el.dataset.wired) this._auWire(el);
+    if (au.focusQ) { el.querySelector(".au-q")?.focus(); au.focusQ = false; }
+  }
+
+  /** The whole automation in one sentence, under the editor. */
+  _auSummary(s) {
+    const does = (list) => list.map((a) => `${this._auName(a.entity)} ${(this._auOps(a.entity).find((o) => o[0] === a.op)?.[1] || a.op).toLowerCase()}`).join(", ");
+    let t = `${this._auWhenText(s.when)}: ${does(s.actions)}.`;
+    if (s.else?.length && this._auElseText(s.when)) t += ` Else, ${this._auElseText(s.when)}: ${does(s.else)}.`;
+    if (s.conds?.length) t += ` ${s.conds.map((c) => this._auCondText(c)).join(". ")}.`;
+    return t;
+  }
+
+  /** Set a field from the editor: "when.value", "c.0.after"... */
+  _auSetField(bind, v) {
+    const s = this._au.s, [a, b, c] = bind.split(".");
+    const obj = a === "when" ? s.when : s.conds[Number(b)];
+    const key = a === "when" ? b : c;
+    if (!obj) return;
+    obj[key] = key === "value" ? (v === "" ? "" : Number(v)) : v;
+    if (key === "entity") {
+      if (a === "when") { obj.to = this._auToOpts(v)[0]?.[0]; if (obj.type === "num" && (obj.value === "" || obj.value == null)) obj.value = Math.round(Number(this._stateOf(v)?.state) || 0) + 1; }
+      else { obj.state = this._auIsOpts(v)[0]?.[0]; if (obj.type === "num" && (obj.value === "" || obj.value == null)) obj.value = Math.round(Number(this._stateOf(v)?.state) || 0); }
+    }
+  }
+
+  _auWire(el) {
+    el.dataset.wired = "1";
+    el.addEventListener("pointerdown", (e) => e.stopPropagation());
+    el.addEventListener("input", (e) => {
+      const au = this._au;
+      if (!au) return;
+      const t = e.target;
+      if (t.classList.contains("au-q")) { au.q = t.value; el.querySelector(".ad-list").innerHTML = this._auPickHtml(); }
+      else if (t.classList.contains("au-nm")) au.s.name = t.value;
+      else if (t.classList.contains("au-in") && t.dataset.bind) {
+        this._auSetField(t.dataset.bind, t.value);
+        const sum = el.querySelector(".au-sum");
+        if (sum && au.s.actions.length) sum.textContent = this._auSummary(au.s);
+      }
+    });
+    el.addEventListener("change", (e) => {
+      const au = this._au;
+      if (!au || !e.target.classList.contains("au-sel")) return;
+      this._auSetField(e.target.dataset.bind, e.target.value);
+      this._auRender();
+    });
+    el.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key !== "Escape") return;
+      if (this._au?.view === "pick") { this._au.view = "main"; this._auRender(); } else this._auClose();
+    });
+    el.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const b = e.target.closest("[data-au]");
+      const au = this._au;
+      if (!b || !au || b.disabled) return;
+      const s = au.s, act = b.dataset.au, i = Number(b.dataset.i);
+      if (act === "close") return this._auClose();
+      if (act === "back") { au.view = "main"; return this._auRender(); }
+      if (act === "add") { au.view = "pick"; au.pickFor = b.dataset.list; au.q = ""; au.focusQ = true; return this._auRender(); }
+      if (act === "pickdev") {
+        const ops = this._auOps(b.dataset.e), off = ops.find((o) => ["off", "close", "dock"].includes(o[0]));
+        s[au.pickFor].push({ entity: b.dataset.e, op: au.pickFor === "else" && off ? off[0] : ops[0][0] });
+        au.view = "main"; au.err = "";
+        return this._auRender();
+      }
+      if (act === "rmact") { s[b.dataset.list].splice(i, 1); return this._auRender(); }
+      if (act === "op") { s[b.dataset.list][i].op = b.dataset.k; return this._auRender(); }
+      if (act === "icon") { s.icon = b.dataset.ic; return this._auRender(); }
+      if (act === "when") {
+        const type = b.dataset.k;
+        s.when = { type };
+        if (type === "time") s.when.at = "07:00";
+        if (type === "num") { const t = this._auNumEntities()[0]; if (t) { s.when.entity = t.id; s.when.dir = "above"; s.when.value = Math.round(Number(this._stateOf(t.id)?.state) || 0) + 1; } }
+        au.err = "";
+        return this._auRender();
+      }
+      if (act === "to") { s.when.to = b.dataset.k; return this._auRender(); }
+      if (act === "set") { this._auSetField(b.dataset.bind, b.dataset.v); return this._auRender(); }
+      if (act === "addcond") { s.conds.push({ mode: b.dataset.k, type: "state" }); return this._auRender(); }
+      if (act === "rmcond") { s.conds.splice(i, 1); return this._auRender(); }
+      if (act === "ctype") {
+        const c = { mode: s.conds[i].mode, type: b.dataset.k };
+        if (c.type === "time") { c.after = "22:00"; c.before = "07:00"; }
+        if (c.type === "sun") c.sun = "dark";
+        if (c.type === "num") c.dir = "above";
+        s.conds[i] = c;
+        return this._auRender();
+      }
+      if (act === "cstate") { s.conds[i].state = b.dataset.k; return this._auRender(); }
+      if (act === "csun") { s.conds[i].sun = b.dataset.k; return this._auRender(); }
+      if (act === "idea") {
+        const x = au.ideas?.[i];
+        if (!x) return;
+        Object.assign(s, JSON.parse(JSON.stringify(x)));
+        return this._auRender();
+      }
+      if (act === "save") return this._auCommit();
+      if (act === "del") return this._auDelete();
+    });
+  }
+
+  /** A trigger as Home Assistant writes it; `flip` is its opposite (for Else). */
+  _auTrig(w, flip = false) {
+    if (w.type === "time") return { trigger: "time", at: `${w.at}:00` };
+    if (w.type === "sunset" || w.type === "sunrise") return { trigger: "sun", event: w.type };
+    if (w.type === "num") {
+      const dir = (w.dir === "below") !== flip ? "below" : "above";
+      return { trigger: "numeric_state", entity_id: w.entity, [dir]: Number(w.value) };
+    }
+    return flip ? { trigger: "state", entity_id: w.entity, from: w.to } : { trigger: "state", entity_id: w.entity, to: w.to };
+  }
+
+  _auCond(c) {
+    let x;
+    if (c.type === "sun") x = { condition: "state", entity_id: "sun.sun", state: c.sun === "light" ? "above_horizon" : "below_horizon" };
+    else if (c.type === "time") x = { condition: "time", after: `${c.after}:00`, before: `${c.before}:00` };
+    else if (c.type === "num") x = { condition: "numeric_state", entity_id: c.entity, [c.dir === "below" ? "below" : "above"]: Number(c.value) };
+    else x = { condition: "state", entity_id: c.entity, state: c.state };
+    return c.mode === "not" ? { condition: "not", conditions: [x] } : x;
+  }
+
+  /** An automation as Home Assistant stores it (what automations.yaml would hold). */
+  _auHaConfig(s) {
+    const acts = (list) => list.flatMap((a) => this._auSteps(a).map(([d, sv, data]) => {
+      const { entity_id, ...rest } = data;
+      return { action: `${d}.${sv}`, target: { entity_id }, ...(Object.keys(rest).length ? { data: rest } : {}) };
+    }));
+    const hasElse = !!(s.else?.length && this._auElseText(s.when));
+    const triggers = hasElse ? [{ ...this._auTrig(s.when), id: "then" }, { ...this._auTrig(s.when, true), id: "else" }] : [this._auTrig(s.when)];
+    const actions = hasElse ? [{ if: [{ condition: "trigger", id: "then" }], then: acts(s.actions), else: acts(s.else) }] : acts(s.actions);
+    return { alias: s.name, description: "Made in the 3D house card (Devices → Shortcuts).", mode: "restart", triggers, conditions: (s.conds || []).map((c) => this._auCond(c)), actions };
+  }
+
+  _auHa(method, id, body) {
+    if (!this._hass?.callApi) return Promise.reject(new Error("This Home Assistant can't save automations from the dashboard."));
+    return this._hass.callApi(method, `config/automation/config/${id}`, body);
+  }
+
+
+  async _auCommit() {
+    const au = this._au;
+    if (!au || au.busy) return;
+    const s = au.s, w = s.when;
+    s.name = (s.name || "").trim();
+    const fail = (msg) => { au.err = msg; this._auRender(); };
+    if (!s.name) return fail(`Give the ${au.kind === "auto" ? "automation" : "shortcut"} a name.`);
+    if (!s.actions.length) return fail(au.kind === "auto" ? "Add at least one device under “Then”." : "Add at least one device for it to control.");
+    if (w.type === "time" && !/^\d\d:\d\d$/.test(w.at || "")) return fail("Choose a time.");
+    if (w.type === "state" && (!w.entity || !w.to)) return fail("Choose what should happen to start it.");
+    if (w.type === "num" && (!w.entity || w.value === "" || !Number.isFinite(Number(w.value)))) return fail("Choose a reading and a value.");
+    for (const c of s.conds || []) {
+      if ((c.type === "state" && (!c.entity || !c.state)) || (c.type === "num" && (!c.entity || c.value === "" || !Number.isFinite(Number(c.value))))) return fail("Finish or remove the rule that's missing a device or value.");
+    }
+    if (!this._auElseText(w)) s.else = [];
+    if (w.type === "tap") { s.conds = []; s.else = []; }
+    const prev = (this._shortcuts || []).find((x) => x.id === s.id);
+    au.busy = true; au.err = "";
+    this._auRender();
+    try {
+      if (w.type !== "tap") await this._auHa("POST", s.id, this._auHaConfig(s));
+      else if (prev && prev.when?.type !== "tap") await this._auHa("DELETE", s.id).catch(() => {});
+    } catch (e) {
+      au.busy = false;
+      const who = e?.status_code === 401 || e?.status === 401 || /unauthor/i.test(e?.message || e?.body?.message || "") ? " Only Home Assistant admins can make automations." : "";
+      return fail(`Home Assistant didn't save the automation.${who}`);
+    }
+    const list = [...(this._shortcuts || [])];
+    const i = list.findIndex((x) => x.id === s.id);
+    if (i >= 0) list[i] = s; else list.push(s);
+    this._shortcuts = list;
+    this._auSave();
+    this._auClose();
+    this._auRefresh(true);
+    if (navigator.vibrate) navigator.vibrate(12);
+    requestAnimationFrame(() => this.shadowRoot.querySelector(`.dl-auto .au-t[data-sid="${CSS.escape(s.id)}"]`)?.classList.add("flash"));
+  }
+
+  async _auDelete() {
+    const au = this._au;
+    if (!au) return;
+    const prev = (this._shortcuts || []).find((x) => x.id === au.s.id);
+    if (prev?.when?.type && prev.when.type !== "tap") {
+      try { await this._auHa("DELETE", prev.id); } catch (e) { au.err = "Home Assistant didn't delete the automation. Try again, or delete it in Settings → Automations."; return this._auRender(); }
+    }
+    this._shortcuts = (this._shortcuts || []).filter((x) => x.id !== au.s.id);
+    this._auSave();
+    this._auClose();
+    this._auRefresh(true);
+  }
+
+  /* ------------------------------------------------------------ secret shortcuts */
+
+  /**
+   * Press and hold the closed ☰ button (or right-click it, or the context-menu key) for a quick-actions menu:
+   * all lights off, blinds, everything off, top view / start view, plus your own `shortcuts:` (scenes, scripts,
+   * any service).
+   */
+  _scWire(dl) {
+    let t = null, x0 = 0, y0 = 0;
+    const cancel = () => { clearTimeout(t); t = null; dl.classList.remove("pressing"); };
+    dl.addEventListener("pointerdown", (e) => {
+      if (this._dlOpen || e.button > 0) return;
+      x0 = e.clientX; y0 = e.clientY;
+      dl.classList.add("pressing");
+      clearTimeout(t);
+      t = setTimeout(() => requestAnimationFrame(() => {
+        if (!t) return;
+        t = null;
+        dl.classList.remove("pressing");
+        this._scSuppress = true;
+        this._scOpen(true);
+      }), 450);
+    });
+    dl.addEventListener("pointermove", (e) => { if (t && Math.hypot(e.clientX - x0, e.clientY - y0) > 10) cancel(); });
+    dl.addEventListener("pointerup", () => { if (t) cancel(); setTimeout(() => (this._scSuppress = false), 0); });
+    dl.addEventListener("pointercancel", cancel);
+    dl.addEventListener("contextmenu", (e) => {
+      if (this._dlOpen) return;
+      e.preventDefault();
+      cancel();
+      this._scOpen(true);
+    });
+    dl.addEventListener("keydown", (e) => {
+      if (this._dlOpen) return;
+      if (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10")) { e.preventDefault(); this._scOpen(true); }
+    });
+    const sc = this.shadowRoot.querySelector(".sc"), dim = this.shadowRoot.querySelector(".sc-dim");
+    dim.addEventListener("pointerdown", (e) => { e.stopPropagation(); this._scOpen(false); });
+    sc.addEventListener("pointerdown", (e) => e.stopPropagation());
+    sc.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const el = e.target.closest("[data-sc]");
+      if (el) this._scRun(Number(el.dataset.sc), el);
+    });
+    sc.addEventListener("keydown", (e) => {
+      const items = [...sc.querySelectorAll(".sc-i")];
+      const i = items.indexOf(this.shadowRoot.activeElement);
+      if (e.key === "Escape") { e.preventDefault(); this._scOpen(false); dl.querySelector(".dl-h")?.focus(); }
+      if (e.key === "ArrowDown") { e.preventDefault(); items[(i + 1) % items.length]?.focus(); }
+      if (e.key === "ArrowUp") { e.preventDefault(); items[(i - 1 + items.length) % items.length]?.focus(); }
+    });
+  }
+
+  /** The shortcuts: yours first (`shortcuts:`), then the built-in ones (unless `shortcut_defaults: false`). */
+  _scItems() {
+    const c = this._config, out = [];
+    const live = (b) => !this._isHidden(b.cfg.entity);
+    const ents = (d) => this._bindings.filter((b) => b.cfg.entity.startsWith(`${d}.`) && live(b)).map((b) => b.cfg.entity);
+    for (const s of this._shortcuts || []) out.push({ name: s.name, icon: ICON[s.icon] ? s.icon : "sparkle", run: () => this._auRun(s) });
+    for (const x of c.shortcuts || []) {
+      const it = typeof x === "string" ? { entity: x } : x;
+      let [domain, service] = String(it.service || "").split(".");
+      const entity = it.entity;
+      if (!service && entity) {
+        const d = entity.split(".")[0];
+        [domain, service] = d === "scene" || d === "script" ? [d, "turn_on"] : ["homeassistant", "toggle"];
+      }
+      if (!domain || !service) continue;
+      const name = it.name || (entity && this._stateOf(entity)?.attributes?.friendly_name) || entity || it.service;
+      const icon = it.icon && ICON[it.icon] ? it.icon : entity?.startsWith("scene.") ? "sparkle" : entity?.startsWith("script.") ? "play" : "dot";
+      out.push({ name, icon, run: () => this._call(domain, service, { ...(entity ? { entity_id: entity } : {}), ...(it.data || {}) }) });
+    }
+    if (c.shortcut_defaults === false) return out;
+    const lights = ents("light"), covers = ents("cover"), fans = ents("fan"), media = ents("media_player");
+    if (lights.length) out.push({ name: "All lights off", icon: "bulb", run: () => this._call("light", "turn_off", { entity_id: lights }) });
+    if (covers.length) {
+      out.push({ name: covers.length > 1 ? "Close blinds" : "Close blind", icon: "down", run: () => this._call("cover", "close_cover", { entity_id: covers }) });
+      out.push({ name: covers.length > 1 ? "Open blinds" : "Open blind", icon: "up", run: () => this._call("cover", "open_cover", { entity_id: covers }) });
+    }
+    if (lights.length + fans.length + media.length > 1) {
+      out.push({ name: "Everything off", icon: "power", run: () => {
+        if (lights.length) this._call("light", "turn_off", { entity_id: lights });
+        if (fans.length) this._call("fan", "turn_off", { entity_id: fans });
+        if (media.length) this._call("media_player", "turn_off", { entity_id: media });
+      } });
+    }
+    const top = this._el > 75 * DEG;
+    out.push({ name: top ? "3D view" : "Top view", icon: "topview", view: true, run: () => this._toggleTop() });
+    out.push({ name: "Start view", icon: "home", view: true, run: () => this._goHome(900) });
+    return out;
+  }
+
+  _scOpen(open) {
+    const sc = this.shadowRoot.querySelector(".sc"), dim = this.shadowRoot.querySelector(".sc-dim");
+    if (!sc) return;
+    clearTimeout(this._scT);
+    this._scIsOpen = open;
+    this._wrap.classList.toggle("sc-open", open);
+    if (open) {
+      if (this._wxOpen) this._setWeatherOpen(false);
+      this._scList = this._scItems();
+      sc.innerHTML = `<div class="sc-t">Shortcuts</div>` + this._scList
+        .map((it, i) => `<button class="sc-i" role="menuitem" data-sc="${i}" style="--i:${i}"><span class="sc-ic">${svg(it.icon)}</span><span class="sc-n"></span></button>`)
+        .join("");
+      sc.querySelectorAll(".sc-n").forEach((el, i) => (el.textContent = this._scList[i].name));
+      sc.hidden = dim.hidden = false;
+      sc.classList.remove("out");
+      dim.classList.remove("out");
+      if (navigator.vibrate) navigator.vibrate(18);
+      sc.querySelector(".sc-i")?.focus({ preventScroll: true });
+    } else if (!sc.hidden) {
+      sc.classList.add("out");
+      dim.classList.add("out");
+      this._scT = setTimeout(() => { sc.hidden = dim.hidden = true; sc.classList.remove("out"); dim.classList.remove("out"); }, 200);
+    }
+    this._dirty = true;
+  }
+
+  _scRun(i, el) {
+    const it = this._scList?.[i];
+    if (!it) return;
+    try { it.run(); } catch (err) { console.warn("house3d-card: shortcut failed", err); }
+    if (navigator.vibrate) navigator.vibrate(12);
+    // a tick on the item, then the menu closes
+    el.classList.add("done");
+    el.querySelector(".sc-ic").innerHTML = svg("check");
+    setTimeout(() => this._scOpen(false), it.view ? 120 : 420);
+  }
+
+  /**
+   * Slide a light's card up or down to set its brightness (like dimming a HomeKit tile): the card fills with the
+   * lamp's colour as you go, the lamp follows live, and all the way down switches it off.
+   */
+  _dlWireSlide(dl) {
+    dl.addEventListener("pointerdown", (e) => {
+      const tile = e.target.closest(".dl-rows .dl-r.dim");
+      if (!tile || this._dlEdit || !this._dlOpen) return;
+      const st = this._stateOf(tile.dataset.e);
+      const on = st?.state === "on";
+      const lv = on ? (st?.attributes?.brightness != null ? Math.round((st.attributes.brightness / 255) * 100) : 100) : 0;
+      this._dlSlide = { e: tile.dataset.e, tile, x0: e.clientX, y0: e.clientY, v0: lv, v: lv, started: false, id: e.pointerId, last: 0, t: 0 };
+    });
+    dl.addEventListener("pointermove", (e) => {
+      const g = this._dlSlide;
+      if (!g) return;
+      const dy = g.y0 - e.clientY, dx = e.clientX - g.x0;
+      if (!g.started) {
+        if (Math.abs(dy) < 6 || Math.abs(dy) < Math.abs(dx)) return;
+        g.started = true;
+        this._dlHoldCancel?.(); // it's a slide, not a long press
+        try { dl.setPointerCapture(e.pointerId); } catch (err) {}
+        g.tile.classList.add("sliding");
+      }
+      // about 160 px of travel for the full range; the card is updated once per frame
+      g.v = Math.round(Math.min(100, Math.max(0, g.v0 + (dy / 160) * 100)));
+      if (!g.raf) g.raf = requestAnimationFrame(() => {
+        g.raf = 0;
+        g.tile.style.setProperty("--lvn", (g.v / 100).toFixed(3));
+        g.tile.classList.toggle("is-on", g.v > 0);
+        const q = g.tile.querySelector(".dl-q"), sm = g.tile.querySelector(".dl-t small");
+        const txt = g.v > 0 ? `${g.v}%` : "Off";
+        if (q && q.textContent !== txt) q.textContent = txt;
+        if (sm) sm.textContent = g.v > 0 ? `On · ${g.v}%` : "Off";
+      });
+      const now = performance.now();
+      if (g.v > 0 && now - g.last > 250) {
+        g.last = now;
+        this._call("light", "turn_on", { entity_id: g.e, brightness_pct: g.v });
+      }
+    });
+    const end = () => {
+      const g = this._dlSlide;
+      if (!g) return;
+      this._dlSlide = null;
+      if (g.raf) cancelAnimationFrame(g.raf);
+      if (!g.started) return;
+      g.tile.style.setProperty("--lvn", (g.v / 100).toFixed(3));
+      g.tile.classList.remove("sliding");
+      this._dirty = true; // the room catches up with the lamp now
+      this._dlSuppressClick = true; // the slide isn't a tap
+      if (g.v <= 0) this._call("light", "turn_off", { entity_id: g.e });
+      else this._call("light", "turn_on", { entity_id: g.e, brightness_pct: g.v });
+      if (navigator.vibrate) navigator.vibrate(8);
+    };
+    dl.addEventListener("pointerup", end);
+    dl.addEventListener("pointercancel", end);
+  }
+
+  /** Press and hold a device (or the Arrange chip) to arrange; then drag devices anywhere. */
+  _dlWireArrange(dl) {
+    let hold = null;
+    this._dlHoldCancel = () => { if (hold) { clearTimeout(hold.t); hold = null; } };
+    dl.addEventListener("pointerdown", (e) => {
+      const tile = e.target.closest(".dl-rows .dl-r");
+      if (!tile || !this._dlOpen || !this._dlCompact() || e.target.closest(".dl-rm")) return;
+      if (this._dlEdit) return this._dlStartDrag(e, tile);
+      // a long press enters arrange mode and picks the device up straight away
+      clearTimeout(hold?.t);
+      const h = { x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY, id: e.pointerId };
+      h.t = setTimeout(() => requestAnimationFrame(() => {
+        // finger movements are delivered once per frame: wait for this frame's so a slide that has already
+        // started (e.g. dimming a light's card on a slow tablet) isn't mistaken for a long press
+        if (hold !== h || this._dlSlide?.started) return;
+        hold = null;
+        this._dlSuppressClick = true;
+        this._dlSetEdit(true);
+        const again = dl.querySelector(`.dl-rows .dl-r[data-e="${CSS.escape(tile.dataset.e)}"]`);
+        if (again) this._dlStartDrag({ clientX: h.x, clientY: h.y, pointerId: h.id }, again);
+      }), 450);
+      hold = h;
+    });
+    dl.addEventListener("pointermove", (e) => {
+      if (hold) {
+        hold.x = e.clientX;
+        hold.y = e.clientY;
+        if (Math.hypot(hold.x - hold.x0, hold.y - hold.y0) > 8) { clearTimeout(hold.t); hold = null; } // it's a scroll
+      }
+      if (this._dlDrag) this._dlDragMove(e);
+    });
+    const end = (e) => {
+      if (hold) { clearTimeout(hold.t); hold = null; }
+      if (this._dlDrag) this._dlDragEnd(e);
+      // a long press swallows its own click; if that click never comes (you dragged away), don't swallow the next one
+      setTimeout(() => (this._dlSuppressClick = false), 0);
+    };
+    dl.addEventListener("pointerup", end);
+    dl.addEventListener("pointercancel", end);
+  }
+
+  _dlStartDrag(e, tile) {
+    const dl = this.shadowRoot.querySelector(".dl");
+    const r = tile.getBoundingClientRect(), d = dl.getBoundingClientRect();
+    const ghost = tile.cloneNode(true);
+    ghost.classList.add("ghost");
+    ghost.querySelector(".dl-rm")?.remove();
+    ghost.classList.remove("ph");
+    const wrap = this._wrap, wr = wrap.getBoundingClientRect();
+    const holder = document.createElement("div");
+    holder.className = `dl dl-float${dl.classList.contains("compact") ? " compact" : ""}`;
+    holder.setAttribute("aria-hidden", "true");
+    holder.style.cssText = `left:${r.left - wr.left}px;top:${r.top - wr.top}px;width:${r.width}px;height:${r.height}px;`;
+    holder.appendChild(ghost);
+    wrap.appendChild(holder);
+    this._dlDrag = {
+      e: tile.dataset.e, ghost, holder, x0: e.clientX, y0: e.clientY, left: r.left - d.left, top: r.top - d.top,
+      layout: this._dlLayout(this._dlData), targetKey: null, pending: null, raf: 0,
+    };
+    tile.classList.add("ph");
+    this._dlGeo = null; // measured afresh on the first move
+    dl.classList.add("dragging");
+    try { dl.setPointerCapture(e.pointerId); } catch (err) {}
+    if (navigator.vibrate) navigator.vibrate(10);
+  }
+
+  _dlDragMove(e) {
+    const g = this._dlDrag;
+    g.pending = { x: e.clientX, y: e.clientY };
+    // pointer speed from the events' own timestamps (px per ms), for the lifted card's motion blur
+    if (g.et != null) g.vel = (g.vel || 0) * 0.5 + (Math.hypot(e.clientX - g.ex, e.clientY - g.ey) / Math.max(4, e.timeStamp - g.et)) * 0.5;
+    g.ex = e.clientX; g.ey = e.clientY; g.et = e.timeStamp;
+    if (!g.raf) g.raf = requestAnimationFrame(() => this._dlDragFrame());
+  }
+
+  _dlDragFrame() {
+    const g = this._dlDrag;
+    if (!g) return;
+    g.raf = 0;
+    const { x, y } = g.pending;
+    g.ghost.style.transform = `translate3d(${x - g.x0}px, ${y - g.y0}px, 0) scale(1.05)`;
+    this._dlMotionBlur(g, x, y);
+    // keep scrolling when you drag near the top or bottom of the list
+    const box = this.shadowRoot.querySelector(".dl-rows"), br = box.getBoundingClientRect();
+    if (y < br.top + 24) box.scrollTop -= 8;
+    else if (y > br.bottom - 24) box.scrollTop += 8;
+    const t = this._dlDropTarget(g.layout, g.e, x, y);
+    const key = JSON.stringify(t);
+    if (key === g.targetKey) { g.cand = null; return; }
+    // a new spot has to hold for a moment before the others move: skimming over a border doesn't make them twitch
+    const now = performance.now();
+    if (g.cand !== key) { g.cand = key; g.candT = now; }
+    if (now - g.candT < 90) {
+      clearTimeout(g.candTimer);
+      g.candTimer = setTimeout(() => { if (this._dlDrag === g && !g.raf) g.raf = requestAnimationFrame(() => this._dlDragFrame()); }, 100);
+      return;
+    }
+    const next = this._dlMove(g.layout, g.e, t);
+    const sig = (l) => JSON.stringify(l.map((r) => r.map((q) => q.i)));
+    // moving the tile reshapes the rows around it, which can put the pointer over the spot it just left: going
+    // straight back to the previous layout needs a real move of the pointer (~18 px), not the reshuffle itself
+    if (g.prevSig && sig(next) === g.prevSig && Math.hypot(x - g.sx, y - g.sy) < 18) return;
+    g.cand = null;
+    g.targetKey = key;
+    if (sig(next) !== sig(g.layout)) { g.prevSig = sig(g.layout); g.sx = x; g.sy = y; }
+    if (JSON.stringify(next.map((l) => l.map((r) => r.i))) === JSON.stringify(g.layout.map((l) => l.map((r) => r.i)))) return;
+    g.layout = next;
+    this._dlReflow(next); // the others make room: they slide over and resize to share the row
+  }
+
+  /** The lifted card blurs with its speed (like motion blur) and sharpens again as it slows down or stops. */
+  _dlMotionBlur(g, x, y) {
+    if (this._reducedMotion || (x === g.lx && y === g.ly)) return; // re-checks at the same spot aren't motion
+    g.lx = x; g.ly = y;
+    g.blur = (g.blur || 0) * 0.5 + Math.min(4, (g.vel || 0) * 2.4) * 0.5;
+    const set = (b) => {
+      g.ghost.style.filter = b > 0.4 ? `blur(${b.toFixed(2)}px)` : "";
+      g.ghost.style.opacity = b > 0.4 ? String((0.96 - b * 0.05).toFixed(3)) : "";
+    };
+    set(g.blur);
+    clearTimeout(g.stillT);
+    g.stillT = setTimeout(() => { if (this._dlDrag === g) { g.blur = 0; g.vel = 0; set(0); } }, 90); // stopped: sharp again
+  }
+
+  _dlDragEnd() {
+    const g = this._dlDrag;
+    this._dlDrag = null;
+    if (g.raf) cancelAnimationFrame(g.raf);
+    clearTimeout(g.candTimer);
+    clearTimeout(g.stillT);
+    g.ghost.style.filter = g.ghost.style.opacity = "";
+    this._dlGeo = null;
+    const dl = this.shadowRoot.querySelector(".dl");
+    dl.classList.remove("dragging");
+    const ph = dl.querySelector(`.dl-rows .dl-r[data-e="${CSS.escape(g.e)}"]`);
+    this._dlSaveLayout(g.layout);
+    this._dlShape = null;
+    if (ph && !this._reducedMotion) {
+      // the picked-up tile settles into its new place (one small element, so animating its box is cheap)
+      const a = g.ghost.getBoundingClientRect(), b = ph.getBoundingClientRect(), d = g.holder.getBoundingClientRect();
+      g.ghost.style.cssText = `left:${a.left - d.left}px;top:${a.top - d.top}px;width:${a.width}px;height:${a.height}px;transform:none;`;
+      const anim = g.ghost.animate(
+        [{ left: `${a.left - d.left}px`, top: `${a.top - d.top}px`, width: `${a.width}px`, height: `${a.height}px` },
+         { left: `${b.left - d.left}px`, top: `${b.top - d.top}px`, width: `${b.width}px`, height: `${b.height}px` }],
+        { duration: 200, easing: "cubic-bezier(.25,.8,.25,1)", fill: "forwards" });
+      anim.onfinish = () => { g.holder.remove(); ph.classList.remove("ph"); };
+    } else {
+      g.holder.remove();
+      ph?.classList.remove("ph");
+    }
+    if (navigator.vibrate) navigator.vibrate(8);
+  }
+
+  /* ------------------------------------------------------------ light height fade */
+
+  /**
+   * `light_reach: 0.85` makes a light fade out gradually up the walls, reaching zero at 85% of the
+   * wall height, like a table lamp lighting a room without reaching the ceiling.
+   * Done by patching the point-light loop of every material with a per-light world-height fade.
+   */
+  /** The per-light fade list mirrors the scene's point lights; refreshed whenever a light is added or removed. */
+  _refreshFade() {
+    if (!this._fadeUniform) return;
+    // three.js uploads point lights in scene order (shadow-casting ones first); mirror that order
+    const pls = [];
+    this._scene.traverse((o) => o.isPointLight && pls.push(o));
+    pls.sort((a, b) => (b.castShadow ? 1 : 0) - (a.castShadow ? 1 : 0));
+    const none = new THREE.Vector2(1e6, 1e6 + 1);
+    this._fadeUniform.value = pls.map((l) => l.userData.fade || none);
+  }
+
+  _setupLightFade() {
+    const faded = this._bindings.filter((b) => b.cfg.light_reach != null && b.lights.length);
+    if (!faded.length || !this._root) return;
+
+    // wall height: the top of the walls if the model has them, otherwise the model's height
+    const wallBox = this._walls?.length ? this._boxOf(this._walls.flatMap((w) => w.meshes)) : this._boxOf([this._root]);
+    const floorY = this._boxOf([this._root]).min.y;
+    const wallH = wallBox.max.y - floorY;
+    for (const b of faded) {
+      for (const light of b.lights) {
+        const top = floorY + wallH * Number(b.cfg.light_reach);
+        const start = b.cfg.light_fade_start != null ? floorY + wallH * Number(b.cfg.light_fade_start) : light.position.y;
+        light.userData.fade = new THREE.Vector2(Math.min(start, top - 0.01), top);
+      }
+    }
+
+    this._fadeUniform = { value: [] };
+    this._refreshFade();
+
+    const uni = this._fadeUniform;
+    const chunk = THREE.ShaderChunk.lights_fragment_begin.replace(
+      "getPointLightInfo( pointLight, geometryPosition, directLight );",
+      "getPointLightInfo( pointLight, geometryPosition, directLight );\n\t\tdirectLight.color *= 1.0 - smoothstep( h3dFade[ i ].x, h3dFade[ i ].y, vH3dY );"
+    );
+    const patch = (mat) => {
+      if (!mat || mat.userData.h3dFade || !("lights" in mat) || mat.lights === false || mat.isShaderMaterial) return;
+      if (mat.isMeshBasicMaterial) return;
+      mat.userData.h3dFade = true;
+      const prev = mat.onBeforeCompile;
+      mat.onBeforeCompile = (shader, renderer) => {
+        prev?.call(mat, shader, renderer);
+        shader.uniforms.h3dFade = uni;
+        shader.vertexShader = shader.vertexShader
+          .replace("#include <common>", "#include <common>\nvarying float vH3dY;")
+          .replace("#include <project_vertex>", "#include <project_vertex>\nvH3dY = ( modelMatrix * vec4( transformed, 1.0 ) ).y;");
+        shader.fragmentShader = shader.fragmentShader
+          .replace(
+            "#include <common>",
+            "#include <common>\nvarying float vH3dY;\n#if NUM_POINT_LIGHTS > 0\nuniform vec2 h3dFade[ NUM_POINT_LIGHTS ];\n#endif"
+          )
+          .replace("#include <lights_fragment_begin>", chunk);
+      };
+      const prevKey = mat.customProgramCacheKey?.bind(mat);
+      mat.customProgramCacheKey = () => (prevKey ? prevKey() : "") + "|h3dfade";
+      mat.needsUpdate = true;
+    };
+    this._root.traverse((o) => {
+      if (!o.isMesh) return;
+      (Array.isArray(o.material) ? o.material : [o.material]).forEach(patch);
+    });
+    this._dirty = true;
+  }
+
+  /* ------------------------------------------------------------ walls */
+
+  /**
+   * Walls between the camera and the middle of the room fade out, so you can look into rooms
+   * with full-height walls. Sweet Home 3D names walls wall_<n>_<face>; other models can set wall_pattern.
+   */
+  _setupWalls() {
+    this._walls = [];
+    const mode = this._config.walls ?? "auto";
+    if (mode === false || mode === "off" || !this._root) return;
+    const pat = new RegExp(this._config.wall_pattern || "^wall_(\\d+)_", "i");
+    const groups = new Map();
+    this._root.traverse((o) => {
+      if (!o.isMesh || !o.visible) return;
+      const m = o.name.match(pat) || (o.parent && o.parent !== this._root ? o.parent.name.match(pat) : null);
+      if (!m) return;
+      const key = m[1] ?? m[0];
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(o);
+    });
+    const shadows = !!this._config.shadows;
+    for (const meshes of groups.values()) {
+      const box = this._boxOf(meshes);
+      const c = box.getCenter(new THREE.Vector3());
+      const len = Math.hypot(c.x, c.z);
+      if (len < 0.3) continue; // a wall through the middle has no "outside"
+      const mats = [];
+      for (const mesh of meshes) {
+        const cloned = Array.isArray(mesh.material) ? mesh.material.map((x) => x.clone()) : mesh.material.clone();
+        mesh.material = cloned;
+        for (const mat of Array.isArray(cloned) ? cloned : [cloned]) {
+          mat.transparent = true;
+          mats.push(mat);
+        }
+      }
+      this._walls.push({ meshes, mats, dir: { x: c.x / len, z: c.z / len }, cur: 1, target: 1, shadows });
+    }
+  }
+
+  _updateWallTargets() {
+    if (!this._walls?.length) return;
+    const cx = this._camera.position.x - this._target.x;
+    const cz = this._camera.position.z - this._target.z;
+    const cl = Math.hypot(cx, cz) || 1;
+    const topDown = this._el > 72 * DEG;
+    const faded = this._config.wall_opacity ?? 0.08;
+    for (const w of this._walls) {
+      const d = (w.dir.x * cx + w.dir.z * cz) / cl;
+      w.target = !topDown && d > 0.2 ? faded : 1;
+    }
+  }
+
+  _buildViewButtons() {
+    const holder = this.shadowRoot.querySelector(".views");
+    holder.innerHTML = "";
+    for (const v of this._config.views || []) {
+      const b = document.createElement("button");
+      b.textContent = v.name || "View";
+      b.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this._goToView(v);
+      });
+      holder.appendChild(b);
+    }
+  }
+
+  /* ------------------------------------------------------------ state */
+
+  _stateOf(id) {
+    return this._hass?.states?.[id] || this._local[id] || null;
+  }
+
+  _isOn(st, id, cfg) {
+    if (!st) return false;
+    if (cfg?.on_state != null) {
+      const list = Array.isArray(cfg.on_state) ? cfg.on_state : [cfg.on_state];
+      return list.map(String).includes(st.state);
+    }
+    if (id.startsWith("media_player.")) return !MEDIA_OFF.has(st.state);
+    if (id.startsWith("vacuum.")) return st.state === "cleaning" || st.state === "returning";
+    if (id.startsWith("cover.")) return st.state === "open" || st.state === "opening" || (st.attributes?.current_position ?? 0) > 0;
+    return ON_STATES.has(st.state);
+  }
+
+  _applyStates() {
+    if (!this._bindings.length) return;
+    const c = this._config;
+    for (const b of this._bindings) {
+      const st = this._stateOf(b.cfg.entity);
+      const isMedia = b.isMedia;
+      const on = this._isOn(st, b.cfg.entity, b.cfg);
+      if (b.door) b.door.target = on ? 1 : 0;
+      if (b.cover) {
+        const p = st?.attributes?.current_position;
+        this._coverReport(b.cover, p != null ? Math.min(Math.max(p / 100, 0), 1) : on ? 1 : 0, st?.state);
+      }
+      if (b.cfg.network) this._recordNet(b);
+      if (b.rotate) b.rotate.on = on && st?.attributes?.oscillating !== false;
+      if (b.vac) this._vacReport(b, st);
+      if (b.airflow) {
+        const af = b.airflow;
+        af.on = on;
+        const pctv = st?.attributes?.percentage;
+        af.speed = pctv != null ? Math.min(Math.max(pctv / 100, 0.1), 1) : 0.5;
+        af.reverse = st?.attributes?.direction === "reverse";
+        af.heat = on && !!b.cfg.climate && this._isHeating(this._stateOf(b.cfg.climate));
+      }
+      if (b.heat) {
+        const heating = on && this._isHeating(this._stateOf(b.cfg.climate));
+        if (heating !== b.heat.on) {
+          b.heat.on = heating;
+          for (const m of b.heat.mats) {
+            if (heating) m.mat.emissive.set(0xff8a4c);
+            else m.mat.emissive.copy(m.emissive);
+            m.mat.emissiveIntensity = heating ? 0.06 * (b.cfg.heat_glow ?? 1) : m.intensity;
+          }
+          b.heat.light.intensity = heating ? 1.6 * (b.cfg.heat_glow ?? 1) : 0;
+        }
+      }
+      const bri = st?.attributes?.brightness;
+      let factor = on ? (bri == null ? 1 : 0.2 + (0.8 * bri) / 255) : 0;
+      if (isMedia && on) factor = st.state === "playing" ? 1 : 0.45; // paused / idle: dim screen
+      const rgb = b.isScreen ? null : st?.attributes?.rgb_color;
+      const hasPicture = b.mats.some((m) => m.map);
+      const color = rgb
+        ? new THREE.Color(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255)
+        : new THREE.Color(b.cfg.color || (b.isScreen ? (hasPicture ? "#ffffff" : "#8fb0ff") : c.glow_color));
+      b.fx = isMedia && on && st.state === "playing" && b.cfg.flicker !== false && !this._reducedMotion;
+      if (b.cfg.entity.startsWith("light.") && (!b.baseColor || !b.baseColor.equals(color) || b.baseFactor !== factor)) this._bgKey = (this._bgKey || 0) + 1;
+      b.baseColor = color;
+      b.baseFactor = factor;
+      // the same colour as plain sRGB for the background glows (THREE.Color may hold it in linear space)
+      b.baseCss = rgb ? `rgb(${rgb.join(",")})` : b.cfg.color || (b.isScreen ? "#ffffff" : c.glow_color) || "#ffb56b";
+      if (b.hint) {
+        // offline (unavailable / missing in Home Assistant): every device's dot pulses red.
+        // `alert_when_off: true` also does it while the entity is simply off (e.g. internet down).
+        const offline = this._config.offline_alert !== false && !!this._hass && b.cfg.offline_alert !== false && (!st || st.state === "unavailable");
+        const alert = offline || (!!b.cfg.alert_when_off && !!st && !on && st.state !== "unavailable" && st.state !== "unknown") ||
+          (b.cfg.entity.startsWith("vacuum.") && st?.state === "error");
+        if (alert !== b.alert) this._dirty = true;
+        const wasAlert = b.alert === true;
+        const wasOffline = b.offline === true;
+        b.alert = alert;
+        b.offline = offline;
+        if (alert) this._clearBack(b);
+        else if (wasAlert) this._showBack(b, wasOffline, st);
+        // when it went offline / off: Home Assistant's last_changed, or when this card first saw it
+        let sinceText = "";
+        if (alert) {
+          const ts = st?.last_changed ? new Date(st.last_changed) : (b.alertSeen ||= new Date());
+          const label = !st ? "Not found in Home Assistant" : offline ? "Offline" : st.state === "error" && b.cfg.entity.startsWith("vacuum.") ? "Needs help" : b.cfg.alert_text || "Off";
+          sinceText = st ? `${label} since ${this._fmtSince(ts)}` : label;
+        } else b.alertSeen = null;
+        b.sinceText = sinceText;
+        const sinceEl = b.hint.querySelector(".since");
+        if (sinceEl && !b.back && sinceEl.textContent !== sinceText) sinceEl.textContent = sinceText;
+        b.hint.classList.toggle("on", on && !alert);
+        b.hint.classList.toggle("alert", alert);
+      }
+      const key = `${on}|${factor.toFixed(3)}|${color.getHexString()}`;
+      if (key === b.key) continue;
+      const first = b.key == null;
+      b.key = key;
+      const mats = b.mats.map((m) => {
+        if (on) return { c: color.clone(), i: b.isScreen ? 0.25 + 0.75 * factor : 0.4 + 1.6 * factor };
+        // status LEDs: e.g. red when the internet is down
+        if (b.cfg.off_color && st && st.state !== "unavailable") return { c: new THREE.Color(b.cfg.off_color), i: 1.2 };
+        return { c: m.emissive.clone(), i: m.intensity };
+      });
+      const n = b.lights.length;
+      const base = (b.cfg.intensity ?? (b.isScreen ? (hasPicture ? 3 : 6) : 10)) * (n > 1 ? 1.6 / n : 1);
+      this._lightFadeTo(b, mats, b.lights.map(() => ({ c: color.clone(), i: on ? base * factor : 0 })), on, first);
+    }
+    this._fxBindings = this._bindings.filter((b) => b.fx);
+    this._renderDeviceList();
+    this._renderMenu();
+    this._dirty = true;
+  }
+
+  /**
+   * A lamp (or screen) eases to its new glow and light instead of snapping: up in ~0.4 s when it comes on, and a
+   * little slower, ~0.65 s, when it goes off, like a bulb's afterglow. Brightness and colour changes glide the same
+   * way, from wherever the light is at that moment, so dimming with the slider stays smooth.
+   */
+  _lightFadeTo(b, mats, lights, on, instant) {
+    const apply = () => {
+      b.mats.forEach((m, i) => { m.mat.emissive.copy(mats[i].c); m.mat.emissiveIntensity = mats[i].i; });
+      b.lights.forEach((l, i) => { l.color.copy(lights[i].c); l.intensity = lights[i].i; });
+    };
+    this._lfades = this._lfades || new Map();
+    if (instant || this._reducedMotion || b.fx) { this._lfades.delete(b); apply(); return; }
+    const dur = on ? 380 : 650;
+    this._lfades.set(b, {
+      t0: performance.now(), dur,
+      mats: b.mats.map((m, i) => ({ m, fc: m.mat.emissive.clone(), fi: m.mat.emissiveIntensity, tc: mats[i].c, ti: mats[i].i })),
+      // a light coming up from dark takes its new colour straight away; one going dark keeps its colour as it fades
+      lights: b.lights.map((l, i) => ({ l, fc: l.intensity > 0 ? l.color.clone() : lights[i].c.clone(), fi: l.intensity,
+        tc: lights[i].i > 0 ? lights[i].c : l.color.clone(), ti: lights[i].i })),
+    });
+    this._dirty = true;
+  }
+
+  _stepLightFades(now) {
+    if (!this._lfades?.size) return false;
+    for (const [b, f] of this._lfades) {
+      if (b.fx) { this._lfades.delete(b); continue; } // a playing TV's flicker drives its light
+      const k = Math.min(1, Math.max(0, (now - f.t0) / f.dur));
+      const e = 1 - Math.pow(1 - k, 3); // quick at first, settling gently
+      for (const x of f.mats) { x.m.mat.emissive.copy(x.fc).lerp(x.tc, e); x.m.mat.emissiveIntensity = x.fi + (x.ti - x.fi) * e; }
+      for (const x of f.lights) { x.l.color.copy(x.fc).lerp(x.tc, e); x.l.intensity = x.fi + (x.ti - x.fi) * e; }
+      if (k >= 1) this._lfades.delete(b);
+    }
+    return true;
+  }
+
+  /* ------------------------------------------------------------ phone view */
+
+  /**
+   * Phone view (☰ → Phone view): one device at a time, like a phone app. The camera frames the device, a round
+   * button sits at the bottom (power, or the device's own icon), and tapping it grows the card up out of it.
+   * Swipe left / right on the room (or the arrows, or the arrow keys) for the next device. Remembered per screen.
+   */
+  _phonePref() {
+    try { return localStorage.getItem(`house3d-card:phone:${this._config.model || ""}`) === "1"; } catch (e) { return false; }
+  }
+
+  /**
+   * The order you swipe through: `phone_first:` devices, then the rest from left to right as seen from the start
+   * view, then `phone_last:` devices. Hidden devices are part of the order (so they keep their spot if you show
+   * them again) but are skipped.
+   */
+  _phoneOrder() {
+    const all = this._bindings.filter((b) => b.cfg.list !== false && this._menuEnabled(b) && b.objs?.length);
+    const ids = (v) => (Array.isArray(v) ? v : v ? [v] : []).map(String);
+    const first = ids(this._config.phone_first), last = ids(this._config.phone_last);
+    // left to right from the start view: project each device with the camera put at the start view for a moment
+    const keep = { az: this._az, el: this._el, dist: this._dist, target: this._target.clone() };
+    this._az = this._config.start_azimuth * DEG; this._el = this._config.start_elevation * DEG;
+    this._dist = this._home.dist; this._target.copy(this._home.target);
+    this._updateCamera();
+    const x = new Map(all.map((b) => [b, this._boxOf(b.objs).getCenter(new THREE.Vector3()).project(this._camera).x]));
+    Object.assign(this, { _az: keep.az, _el: keep.el, _dist: keep.dist }); this._target.copy(keep.target);
+    this._updateCamera();
+    const rank = (b) => (first.includes(b.cfg.entity) ? -1000 + first.indexOf(b.cfg.entity) : last.includes(b.cfg.entity) ? 1000 + last.indexOf(b.cfg.entity) : 0);
+    return all.sort((p, q) => rank(p) - rank(q) || x.get(p) - x.get(q));
+  }
+
+  _phoneList() {
+    return this._phoneOrder().filter((b) => !this._isHidden(b.cfg.entity));
+  }
+
+  _setPhone(on) {
+    this._phone = on;
+    try { localStorage.setItem(`house3d-card:phone:${this._config.model || ""}`, on ? "1" : "0"); } catch (e) {}
+    this._wrap.classList.toggle("phone", on);
+    clearTimeout(this._returnTimer);
+    if (on) {
+      if (this._dlOpen) this._closeDeviceList();
+      if (!this._phoneBar) {
+        const bar = (this._phoneBar = document.createElement("div"));
+        bar.className = "phb";
+        bar.innerHTML = `<button class="phb-a" data-ph="-1" aria-label="Previous device">${svg("chev")}</button>
+          <div class="phb-t"><b></b><span class="phb-d" aria-hidden="true"></span></div>
+          <button class="phb-a" data-ph="1" aria-label="Next device">${svg("chev")}</button>`;
+        const x = (this._phoneX = document.createElement("button"));
+        x.className = "phx";
+        x.innerHTML = `${svg("close")}<span>Exit</span>`;
+        x.setAttribute("aria-label", "Exit phone view");
+        for (const el of [bar, x]) {
+          el.addEventListener("pointerdown", (e) => e.stopPropagation());
+          this._wrap.appendChild(el);
+        }
+        bar.addEventListener("click", (e) => { const a = e.target.closest("[data-ph]"); if (a) this._phoneStep(Number(a.dataset.ph)); });
+        x.addEventListener("click", () => this._setPhone(false));
+        this._wrap.addEventListener("keydown", (e) => {
+          if (!this._phone || e.target.closest?.(".menu, .dl")) return;
+          if (e.key === "ArrowRight") { e.preventDefault(); this._phoneStep(1); }
+          if (e.key === "ArrowLeft") { e.preventDefault(); this._phoneStep(-1); }
+        });
+      }
+      this._phoneBar.hidden = this._phoneX.hidden = false;
+      const list = this._phoneList();
+      const cur = this._menuFor && list.indexOf(this._menuFor);
+      this._phoneGo(cur >= 0 ? cur : this._phoneIdx || 0);
+    } else {
+      if (this._phoneBar) this._phoneBar.hidden = this._phoneX.hidden = true;
+      this._phoneCollapsed = false;
+      this._closeMenu();
+      this._goHome(900);
+      this._scheduleReturn();
+    }
+    this._dirty = true;
+  }
+
+  /** Fly to device i (in the list without hidden devices) and show its round button at the bottom. */
+  _phoneGo(i) {
+    const list = this._phoneList();
+    if (!list.length) return;
+    const n = list.length;
+    i = ((i % n) + n) % n;
+    const b = list[i];
+    this._phoneIdx = i;
+    this._phoneB = b;
+    this._phoneCollapsed = true;
+    if (this._menuFor && this._menuFor !== b) this._closeMenu();
+    // frame it: the whole object in view, sitting in the upper part (the button and the card use the lower part)
+    const box = this._boxOf(b.objs), target = box.getCenter(new THREE.Vector3());
+    const r = Math.max(0.15, box.getSize(new THREE.Vector3()).length() / 2);
+    const vf = (this._camera.fov * Math.PI) / 360, aspect = this._wrap.clientWidth / Math.max(1, this._wrap.clientHeight);
+    const hf = Math.atan(Math.tan(vf) * aspect);
+    const dist = THREE.MathUtils.clamp((r / Math.sin(Math.min(vf, hf))) * 1.5, this._minDist * 0.4, this._maxDist);
+    target.y -= r * 0.45;
+    this._animateTo({ target, dist, el: 28 * DEG }, 800, easeInOutCubic);
+    this._openMenu(b);
+    this._phoneBarUpdate();
+  }
+
+  _phoneStep(d) {
+    if (!this._phone) return;
+    // step from the device on screen by its spot in the whole order (it may have been hidden since), skipping hidden ones
+    const order = this._phoneOrder(), list = this._phoneList();
+    if (!list.length) return;
+    let k = Math.max(0, order.indexOf(this._phoneB));
+    for (let n = 0; n < order.length; n++) {
+      k = (k + d + order.length) % order.length;
+      if (list.includes(order[k])) break;
+    }
+    this._phoneGo(list.indexOf(order[k]));
+    if (navigator.vibrate) navigator.vibrate(8);
+  }
+
+  _phoneOpen(open) {
+    this._phoneCollapsed = !open;
+    this._renderMenu(true);
+    this._phoneBarUpdate();
+  }
+
+  _phoneBarUpdate() {
+    const bar = this._phoneBar;
+    if (!bar) return;
+    const list = this._phoneList(), b = this._phoneB && list.includes(this._phoneB) ? this._phoneB : list[this._phoneIdx || 0];
+    this._phoneIdx = Math.max(0, list.indexOf(b));
+    bar.classList.toggle("under", !this._phoneCollapsed); // the open card covers it
+    const name = b ? b.cfg.name || this._stateOf(b.cfg.entity)?.attributes?.friendly_name || b.cfg.entity : "";
+    bar.querySelector("b").textContent = name;
+    bar.querySelector(".phb-d").innerHTML = list.length > 12
+      ? `${(this._phoneIdx || 0) + 1} / ${list.length}`
+      : list.map((_, k) => `<i class="${k === this._phoneIdx ? "on" : ""}"></i>`).join("");
+  }
+
+  /** Phone view: the round button sits at the bottom centre; the open card rises from it, as tall as there's room. */
+  _phonePlaceMenu() {
+    const m = this._menu, w = this._wrap.clientWidth, h = this._wrap.clientHeight;
+    m.style.visibility = "";
+    m.classList.remove("below");
+    const B = h - 14, cy = B - 36; // the card's bottom edge, and the button's centre
+    if (m.classList.contains("mini")) {
+      if (m.style.maxHeight) m.style.maxHeight = "";
+      m.style.left = `${(w - m.offsetWidth) / 2}px`;
+      m.style.top = `${cy - m.offsetHeight / 2}px`;
+      return;
+    }
+    const natural = m.scrollHeight, cap = B - 10;
+    const want = natural > cap ? `${Math.round(cap)}px` : "";
+    if (m.style.maxHeight !== want) m.style.maxHeight = want;
+    m.style.left = `${Math.max(8, (w - m.offsetWidth) / 2)}px`;
+    m.style.top = `${B - m.offsetHeight}px`;
+  }
+
+  _isNight() {
+    const mode = this._forcedNight ?? this._config.night_mode;
+    if (mode === true || mode === "on") return true;
+    if (mode === false || mode === "off") return false;
+    return this._hass?.states?.["sun.sun"]?.state === "below_horizon";
+  }
+
+  _applyNight() {
+    if (!this._hemi) return;
+    const night = this._isNight();
+    if (night === this._night) return;
+    this._night = night;
+    this._hemi.intensity = night ? 0.3 : 1.4;
+    this._hemi.color.set(night ? 0x8fa6ff : 0xffffff);
+    this._sun.intensity = night ? 0.08 : 2.0;
+    this._sun.color.set(night ? 0x9fb4ff : 0xfff2e0);
+    if (this._bg) this._bg.dirty = true;
+    this._dirty = true;
+  }
+
+  /** Public helper (used by the demo page). */
+  setNightMode(mode) {
+    this._forcedNight = mode;
+    this._night = undefined;
+    this._applyNight();
+  }
+
+  /* ------------------------------------------------------------ actions */
+
+  _menuEnabled(b) {
+    const net = !!(b.cfg.network || b.cfg.presence);
+    return this._config.menu !== false && b.cfg.menu !== false && (net || !b.readOnly) && !ONE_SHOT.has(b.cfg.entity.split(".")[0]);
+  }
+
+  /** Tap on a device in the model. */
+  _tap(b) {
+    if (this._phone) {
+      // phone view: tapping a device goes to it (or opens its card if it's the one on screen)
+      const i = this._phoneList().indexOf(b);
+      if (i >= 0) { if (i !== this._phoneIdx) this._phoneGo(i); else this._phoneOpen(true); return; }
+    }
+    const isCam = b.cfg.entity.startsWith("camera.");
+    const isNet = !!(b.cfg.network || b.cfg.presence);
+    const action = b.cfg.tap_action || (isCam || isNet ? "menu" : b.readOnly ? "more-info" : "toggle");
+    if (action === "more-info") return this._moreInfo(b);
+    if (action === "menu") return this._openMenu(b);
+    if (action === "none") return;
+    const wasOn = this._isOn(this._stateOf(b.cfg.entity), b.cfg.entity, b.cfg);
+    this._toggleEntity(b);
+    if (!wasOn && this._menuEnabled(b)) this._openMenu(b);
+    else if (wasOn && this._menuFor === b) this._closeMenu();
+    if (navigator.vibrate) navigator.vibrate(15);
+  }
+
+  /** Long-press on a device. */
+  _longPress(b) {
+    if (this._menuEnabled(b)) this._openMenu(b);
+    else this._moreInfo(b);
+    if (navigator.vibrate) navigator.vibrate(25);
+  }
+
+  _toggleEntity(b) {
+    const id = b.cfg.entity;
+    const domain = id.split(".")[0];
+    let [d, s] = ["homeassistant", "toggle"];
+    if (domain === "scene" || domain === "script") [d, s] = [domain, "turn_on"];
+    else if (domain === "button" || domain === "input_button") [d, s] = [domain, "press"];
+    this._call(d, s, { entity_id: id });
+  }
+
+  /** Call a service, or simulate it for entities that don't exist in HA (demo house). */
+  _call(domain, service, data) {
+    const id = data.entity_id;
+    if (this._hass?.states?.[id]) {
+      this._hass.callService(domain, service, data);
+      return;
+    }
+    const st = (this._local[id] = this._local[id] || { state: "off", attributes: {} });
+    const a = (st.attributes = { ...st.attributes });
+    const on = this._isOn(st, id);
+    if (service === "toggle") st.state = on ? "off" : id.startsWith("media_player.") ? "playing" : "on";
+    else if (service === "set_percentage") a.percentage = data.percentage;
+    else if (service === "oscillate") a.oscillating = data.oscillating;
+    else if (service === "set_direction") a.direction = data.direction;
+    else if (service === "set_preset_mode") a.preset_mode = data.preset_mode;
+    else if (service === "set_hvac_mode") st.state = data.hvac_mode;
+    else if (service === "set_temperature") a.temperature = data.temperature;
+    else if (service === "media_play_pause") st.state = st.state === "playing" ? "paused" : "playing";
+    else if (service === "volume_set") a.volume_level = data.volume_level;
+    else if (id.startsWith("vacuum.")) {
+      if (service === "start") st.state = "cleaning";
+      else if (service === "pause") st.state = "paused";
+      else if (service === "return_to_base") st.state = "returning";
+      else if (service === "set_fan_speed") a.fan_speed = data.fan_speed;
+    }
+    else if (service === "turn_off") st.state = "off";
+    else if (service === "turn_on") {
+      st.state = "on";
+      if (data.brightness_pct != null) a.brightness = Math.round((data.brightness_pct / 100) * 255);
+      if (data.rgb_color) {
+        a.rgb_color = data.rgb_color;
+        a.color_mode = "hs";
+        delete a.color_temp_kelvin;
+      }
+      if (data.color_temp_kelvin) {
+        a.color_temp_kelvin = data.color_temp_kelvin;
+        a.rgb_color = kelvinToRgb(data.color_temp_kelvin);
+        a.color_mode = "color_temp";
+      }
+    }
+    if (st.state === "on" && a.brightness == null && id.startsWith("light.")) a.brightness = 230;
+    if (id.startsWith("media_player.") && a.volume_level == null) a.volume_level = 0.3;
+    this._applyStates();
+  }
+
+  /**
+   * Reconnected: the tag turns green ("Back online · 15:21"), stays 2.5 s, then floats away.
+   * `back_text` changes the wording for alert_when_off devices, e.g. "Internet back".
+   */
+  _showBack(b, wasOffline, st) {
+    if (!b.hint) return;
+    this._clearBack(b);
+    const ts = st?.last_changed ? new Date(st.last_changed) : new Date();
+    const label = wasOffline ? "Back online" : b.cfg.back_text || "Back online";
+    const el = b.hint.querySelector(".since");
+    if (el) el.textContent = `${label} · ${this._fmtSince(ts)}`;
+    b.back = true;
+    b.hint.classList.add("back");
+    this._dirty = true;
+    const stay = Number(this._config.back_duration ?? 2.5) * 1000;
+    b.backTimers = [
+      setTimeout(() => b.hint.classList.add("leaving"), stay),
+      setTimeout(() => this._clearBack(b), stay + (this._reducedMotion ? 0 : 480)),
+    ];
+  }
+
+  _clearBack(b) {
+    (b.backTimers || []).forEach(clearTimeout);
+    b.backTimers = null;
+    if (!b.back) return;
+    b.back = false;
+    b.hint?.classList.remove("back", "leaving");
+    const el = b.hint?.querySelector(".since");
+    if (el && !b.alert) el.textContent = "";
+    this._dirty = true;
+  }
+
+  /** "14:32" today, "27 Sep 14:32" on another day (in Home Assistant's language). */
+  _fmtSince(d) {
+    if (!(d instanceof Date) || Number.isNaN(d.getTime())) return "–";
+    const lang = this._hass?.locale?.language || this._hass?.language || undefined;
+    const now = new Date();
+    const time = d.toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit" });
+    if (d.toDateString() === now.toDateString()) return time;
+    const sameYear = d.getFullYear() === now.getFullYear();
+    const date = d.toLocaleDateString(lang, { day: "numeric", month: "short", ...(sameYear ? {} : { year: "numeric" }) });
+    return `${date} ${time}`;
+  }
+
+  _isHeating(cl) {
+    if (!cl) return false;
+    return cl.state === "heat" || cl.attributes?.hvac_action === "heating";
+  }
+
+  _moreInfo(b) {
+    const ev = new Event("hass-more-info", { bubbles: true, composed: true });
+    ev.detail = { entityId: b.cfg.entity };
+    this.dispatchEvent(ev);
+  }
+
+  /* ------------------------------------------------------------ device menu */
+
+  /**
+   * Grow (or shrink) the panel from its old size to its new one, like the device list and the weather pill:
+   * the glass stretches from the power button out to the full panel, the button glides to its place in the
+   * corner, and the controls fade in once there's room for them.
+   */
+  _menuMorphFrom(r0, p0, mini) {
+    const m = this._menu;
+    this._menuPin = null;
+    this._positionMenu();
+    if (!mini && p0 && m.querySelector(".mf .pw")) {
+      // growing from the power button: the open card's button (at its bottom) takes the button's place, so the card
+      // grows up out of it; it keeps that spot relative to the device while the card is open, following it
+      this._menuPin = { b: this._menuFor, cx: p0.left + p0.width / 2, cy: p0.top + p0.height / 2 };
+      this._positionMenu();
+    }
+    const r1 = m.getBoundingClientRect();
+    const pw = m.querySelector(".pw");
+    const p1 = pw?.getBoundingClientRect(); // measured at the final size, before the panel starts from the old one
+    m.getAnimations().forEach((a) => a.cancel());
+    m.classList.remove("in");
+    m.classList.add("morph");
+    m.classList.toggle("grow", !mini);
+    this._menuMorph = true;
+    const ease = "cubic-bezier(.3,.9,.25,1)";
+    // go straight from the button to where the finished panel will sit (worked out up front, at its final size),
+    // so a tall panel never gets pushed against the edge or flipped below the device halfway through
+    const w = this._wrap.getBoundingClientRect();
+    const dur = mini ? 380 : Math.round(460 + Math.min(160, Math.abs(r1.height - r0.height) * 0.25));
+    const anim = m.animate(
+      [{ left: `${r0.left - w.left}px`, top: `${r0.top - w.top}px`, width: `${r0.width}px`, height: `${r0.height}px`, borderRadius: mini ? "24px" : "30px" },
+       { left: `${r1.left - w.left}px`, top: `${r1.top - w.top}px`, width: `${r1.width}px`, height: `${r1.height}px`, borderRadius: mini ? "30px" : "24px" }],
+      { duration: dur, easing: ease }
+    );
+    if (pw && p0 && p1) {
+      // the power button travels its own path on screen, from where it was to where it ends up (the same spot when
+      // switching on from it): each frame it's measured where the in-between layout puts it and nudged onto that
+      // path, so it never jumps while the card is still too small for its contents
+      const x0 = p0.left + p0.width / 2, y0 = p0.top + p0.height / 2, x1 = p1.left + p1.width / 2, y1 = p1.top + p1.height / 2;
+      const s0 = p0.width / (p1.width || p0.width);
+      pw.style.transition = "background .15s"; // its pressed-effect transform transition would make it lag its path
+      const follow = () => {
+        if (!m.classList.contains("morph") || !pw.isConnected) { pw.style.transform = pw.style.transition = ""; return; }
+        const pr = anim.effect?.getComputedTiming?.().progress;
+        const k = pr ?? (anim.playState === "finished" ? 1 : 0); // not started yet: still at the start
+        pw.style.transform = "";
+        const q = pw.getBoundingClientRect();
+        pw.style.transform = `translate(${(x0 + (x1 - x0) * k - (q.left + q.width / 2)).toFixed(1)}px, ${(y0 + (y1 - y0) * k - (q.top + q.height / 2)).toFixed(1)}px) scale(${(s0 + (1 - s0) * k).toFixed(3)})`;
+        requestAnimationFrame(follow);
+      };
+      follow();
+    }
+    anim.onfinish = anim.oncancel = () => {
+      m.classList.remove("morph", "grow");
+      this._menuMorph = false;
+      this._positionMenu();
+    };
+  }
+
+  _openMenu(b) {
+    if (!this._menuEnabled(b) || b.hiddenByUser) return;
+    const reopen = this._menuFor !== b || this._menu.hidden;
+    if (reopen && this._menuFor && this._menuFor !== b) this._stopCamera(this._menuFor);
+    if (reopen) { this._menuPin = null; this._menu.scrollTop = 0; }
+    if (reopen && b.cfg.entity.startsWith("camera.")) this._startCamera(b);
+    clearTimeout(this._menuOutT); // reopened while it was still closing
+    if (this._menu.classList.contains("out")) {
+      this._menu.classList.remove("out");
+      this._menu.hidden = true;
+    }
+    this._menu.classList.toggle("wide", b.cfg.entity.startsWith("camera."));
+    this._menuFor = b;
+    this._menu.hidden = false;
+    this._renderMenu(true);
+    if (reopen) {
+      this._menu.classList.remove("in");
+      void this._menu.offsetWidth;
+      this._menu.classList.add("in");
+    }
+    this._hideTip();
+    this._positionMenu();
+    this._dirty = true;
+  }
+
+  /* ------------------------------------------------------------ network panel */
+
+  _fmtNum(st, decimals = 0) {
+    if (!st || st.state === "unavailable" || st.state === "unknown") return "–";
+    const n = Number(st.state);
+    return Number.isNaN(n) ? st.state : n.toFixed(decimals);
+  }
+
+  _isPresent(st) {
+    if (!st) return false;
+    return ["home", "on", "connected", "online", "true"].includes(String(st.state).toLowerCase());
+  }
+
+  /** Internet status, speeds, client count and who's connected. Values are escaped via textContent later. */
+  _networkBody(b, st, on) {
+    const n = b.cfg.network || {};
+    const esc = (v) => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    const unitOf = (id, d) => esc(this._stateOf(id)?.attributes?.unit_of_measurement || d);
+    const clients = n.clients ? this._fmtNum(this._stateOf(n.clients)) : null;
+    let status = on ? "Online" : "Offline";
+    if (clients && clients !== "–") status += ` · ${clients} devices`;
+    let body = `<div class="net ${on ? "" : "down"}"><span class="dot"></span>${on ? "Internet connected" : "Internet down"}</div>`;
+    const cells = [];
+    if (n.download) cells.push(`<div class="aqc"><span class="aqn">${svg("down")} Down</span><b>${esc(this._fmtNum(this._stateOf(n.download), 0))}</b><small class="u">${unitOf(n.download, "Mbit/s")}</small></div>`);
+    if (n.upload) cells.push(`<div class="aqc"><span class="aqn">${svg("up")} Up</span><b>${esc(this._fmtNum(this._stateOf(n.upload), 0))}</b><small class="u">${unitOf(n.upload, "Mbit/s")}</small></div>`);
+    if (n.clients) cells.push(`<div class="aqc"><span class="aqn">${svg("devices")} Online</span><b>${esc(clients)}</b><small class="u">devices</small></div>`);
+    if ((n.download || n.upload) && b.cfg.graph !== false) {
+      const mins = Number(b.cfg.graph_minutes ?? 5);
+      const val = (id) => esc(this._fmtNum(this._stateOf(id), 0));
+      body += `<div class="hb"><div class="hbh"><span class="hbt">Throughput</span>
+          ${n.download ? `<span class="dn">${svg("down")}<b class="hbv" data-id="${esc(n.download)}">${val(n.download)}</b><small>Mbps</small></span>` : ""}
+          ${n.upload ? `<span class="upl">${svg("up")}<b class="hbv" data-id="${esc(n.upload)}">${val(n.upload)}</b><small>Mbps</small></span>` : ""}</div>
+        <canvas class="hbc" aria-hidden="true"></canvas>
+        <div class="hbl"><span>−${mins} min</span><span>now</span></div></div>`;
+    }
+    const graphShown = (n.download || n.upload) && b.cfg.graph !== false;
+    if (cells.length && !graphShown) body += `<div class="aq">${cells.join("")}</div>`;
+    const pres = (b.cfg.presence || []).map((x) => (typeof x === "string" ? { entity: x } : x));
+    if (pres.length) {
+      body += `<div class="pres">${pres
+        .map((x) => {
+          const ps = this._stateOf(x.entity);
+          const here = this._isPresent(ps);
+          const ssid = ps?.attributes?.essid || ps?.attributes?.ssid;
+          const icon = ICON[x.icon] ? x.icon : /pc|desktop|computer|noir/i.test(x.entity) ? "pc" : "phone";
+          const name = esc(x.name || ps?.attributes?.friendly_name || x.entity);
+          const detail = here ? `Connected${ssid ? ` · ${esc(ssid)}` : ""}` : ps ? "Away" : "Unknown";
+          return `<div class="pr ${here ? "here" : ""}">${svg(icon)}<span class="prn">${name}</span><span class="prs">${detail}</span></div>`;
+        })
+        .join("")}</div>`;
+    }
+    return { body, status };
+  }
+
+  /* ------------------------------------------------------------ bandwidth heartbeat */
+
+  _netIds(b) {
+    const n = b.cfg.network || {};
+    return [n.download, n.upload].filter(Boolean);
+  }
+
+  /** Keep a rolling buffer of speed samples per sensor (in the browser, per dashboard session). */
+  _recordNet(b) {
+    const now = Date.now();
+    const keep = Number(b.cfg.graph_minutes ?? 5) * 60000 * 1.3;
+    this._series ||= {};
+    for (const id of this._netIds(b)) {
+      const st = this._stateOf(id);
+      const v = Number(st?.state);
+      if (!st || !Number.isFinite(v)) continue;
+      const buf = (this._series[id] ||= []);
+      const last = buf[buf.length - 1];
+      if (!last || last.v !== v || now - last.t > 5000) buf.push({ t: now, v });
+      while (buf.length > 2 && now - buf[1].t > keep) buf.shift();
+    }
+    this._loadNetHistory(b);
+  }
+
+  /** Fill the graph from Home Assistant's history once, so it doesn't start empty. */
+  async _loadNetHistory(b) {
+    this._histLoaded ||= new Set();
+    const ids = this._netIds(b).filter((id) => !this._histLoaded.has(id));
+    if (!ids.length || !this._hass?.callWS) return;
+    ids.forEach((id) => this._histLoaded.add(id));
+    try {
+      const mins = Number(b.cfg.graph_minutes ?? 5);
+      const res = await this._hass.callWS({
+        type: "history/history_during_period",
+        start_time: new Date(Date.now() - mins * 60000).toISOString(),
+        entity_ids: ids,
+        minimal_response: true,
+        no_attributes: true,
+        significant_changes_only: false,
+      });
+      for (const id of ids) {
+        const rows = (res?.[id] || [])
+          .map((r) => ({
+            t: r.lu != null ? r.lu * 1000 : Date.parse(r.last_updated || r.last_changed),
+            v: Number(r.s ?? r.state),
+          }))
+          .filter((r) => Number.isFinite(r.t) && Number.isFinite(r.v));
+        const live = this._series[id] || [];
+        const first = live.length ? live[0].t : Infinity;
+        this._series[id] = [...rows.filter((r) => r.t < first), ...live];
+      }
+    } catch (e) {
+      console.debug("house3d-card: no history for the bandwidth graph", e);
+    }
+  }
+
+  _startHeartbeat(b) {
+    this._hbFor = b;
+    if (this._hbRaf) return;
+    const loop = (ts) => {
+      const cv = this._menu?.querySelector("canvas.hbc");
+      if (!cv || this._menu.hidden || this._menuFor !== this._hbFor) {
+        this._hbRaf = null;
+        return;
+      }
+      if (!this._hbLast || ts - this._hbLast > 33) {
+        this._hbLast = ts;
+        this._drawHeartbeat(cv, this._hbFor);
+      }
+      this._hbRaf = this._reducedMotion ? null : requestAnimationFrame(loop);
+    };
+    this._hbRaf = requestAnimationFrame(loop);
+  }
+
+  /** UniFi-style throughput graph: smooth curves, UniFi blue / violet, gradient fills, dashed grid. */
+  /** Ease towards a target so new readings glide in instead of jumping. */
+  _ease(key, target, dt, rate = 3.5) {
+    this._eased ||= {};
+    const cur = this._eased[key];
+    if (cur == null || !Number.isFinite(cur) || this._reducedMotion) return (this._eased[key] = target);
+    return (this._eased[key] = cur + (target - cur) * Math.min(1, dt * rate));
+  }
+
+  _drawHeartbeat(cv, b) {
+    const tNow = performance.now();
+    const dt = Math.min(0.1, (tNow - (this._hbT || tNow)) / 1000);
+    this._hbT = tNow;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = cv.clientWidth, h = cv.clientHeight;
+    if (!w || !h) return;
+    if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+    const g = cv.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    const now = Date.now();
+    const span = Number(b.cfg.graph_minutes ?? 5) * 60000;
+    const t0 = now - span;
+    const n = b.cfg.network || {};
+    const lines = [
+      n.download && { id: n.download, color: b.cfg.graph_colors?.[0] || "#1f7bff" },
+      n.upload && { id: n.upload, color: b.cfg.graph_colors?.[1] || "#9b7bff" },
+    ].filter(Boolean);
+    // buckets fixed in time (not on screen), so the curve glides left smoothly instead of re-sampling as it scrolls
+    const bucketMs = span / Math.max(14, Math.round(w / 11));
+    const firstB = Math.floor(t0 / bucketMs) - 1;
+    const lastB = Math.floor(now / bucketMs);
+    const X = (t) => ((t - t0) / span) * w;
+    const series = lines.map((l) => {
+      const buf = this._series?.[l.id] || [];
+      let pts = [];
+      let j = 0, lastV = null;
+      while (j < buf.length && buf[j].t < firstB * bucketMs) lastV = buf[j++].v;
+      for (let k = firstB; k <= lastB; k++) {
+        const tEnd = (k + 1) * bucketMs;
+        let sum = 0, cnt = 0;
+        while (j < buf.length && buf[j].t < tEnd) { sum += buf[j].v; cnt++; lastV = buf[j].v; j++; }
+        const v = cnt ? sum / cnt : lastV;
+        if (v != null) pts.push({ x: X(Math.min(now, (k + 0.5) * bucketMs)), v });
+      }
+      // one more gentle pass: the display's curve never looks nervous
+      pts = pts.map((p, i) => ({ x: p.x, v: i === 0 || i === pts.length - 1 ? p.v : (pts[i - 1].v + 2 * p.v + pts[i + 1].v) / 4 }));
+      if (pts.length) {
+        const liveV = Number(this._stateOf(l.id)?.state);
+        const target = Number.isFinite(liveV) ? (pts[pts.length - 1].v + liveV) / 2 : pts[pts.length - 1].v;
+        pts.push({ x: w, v: this._ease(`end:${l.id}`, target, dt, 2.5) });
+      }
+      return { ...l, pts };
+    });
+    let max = 1;
+    for (const sr of series) for (const p of sr.pts) max = Math.max(max, p.v);
+    const nice = [10, 20, 25, 50, 75, 100, 150, 200, 250, 300, 400, 500, 600, 750, 800, 1000, 1500, 2000, 2500, 5000, 10000];
+    max = nice.find((x) => x >= max * 1.1) || Math.ceil(max * 1.1);
+    max = this._ease(`max:${b.cfg.entity}`, max, dt, 2); // rescale smoothly
+    const top = 13, bottom = h - 2;
+    const Y = (v) => bottom - (v / max) * (bottom - top);
+
+    // dashed grid at 0 / 50 / 100 %, scale labels on the right like the UniFi dashboard
+    g.setLineDash([2, 3]);
+    g.strokeStyle = "rgba(255,255,255,.1)";
+    g.lineWidth = 1;
+    g.font = "500 9px system-ui, sans-serif";
+    g.fillStyle = "rgba(255,255,255,.4)";
+    g.textAlign = "right";
+    const fmt = (v) => (v >= 1000 ? `${+(v / 1000).toFixed(1)} Gbps` : `${Math.round(v / 10) * 10} Mbps`);
+    // header numbers count smoothly to the new reading
+    cv.closest(".hb")?.querySelectorAll(".hbv").forEach((el) => {
+      const v = Number(this._stateOf(el.dataset.id)?.state);
+      if (!Number.isFinite(v)) return;
+      const txt = String(Math.round(this._ease(`num:${el.dataset.id}`, v, dt, 4)));
+      if (el.textContent !== txt) el.textContent = txt;
+    });
+    for (const f of [0.5, 1]) {
+      const y = Math.round(Y(max * f)) + 0.5;
+      g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke();
+      g.fillText(fmt(max * f), w - 2, y - 3);
+    }
+    g.setLineDash([]);
+    g.textAlign = "left";
+
+    // smooth curve through the points (Catmull-Rom -> Bezier)
+    const curve = (pts) => {
+      g.moveTo(pts[0].x, Y(pts[0].v));
+      for (let i = 0; i < pts.length - 1; i++) {
+        const p0 = pts[i - 1] || pts[i], p1 = pts[i], p2 = pts[i + 1], p3 = pts[i + 2] || p2;
+        const c1x = p1.x + (p2.x - p0.x) / 6, c1y = Y(p1.v) + (Y(p2.v) - Y(p0.v)) / 6;
+        const c2x = p2.x - (p3.x - p1.x) / 6, c2y = Y(p2.v) - (Y(p3.v) - Y(p1.v)) / 6;
+        g.bezierCurveTo(c1x, Math.min(bottom, c1y), c2x, Math.min(bottom, c2y), p2.x, Y(p2.v));
+      }
+    };
+    const phase = (now % 1600) / 1600;
+    for (const sr of series) {
+      if (sr.pts.length < 2) continue;
+      const grad = g.createLinearGradient(0, top, 0, bottom);
+      grad.addColorStop(0, sr.color + "66");
+      grad.addColorStop(1, sr.color + "00");
+      g.beginPath(); curve(sr.pts);
+      g.lineTo(sr.pts[sr.pts.length - 1].x, bottom); g.lineTo(sr.pts[0].x, bottom); g.closePath();
+      g.fillStyle = grad; g.fill();
+      g.beginPath(); curve(sr.pts);
+      g.strokeStyle = sr.color; g.lineWidth = 1.8; g.lineJoin = "round"; g.lineCap = "round";
+      g.shadowColor = sr.color; g.shadowBlur = 5;
+      g.stroke();
+      g.shadowBlur = 0;
+      // live point at the right edge, with a soft pulse
+      const last = sr.pts[sr.pts.length - 1];
+      const ly = Y(last.v);
+      if (!this._reducedMotion) {
+        g.fillStyle = sr.color;
+        g.globalAlpha = 0.35 * (1 - phase);
+        g.beginPath(); g.arc(last.x - 2.5, ly, 2.5 + phase * 6, 0, Math.PI * 2); g.fill();
+        g.globalAlpha = 1;
+      }
+      g.fillStyle = "#fff";
+      g.beginPath(); g.arc(last.x - 2.5, ly, 2.6, 0, Math.PI * 2); g.fill();
+      g.fillStyle = sr.color;
+      g.beginPath(); g.arc(last.x - 2.5, ly, 1.7, 0, Math.PI * 2); g.fill();
+    }
+  }
+
+  /* ------------------------------------------------------------ camera feed */
+
+  _serviceCall(spec, id) {
+    if (!spec || !this._hass?.states?.[id]) return;
+    const [d, s] = String(spec.service || spec).split(".");
+    this._hass.callService(d, s, { entity_id: id, ...(spec.data || {}) });
+  }
+
+  /** Some cameras (Eufy battery cams) only stream after being asked to; `camera_start` / `camera_stop` do that. */
+  _startCamera(b) {
+    this._serviceCall(b.cfg.camera_start, b.cfg.entity);
+  }
+
+  _stopCamera(b) {
+    if (!b?.cfg.entity.startsWith("camera.")) return;
+    clearInterval(this._camTimer);
+    this._camTimer = null;
+    this._serviceCall(b.cfg.camera_stop, b.cfg.entity);
+    b._camEl = null;
+  }
+
+  /** Live video via Home Assistant's own stream element; falls back to refreshing snapshots. */
+  _mountCamera(b, holder, st) {
+    const Stream = customElements.get("ha-camera-stream");
+    if (Stream && this._hass?.states?.[b.cfg.entity]) {
+      if (!b._camEl || b._camEl.tagName !== "HA-CAMERA-STREAM") {
+        b._camEl = document.createElement("ha-camera-stream");
+        b._camEl.muted = true;
+        b._camEl.controls = false;
+        b._camEl.allowExoPlayer = true;
+      }
+      b._camEl.hass = this._hass;
+      b._camEl.stateObj = st;
+      holder.appendChild(b._camEl);
+      return;
+    }
+    if (!b._camEl || b._camEl.tagName !== "IMG") {
+      b._camEl = document.createElement("img");
+      b._camEl.alt = "";
+    }
+    const refresh = () => {
+      const pic = this._stateOf(b.cfg.entity)?.attributes?.entity_picture;
+      if (pic) b._camEl.src = pic + (pic.startsWith("data:") ? "" : `${pic.includes("?") ? "&" : "?"}t=${Date.now()}`);
+    };
+    refresh();
+    clearInterval(this._camTimer);
+    this._camTimer = setInterval(refresh, (b.cfg.refresh ?? 2) * 1000);
+    holder.appendChild(b._camEl);
+  }
+
+  /** Close the device panel: it shrinks back into the device and fades out (instant with reduced motion). */
+  _closeMenu() {
+    this._menuAtFor = null;
+    this._menuPin = null;
+    if (this._menuFor) this._stopCamera(this._menuFor);
+    this._menuFor = null;
+    this._menuKey = null;
+    this._dirty = true;
+    const m = this._menu;
+    if (!m || m.hidden || m.classList.contains("out")) return;
+    if (this._reducedMotion) {
+      m.hidden = true;
+      return;
+    }
+    m.classList.remove("in");
+    void m.offsetWidth;
+    m.classList.add("out");
+    clearTimeout(this._menuOutT);
+    this._menuOutT = setTimeout(() => {
+      m.hidden = true;
+      m.classList.remove("out");
+    }, 300);
+  }
+
+  _renderMenu(force = false) {
+    const b = this._menuFor;
+    if (!b || !this._menu) return;
+    const id = b.cfg.entity;
+    const st = this._stateOf(id);
+    const cl = b.cfg.climate ? this._stateOf(b.cfg.climate) : null;
+    const sensorList = (b.cfg.sensors || []).map((x) => (typeof x === "string" ? { entity: x } : x));
+    const netIds = [...Object.values(b.cfg.network || {}), ...(b.cfg.presence || []).map((x) => (typeof x === "string" ? x : x.entity))];
+    const sensorStates = [...sensorList.map((x) => this._stateOf(x.entity)), ...netIds.map((x) => this._stateOf(x))];
+    const isCam = id.startsWith("camera.");
+    const key = isCam
+      ? JSON.stringify([st?.state, sensorStates.map((x) => x?.state)])
+      : JSON.stringify([st?.state, st?.attributes, cl?.state, cl?.attributes, sensorStates.map((x) => x?.state), b.cfg.battery ? this._stateOf(b.cfg.battery)?.state : 0]);
+    if (!force && (key === this._menuKey || this._menuBusy)) return;
+    this._menuKey = key;
+    if (!force && b.cover && this._blindInPlace(b, st)) return;
+
+    const domain = id.split(".")[0];
+    const a = st?.attributes || {};
+    const on = this._isOn(st, id, b.cfg);
+    const pct = (v, max = 255) => Math.round((v / max) * 100);
+    let status = st ? st.state.replace(/_/g, " ") : "unavailable";
+    status = status.charAt(0).toUpperCase() + status.slice(1);
+    let body = "", extraCells = "", hkIcon = "", hkLc = "";
+
+    if (b.cfg.network || b.cfg.presence) {
+      const r = this._networkBody(b, st, on);
+      body += r.body;
+      status = r.status;
+    } else if (domain === "light") {
+      // laid out like Apple's Home app: the lamp's icon, name and brightness on top, one big slider filled in the
+      // lamp's colour, and a row of colour circles
+      const modes = a.supported_color_modes; // undefined in the demo: show everything
+      const canDim = !modes || modes.some((m) => m !== "onoff");
+      const canColor = !modes || modes.some((m) => COLOR_MODES.includes(m));
+      const canCt = !modes || modes.includes("color_temp") || modes.includes("rgbww");
+      const v = a.brightness != null ? pct(a.brightness) : 100;
+      const lc = a.rgb_color ? `rgb(${a.rgb_color.join(",")})` : "var(--accent)";
+      hkLc = lc;
+      hkIcon = `<span class="hk-ic ${on ? "on" : ""}" style="--lc:${lc}" aria-hidden="true">${svg("bulb")}</span>`;
+      if (st && st.state !== "unavailable") status = on ? (a.brightness != null ? `${v}%` : "On") : "Off";
+      if (on && canDim) {
+        body += `<div class="lt-box hk">
+          <div class="lt" role="slider" tabindex="0" aria-label="Brightness" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${v}"
+               style="--lv:${v}%;--lc:${lc}"><span class="lt-f"></span><span class="lt-ic">${svg("bulb")}</span></div></div>`;
+      }
+      if (on && (canColor || canCt)) {
+        const cur = a.rgb_color ? a.rgb_color.join(",") : "";
+        const ctSel = (k) => a.color_mode === "color_temp" && Math.abs((a.color_temp_kelvin || 0) - k) < 250;
+        let sw = "";
+        if (canCt) for (const s of SWATCHES_CT)
+          sw += `<button data-act="ct" data-k="${s.k}" style="--c:${s.css}" title="${s.label}" aria-label="${s.label}" class="${ctSel(s.k) ? "sel" : ""}"></button>`;
+        if (canColor) for (const s of SWATCHES_RGB)
+          sw += `<button data-act="rgb" data-rgb="${s.rgb.join(",")}" style="--c:rgb(${s.rgb.join(",")})" title="${s.label}" aria-label="${s.label}" class="${a.color_mode !== "color_temp" && cur === s.rgb.join(",") ? "sel" : ""}"></button>`;
+        body += `<div class="hk-sw" role="group" aria-label="Colour">${sw}</div>`;
+      }
+    } else if (domain === "fan") {
+      // laid out like Dyson's app: a big speed number with − / +, a row of round controls, then the air readings
+      // FanEntityFeature: 1 speed, 2 oscillate, 4 direction, 8 preset
+      const sf = a.supported_features ?? 0;
+      const canSpeed = a.percentage != null || sf & 1;
+      const canOsc = a.oscillating != null || sf & 2;
+      const canDir = a.direction != null || sf & 4;
+      const presets = a.preset_modes || [];
+      const autoP = presets.find((p) => /auto/i.test(p));
+      const isAuto = !!autoP && a.preset_mode === autoP;
+      if (on && canSpeed) {
+        const v = a.percentage ?? 50;
+        const step = a.percentage_step || 1;
+        const levels = step >= 5 ? Math.round(100 / step) : 0; // e.g. Dyson: 10 speeds of 10%
+        const lvl = levels ? Math.max(1, Math.round(v / step)) : v;
+        status += isAuto ? " · Auto" : levels ? ` · speed ${lvl}` : ` · ${v}%`;
+        const bars = levels || 10, filled = levels ? lvl : Math.round(v / 10);
+        body += `<div class="dy-spd ${isAuto ? "auto" : ""}">
+          <button class="dy-pm" data-act="fan_step" data-d="-1" aria-label="Slower" ${!isAuto && v <= (levels ? step : 1) ? "disabled" : ""}>${svg("minus")}</button>
+          <div class="dy-n"><b>${isAuto ? "Auto" : levels ? lvl : `${v}%`}</b>
+            <span class="dy-bars" aria-hidden="true">${Array.from({ length: bars }, (_, i) => `<i class="${!isAuto && i < filled ? "on" : ""}" style="--h:${Math.round(30 + (70 * (i + 1)) / bars)}%"></i>`).join("")}</span></div>
+          <button class="dy-pm" data-act="fan_step" data-d="1" aria-label="Faster" ${!isAuto && v >= 100 ? "disabled" : ""}>${svg("plus")}</button></div>`;
+      }
+      const rbtn = (act, icon, label, pressed, extra = "", cls = "") =>
+        `<button class="dy-b ${cls}" data-act="${act}" ${extra} ${pressed == null ? "" : `aria-pressed="${pressed}"`}><span>${svg(icon)}</span><small>${label}</small></button>`;
+      let row = "", heatRow = "";
+      if (on && autoP) row += rbtn("fan_auto", "auto", "Auto", isAuto);
+      if (on && canOsc) row += rbtn("oscillate", "osc", "Oscillate", !!a.oscillating);
+      if (on && canDir) {
+        const [fw, rv] = b.cfg.direction_labels || ["Front", "Back"];
+        const rev = a.direction === "reverse";
+        row += rbtn("dir_toggle", "airflow", rev ? rv : fw, null, `data-v="${rev ? "forward" : "reverse"}" aria-label="Airflow: ${rev ? rv : fw}. Tap for ${rev ? fw : rv}"`, rev ? "rev" : "");
+      }
+      if (cl) {
+        const ca = cl.attributes || {};
+        const heating = this._isHeating(cl);
+        if (ca.current_temperature != null) status += ` · ${ca.current_temperature}°`;
+        row += rbtn("heat", "flame", "Heat", heating, "", "heat");
+        if (heating && ca.temperature != null)
+          heatRow = `<div class="dy-heat"><span>Heat to</span><button data-act="ctemp_down" aria-label="Lower target temperature">${svg("minus")}</button>
+            <b>${ca.temperature}°</b><button data-act="ctemp_up" aria-label="Raise target temperature">${svg("plus")}</button></div>`;
+      }
+      if (row) body += `<div class="dy-row">${row}</div>`;
+      body += heatRow;
+      // overall air quality: the worst of the pollutant readings (PM2.5, PM10, VOC, NO₂)
+      let worst = "";
+      sensorList.forEach((x, i) => {
+        const n = Number(sensorStates[i]?.state);
+        if (Number.isNaN(n)) return;
+        const q = this._aqBand(`${x.entity} ${x.name || ""}`, n, true);
+        if (q === "poor" || (q === "fair" && worst !== "poor") || (q === "good" && !worst)) worst = q;
+      });
+      if (worst) status += ` · ${{ good: "Good", fair: "Fair", poor: "Poor" }[worst]} air`;
+      if (on) status = status.replace(/^On · /i, "").replace(/^./, (ch) => ch.toUpperCase()); // the speed number already says it's on
+    } else if (domain === "vacuum") {
+      const r = this._vacBody(b, st);
+      body += r.body;
+      status = r.status;
+      extraCells = r.cells;
+    } else if (domain === "camera") {
+      const live = st && st.state !== "unavailable";
+      status = live ? (st.state === "recording" ? "Recording" : "Live") : "Unavailable";
+      body += `<div class="cam"><span class="live ${live ? "" : "off"}">${live ? "LIVE" : "OFFLINE"}</span></div>`;
+    } else if (domain === "cover") {
+      if (a.current_position != null) {
+        // HomeKit style: one tall slider shaped like the window, the blind comes down as you drag down
+        const p = Math.round(a.current_position);
+        const moving = st.state === "opening" || st.state === "closing";
+        status = moving ? (st.state === "opening" ? "Opening…" : "Closing…") : p <= 0 ? "Closed" : p >= 100 ? "Open" : `${p}% open`;
+        body += `<div class="bl-box">
+          <div class="bl-pct"><b data-bl-out class="${p <= 0 ? "word" : ""}">${p <= 0 ? "Closed" : `${p}%`}</b></div>
+          <div class="bl" role="slider" tabindex="0" aria-label="Blind position" aria-valuemin="0" aria-valuemax="100"
+               aria-valuenow="${p}" style="--c:${100 - p}%">
+            <span class="bl-f"></span><span class="bl-bar"></span>
+          </div>
+          <div class="bl-btns">
+            <button data-act="cover_open" aria-label="Open">${svg("up")}</button>
+            ${moving ? `<button data-act="cover_stop" aria-label="Stop">${svg("stop")}</button>` : ""}
+            <button data-act="cover_close" aria-label="Close">${svg("down")}</button>
+          </div></div>`;
+      } else {
+        body += `<div class="btns"><button data-act="cover_open" aria-label="Open">${svg("up")}</button>
+          <button data-act="cover_stop" aria-label="Stop">${svg("stop")}</button>
+          <button data-act="cover_close" aria-label="Close">${svg("down")}</button></div>`;
+      }
+    } else if (domain === "climate") {
+      if (a.current_temperature != null) status += ` · ${a.current_temperature}°`;
+      if (a.temperature != null)
+        body += `<div class="temp"><button data-act="temp_down" aria-label="Lower">${svg("minus")}</button>
+          <b>${a.temperature}°</b><button data-act="temp_up" aria-label="Raise">${svg("plus")}</button></div>`;
+    } else if (domain === "media_player") {
+      if (on || st?.state === "paused" || st?.state === "idle") {
+        body += `<div class="btns"><button data-act="playpause" aria-label="Play or pause">${svg("playpause")}</button></div>`;
+        if (a.volume_level != null) {
+          const v = Math.round(a.volume_level * 100);
+          body += `<label class="row"><span class="rl">Volume <b data-out>${v}%</b></span>
+            <input type="range" min="0" max="100" value="${v}" data-act="volume" style="--p:${v}%" aria-label="Volume"></label>`;
+        }
+      }
+    }
+
+    // linked read-only sensors (air quality, temperature...) shown as a small grid
+    if (sensorList.length || extraCells) {
+      let cells = extraCells;
+      sensorList.forEach((x, i) => {
+        const ss = sensorStates[i];
+        const unit = ss?.attributes?.unit_of_measurement || "";
+        const raw = ss ? ss.state : "–";
+        const num = Number(raw);
+        const val = raw !== "" && !Number.isNaN(num) ? String(Math.round(num * 10) / 10) : raw;
+        const q = raw !== "" && !Number.isNaN(num) ? this._aqBand(`${x.entity} ${x.name || ""}`, num) : "";
+        const pol = raw !== "" && !Number.isNaN(num) && !!this._aqBand(`${x.entity} ${x.name || ""}`, num, true);
+        cells += `<div class="aqc" ${q ? `data-q="${q}"` : ""} ${pol ? "data-p" : ""}><span class="aqn" data-i="${i}"></span><b>${val}${unit && unit !== "%" ? `<small> ${unit}</small>` : unit}</b></div>`;
+      });
+      body += `<div class="aq">${cells}</div>`;
+    }
+
+    const showPower = !["cover", "climate", "camera", "vacuum"].includes(domain) && !(b.cfg.network || b.cfg.presence);
+    const keepHb = this._hbFor === b ? this._menu.querySelector(".hb") : null;
+    // a light or fan that's off shows only its power button; switching it on grows it into the full panel (and back)
+    // anything with a power button (lights, fans, plugs, switches, TVs...) that's off shows only that button
+    // phone view: the card starts folded into its round button whatever the device's state, until you tap it
+    // (a device that's off is just its power button there too; tapping it switches it on and the card grows)
+    const offMini = showPower && this._canToggle(b) && !on && b.cfg.compact_off !== false && !!st && st.state !== "unavailable" && st.state !== "unknown";
+    const phoneMini = !!this._phone && !!this._phoneCollapsed && !offMini;
+    const mini = this._phone ? phoneMini || offMini : offMini;
+    const m = this._menu;
+    const morph = !this._reducedMotion && !m.hidden && m._for === b && m.classList.contains("mini") !== mini && m.animate;
+    const r0 = morph ? m.getBoundingClientRect() : null;
+    const p0 = morph ? m.querySelector(".pw")?.getBoundingClientRect() : null;
+    m._for = b;
+    m.classList.toggle("mini", mini);
+    m.classList.toggle("dyf", domain === "fan");
+    m.classList.toggle("hkl", domain === "light");
+    if (hkLc) m.style.setProperty("--lcp", hkLc); else m.style.removeProperty("--lcp");
+    // the power button: on its own while the device is off; at the bottom of the open card, so the card grows
+    // up out of it (and shrinks back down into it) right where it was
+    const esc = (v) => String(v ?? "").replace(/[&<>"]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[ch]);
+    const pwBtn = `<button class="pw ${on ? "on" : ""} ${b.alert ? "alert" : ""}" data-act="toggle" aria-label="Turn ${on ? "off" : "on"}">${svg("power")}</button>`;
+    if (mini) m.scrollTop = 0; // a scrolled open card would otherwise leave the round button scrolled off-centre
+    this._menu.innerHTML = `
+      <div class="mh">
+        ${hkIcon}<div class="mt"><div class="mn"></div><div class="ms" ${domain === "light" ? "data-lt-out" : ""}></div></div>
+        ${mini ? (phoneMini ? `<button class="pw ${on ? "on" : ""} ${b.alert ? "alert" : ""}" data-act="phone_open" aria-label="${b.alert ? `${esc(b.sinceText || "Needs attention")}. ` : ""}Open the controls">${svg(showPower ? "power" : this._dlIcon(b))}</button>` : pwBtn) : ""}
+        <button class="mx" data-act="close" aria-label="Close">${svg("close")}</button>
+      </div>
+      ${body}
+      ${id.startsWith("camera.") ? `<button class="more" data-act="more">Open full screen</button>` : ""}
+      ${showPower && !mini ? `<div class="mf">${pwBtn}</div>` : ""}
+      <span class="drop" aria-hidden="true"></span>`;
+    this._menu.querySelectorAll('[data-act="direction"]').forEach((el, i) => (el.textContent = (b._dirLabels || [])[i] ?? el.dataset.v));
+    this._menu.querySelectorAll('[data-act="preset"], [data-act="vac_fan"]').forEach((el) => (el.textContent = this._vacFanName(el.dataset.v, el.dataset.act)));
+    this._menu.querySelectorAll(".aqn[data-i]").forEach((el) => {
+      const x = sensorList[Number(el.dataset.i)];
+      el.textContent = x.name || this._stateOf(x.entity)?.attributes?.friendly_name || x.entity;
+    });
+    const newHb = this._menu.querySelector(".hb");
+    if (keepHb && newHb) newHb.replaceWith(keepHb);
+    if (this._menu.querySelector("canvas.hbc")) this._startHeartbeat(b);
+    const dim = this._menu.querySelector(".lt");
+    if (dim) this._wireDimmer(b, dim);
+    const blind = this._menu.querySelector(".bl");
+    this._blindFor = blind ? b : null;
+    if (blind) { this._wireBlind(b, blind); if (b.cover?.dir) this._syncBlindPanel(b); }
+    if (morph) this._menuMorphFrom(r0, p0, mini);
+    const camHolder = this._menu.querySelector(".cam");
+    if (camHolder && st) this._mountCamera(b, camHolder, st);
+    this._menu.querySelector(".mn").textContent = b.cfg.name || a.friendly_name || id;
+    this._menu.querySelector(".ms").textContent = status;
+    this._menu.setAttribute("aria-label", b.cfg.name || a.friendly_name || id);
+    this._positionMenu();
+  }
+
+  _vacFanName(v, act) {
+    if (act !== "vac_fan") return v;
+    const t = String(v).replace(/_/g, " ");
+    return { "max plus": "Max+", "max+": "Max+", off: "Off", mopping: "Mop" }[t.toLowerCase()] || t.charAt(0).toUpperCase() + t.slice(1);
+  }
+
+  /** The robot vacuum's panel: battery, one big start / pause button, send it home, find it, suction and its numbers. */
+  _vacBody(b, st) {
+    const a = st?.attributes || {};
+    const s = st?.state || "unavailable";
+    const bat = this._vacBattery(b, st);
+    const run = s === "cleaning";
+    const word = this._vacWord(st);
+    const charging = s === "docked" && bat != null && bat < 100;
+    const fmtMin = (m) => (m >= 60 ? `${Math.floor(m / 60)}<small> h </small>${Math.round(m % 60)}<small> min</small>` : `${Math.round(m)}<small> min</small>`);
+    let body = `<div class="vac ${s}">
+      <div class="vac-hero">
+        <span class="vac-bot" aria-hidden="true"><span class="vac-led"></span></span>
+        <div class="vac-bt">${bat != null ? `<b>${bat}<small>%</small></b>
+          <span class="vac-bar ${bat <= 20 ? "low" : ""} ${charging ? "chg" : ""}" style="--b:${bat}%"><i></i></span>` : `<b class="w">${word}</b>`}
+          <small class="vac-w">${bat != null ? (charging ? "Charging" : s === "docked" ? "Fully charged" : "Battery") : ""}</small></div>
+      </div>
+      <button class="vac-go ${run ? "run" : ""}" data-act="${run ? "vac_pause" : "vac_start"}">${svg(run ? "pause" : "play")}<span>${run ? "Pause" : s === "paused" ? "Resume cleaning" : "Start cleaning"}</span></button>
+      <div class="vac-row">
+        <button data-act="vac_home" ${s === "docked" ? 'aria-disabled="true"' : ""}>${svg("home")}<span>${s === "returning" ? "Heading home" : "Dock"}</span></button>
+        <button data-act="vac_locate">${svg("locate")}<span>Find it</span></button>
+      </div>`;
+    const speeds = a.fan_speed_list || [];
+    if (speeds.length)
+      body += `<div class="row"><span class="rl">Suction</span><div class="vac-fs" style="--n:${speeds.length <= 3 ? speeds.length : speeds.length === 4 ? 2 : 3}">${speeds
+        .map((f) => `<button data-act="vac_fan" data-v="${String(f).replace(/"/g, "&quot;")}" aria-pressed="${a.fan_speed === f}"></button>`).join("")}</div></div>`;
+    // whatever the integration reports about the last clean
+    const cells = [];
+    const area = a.cleaned_area ?? a.clean_area;
+    const time = a.cleaning_time ?? a.clean_time;
+    if (area != null) cells.push(["Area", `${Math.round(area)}<small> m²</small>`]);
+    if (time != null) cells.push(["Time", Number.isFinite(Number(time)) ? fmtMin(Number(time)) : String(time)]);
+    if (a.fan_speed && !speeds.length) cells.push(["Suction", this._vacFanName(a.fan_speed, "vac_fan")]);
+    if (s === "error") body += `<div class="vac-err">${svg("close")}<span>${String(a.error || a.status || "It's stuck and needs a hand").replace(/[<>&]/g, "")}</span></div>`;
+    body += `</div>`;
+    // the numbers share one grid with the vacuum's own sensors (filter and brush hours...)
+    return { body, status: `${word}${bat != null && s !== "docked" ? ` · ${bat}%` : ""}`,
+      cells: cells.map(([n, v]) => `<div class="aqc"><span class="aqn">${n}</span><b>${v}</b></div>`).join("") };
+  }
+
+  /**
+   * HomeKit-style blind slider: drag up or down anywhere on it (it moves with your finger rather than
+   * jumping to where you touched), the 3D blind follows along, and the position is sent when you let go.
+   */
+  /**
+   * The lamp's brightness slider: drag up or down anywhere on it (it follows your finger instead of jumping),
+   * or tap a level. The lamp follows live while you drag; all the way down switches it off.
+   */
+  _wireDimmer(b, el) {
+    const out = this._menu.querySelector("[data-lt-out]");
+    let v = Number(el.getAttribute("aria-valuenow")) || 0;
+    let start = null, lastSent = 0, sendT = 0;
+    const show = (x) => {
+      v = Math.round(Math.min(100, Math.max(0, x)));
+      el.style.setProperty("--lv", `${v}%`);
+      el.setAttribute("aria-valuenow", String(v));
+      if (out) out.textContent = v <= 0 ? "Off" : `${v}%`;
+      el.classList.toggle("dark", v < 30);
+    };
+    const send = (final) => {
+      const now = performance.now();
+      clearTimeout(sendT);
+      if (!final && now - lastSent < 250) { sendT = setTimeout(() => send(false), 260 - (now - lastSent)); return; }
+      lastSent = now;
+      if (v <= 0) { if (final) this._call("light", "turn_off", { entity_id: b.cfg.entity }); }
+      else this._call("light", "turn_on", { entity_id: b.cfg.entity, brightness_pct: v });
+      if (final) {
+        clearTimeout(this._busyTimer);
+        this._busyTimer = setTimeout(() => { this._menuBusy = false; this._renderMenu(); }, 900);
+      }
+    };
+    el.addEventListener("pointerdown", (e) => {
+      e.stopPropagation();
+      el.setPointerCapture(e.pointerId);
+      start = { y: e.clientY, v, moved: 0 };
+      this._menuBusy = true;
+      el.classList.add("drag");
+    });
+    el.addEventListener("pointermove", (e) => {
+      if (!start) return;
+      const dy = e.clientY - start.y;
+      start.moved = Math.max(start.moved, Math.abs(dy));
+      show(start.v - (dy / el.clientHeight) * 100);
+      if (v > 0) send(false);
+    });
+    const end = (e) => {
+      if (!start) return;
+      el.classList.remove("drag");
+      if (start.moved < 4 && e.type === "pointerup") {
+        const r = el.getBoundingClientRect();
+        show(Math.round((1 - (e.clientY - r.top) / r.height) * 20) * 5);
+      }
+      start = null;
+      if (navigator.vibrate) navigator.vibrate(8);
+      send(true);
+    };
+    el.addEventListener("pointerup", end);
+    el.addEventListener("pointercancel", end);
+    el.addEventListener("keydown", (e) => {
+      const d = { ArrowUp: 10, ArrowRight: 10, ArrowDown: -10, ArrowLeft: -10, PageUp: 25, PageDown: -25 }[e.key];
+      const to = e.key === "Home" ? 100 : e.key === "End" ? 0 : d != null ? v + d : null;
+      if (to == null) return;
+      e.preventDefault();
+      this._menuBusy = true;
+      show(to);
+      clearTimeout(this._ltKeyT);
+      this._ltKeyT = setTimeout(() => send(true), 400);
+    });
+    show(v);
+  }
+
+  /** Position reports while the blind panel is open: update it where it is (no rebuild, so no jumps). */
+  _blindInPlace(b, st) {
+    const el = this._menu.querySelector(".bl");
+    const p = st?.attributes?.current_position;
+    if (!el || p == null || this._blindFor !== b) return false;
+    const moving = st.state === "opening" || st.state === "closing";
+    const hasStop = !!this._menu.querySelector('.bl-btns [data-act="cover_stop"]');
+    if (moving !== hasStop) return false; // the stop button comes or goes: rebuild
+    const pr = Math.round(p);
+    this._menu.querySelector(".ms").textContent = moving ? (st.state === "opening" ? "Opening…" : "Closing…") : pr <= 0 ? "Closed" : pr >= 100 ? "Open" : `${pr}% open`;
+    if (!moving && !el.classList.contains("drag")) {
+      el.classList.remove("live");
+      el.style.setProperty("--c", `${100 - pr}%`);
+      el.setAttribute("aria-valuenow", String(pr));
+      const out = this._menu.querySelector("[data-bl-out]");
+      if (out) { out.textContent = pr <= 0 ? "Closed" : `${pr}%`; out.classList.toggle("word", pr <= 0); }
+    }
+    return true;
+  }
+
+  /** The blind's list icon rides along with the 3D blind while it moves. */
+  _syncBlindIcon(b) {
+    const ic = this.shadowRoot?.querySelector(`.dl-r[data-e="${CSS.escape(b.cfg.entity)}"] .dl-ic.blind`);
+    if (!ic) return;
+    ic.classList.add("live");
+    ic.style.setProperty("--bl", (1 - Math.min(1, Math.max(0, b.cover.cur))).toFixed(3));
+  }
+
+  /** While the blind is moving on its own, the panel's slider rides along with it, frame by frame. */
+  _syncBlindPanel(b) {
+    const el = this._menu?.querySelector(".bl");
+    const c = b.cover;
+    if (!el || el.classList.contains("drag") || !c.dir) {
+      el?.classList.remove("live");
+      return;
+    }
+    if (c.goal != null && c.goalSlider) return; // you dragged it here: the slider shows where it's going
+    const pos = Math.round(c.cur * 100);
+    el.classList.add("live");
+    el.style.setProperty("--c", `${100 - c.cur * 100}%`);
+    el.setAttribute("aria-valuenow", String(pos));
+    const out = this._menu.querySelector("[data-bl-out]");
+    if (out) { out.textContent = pos <= 0 ? "Closed" : `${pos}%`; out.classList.toggle("word", pos <= 0); }
+  }
+
+  _wireBlind(b, el) {
+    const out = this._menu.querySelector("[data-bl-out]");
+    let pos = Number(el.getAttribute("aria-valuenow")) || 0;
+    let start = null;
+    const show = (p) => {
+      pos = Math.round(Math.min(100, Math.max(0, p)));
+      el.style.setProperty("--c", `${100 - pos}%`);
+      el.setAttribute("aria-valuenow", String(pos));
+      if (out) { out.textContent = pos <= 0 ? "Closed" : `${pos}%`; out.classList.toggle("word", pos <= 0); }
+      if (b.cover) { b.cover.target = pos / 100; this._dirty = true; } // preview in the room
+    };
+    const send = () => {
+      if (b.cover) { b.cover.goal = pos / 100; b.cover.goalT = performance.now(); b.cover.goalSlider = true; }
+      this._call("cover", "set_cover_position", { entity_id: b.cfg.entity, position: pos });
+      clearTimeout(this._busyTimer);
+      this._busyTimer = setTimeout(() => { this._menuBusy = false; this._renderMenu(); }, 900);
+    };
+    el.addEventListener("pointerdown", (e) => {
+      e.stopPropagation();
+      el.setPointerCapture(e.pointerId);
+      start = { y: e.clientY, pos, moved: 0 };
+      this._menuBusy = true;
+      el.classList.add("drag");
+    });
+    el.addEventListener("pointermove", (e) => {
+      if (!start) return;
+      const dy = e.clientY - start.y;
+      start.moved = Math.max(start.moved, Math.abs(dy));
+      show(start.pos - (dy / el.clientHeight) * 100);
+    });
+    const end = (e) => {
+      if (!start) return;
+      el.classList.remove("drag");
+      // a plain tap (no drag) sets the blind to where you tapped, like HomeKit
+      if (start.moved < 4 && e.type === "pointerup") {
+        const r = el.getBoundingClientRect();
+        show(Math.round((1 - (e.clientY - r.top) / r.height) * 10) * 10);
+      }
+      start = null;
+      if (navigator.vibrate) navigator.vibrate(8);
+      send();
+    };
+    el.addEventListener("pointerup", end);
+    el.addEventListener("pointercancel", end);
+    el.addEventListener("keydown", (e) => {
+      const d = { ArrowUp: 10, ArrowRight: 10, ArrowDown: -10, ArrowLeft: -10, PageUp: 25, PageDown: -25 }[e.key];
+      const to = e.key === "Home" ? 100 : e.key === "End" ? 0 : d != null ? pos + d : null;
+      if (to == null) return;
+      e.preventDefault();
+      this._menuBusy = true;
+      show(to);
+      clearTimeout(this._blKeyT);
+      this._blKeyT = setTimeout(send, 400);
+    });
+  }
+
+  /** How good a reading is: PM2.5, PM10, VOC / NO₂ indexes (and humidity, unless only pollutants are asked for). */
+  _aqBand(key, num, pollutantsOnly = false) {
+    key = key.toLowerCase();
+    const band = (g, m) => (num <= g ? "good" : num <= m ? "fair" : "poor");
+    if (/pm_?2|pm2\.5|pm25/.test(key)) return band(12, 35);
+    if (/pm_?10/.test(key)) return band(54, 154);
+    if (/no2|no₂|voc|aqi|index/.test(key)) return band(3, 6);
+    if (!pollutantsOnly && /humid/.test(key)) return num >= 30 && num <= 60 ? "good" : num >= 20 && num <= 70 ? "fair" : "poor";
+    return "";
+  }
+
+  _menuAction(el, commit) {
+    const b = this._menuFor;
+    if (!b) return;
+    const id = b.cfg.entity;
+    const a = this._stateOf(id)?.attributes || {};
+    const act = el.dataset.act;
+    const val = Number(el.value);
+    if (el.type === "range") {
+      const out = el.closest(".row")?.querySelector("[data-out]");
+      const levels = Number(el.dataset.levels) || 0;
+      if (out) out.textContent = levels ? `${Math.max(1, Math.round(val / Number(el.dataset.step)))} / ${levels}` : `${val}%`;
+      el.style.setProperty("--p", `${((val - el.min) / (el.max - el.min)) * 100}%`);
+      if (!commit) return;
+    }
+    switch (act) {
+      case "close": return this._phone ? this._phoneOpen(false) : this._closeMenu(); // phone view: fold it back into its button
+      case "phone_open": return this._phoneOpen(true);
+      case "more": return this._moreInfo(b);
+      case "toggle":
+        if (this._phone) {
+          // phone view: switching off folds the card into its power button; switching on from the button grows it
+          this._phoneCollapsed = this._isOn(this._stateOf(id), id, b.cfg);
+          this._phoneBarUpdate();
+        }
+        return this._toggleEntity(b);
+      case "brightness": return this._call("light", "turn_on", { entity_id: id, brightness_pct: val });
+      case "ct": return this._call("light", "turn_on", { entity_id: id, color_temp_kelvin: Number(el.dataset.k) });
+      case "rgb": return this._call("light", "turn_on", { entity_id: id, rgb_color: el.dataset.rgb.split(",").map(Number) });
+      case "fan": return this._call("fan", "set_percentage", { entity_id: id, percentage: val });
+      case "oscillate": return this._call("fan", "oscillate", { entity_id: id, oscillating: !a.oscillating });
+      case "dir_toggle": return this._call("fan", "set_direction", { entity_id: id, direction: el.dataset.v });
+      case "fan_step": {
+        // one speed up or down; like Dyson's app, choosing a speed leaves Auto
+        const step = a.percentage_step || 10;
+        const presets = a.preset_modes || [], autoP = presets.find((p) => /auto/i.test(p)), manualP = presets.find((p) => !/auto/i.test(p));
+        const v = Math.min(100, Math.max(step, Math.round(((a.percentage ?? 50) + step * Number(el.dataset.d)) / step) * step));
+        if (autoP && a.preset_mode === autoP && manualP) this._call("fan", "set_preset_mode", { entity_id: id, preset_mode: manualP });
+        return this._call("fan", "set_percentage", { entity_id: id, percentage: v });
+      }
+      case "fan_auto": {
+        const presets = a.preset_modes || [], autoP = presets.find((p) => /auto/i.test(p)), manualP = presets.find((p) => !/auto/i.test(p));
+        const to = a.preset_mode === autoP ? manualP : autoP;
+        return to ? this._call("fan", "set_preset_mode", { entity_id: id, preset_mode: to }) : undefined;
+      }
+      case "direction": return this._call("fan", "set_direction", { entity_id: id, direction: el.dataset.v });
+      case "preset": return this._call("fan", "set_preset_mode", { entity_id: id, preset_mode: el.dataset.v });
+      case "heat": {
+        const cid = b.cfg.climate;
+        const cl = this._stateOf(cid);
+        const modes = cl?.attributes?.hvac_modes || ["heat", "off"];
+        const offMode = ["off", "fan_only", "cool"].find((m) => modes.includes(m)) || "off";
+        return this._call("climate", "set_hvac_mode", { entity_id: cid, hvac_mode: this._isHeating(cl) ? offMode : "heat" });
+      }
+      case "ctemp_up":
+      case "ctemp_down": {
+        const cid = b.cfg.climate;
+        const ca = this._stateOf(cid)?.attributes || {};
+        const step = ca.target_temp_step || 1;
+        let t = (ca.temperature ?? 20) + (act === "ctemp_up" ? step : -step);
+        t = Math.min(ca.max_temp ?? 37, Math.max(ca.min_temp ?? 1, Math.round(t * 10) / 10));
+        return this._call("climate", "set_temperature", { entity_id: cid, temperature: t });
+      }
+      case "cover_open":
+        if (b.cover) { b.cover.goal = 1; b.cover.goalT = performance.now(); b.cover.goalSlider = false; }
+        return this._call("cover", "open_cover", { entity_id: id });
+      case "cover_stop":
+        if (b.cover) b.cover.goal = null;
+        return this._call("cover", "stop_cover", { entity_id: id });
+      case "cover_close":
+        if (b.cover) { b.cover.goal = 0; b.cover.goalT = performance.now(); b.cover.goalSlider = false; }
+        return this._call("cover", "close_cover", { entity_id: id });
+      case "cover_pos": return this._call("cover", "set_cover_position", { entity_id: id, position: val });
+      case "temp_up":
+      case "temp_down": {
+        const step = a.target_temp_step || 0.5;
+        const t = Math.round(((a.temperature ?? 20) + (act === "temp_up" ? step : -step)) * 10) / 10;
+        return this._call("climate", "set_temperature", { entity_id: id, temperature: t });
+      }
+      case "playpause": return this._call("media_player", "media_play_pause", { entity_id: id });
+      case "vac_start": return this._call("vacuum", "start", { entity_id: id });
+      case "vac_pause": return this._call("vacuum", "pause", { entity_id: id });
+      case "vac_home": return el.getAttribute("aria-disabled") === "true" ? undefined : this._call("vacuum", "return_to_base", { entity_id: id });
+      case "vac_locate": return this._call("vacuum", "locate", { entity_id: id });
+      case "vac_fan": return this._call("vacuum", "set_fan_speed", { entity_id: id, fan_speed: el.dataset.v });
+      case "volume": return this._call("media_player", "volume_set", { entity_id: id, volume_level: val / 100 });
+    }
+  }
+
+  _positionMenu() {
+    const b = this._menuFor;
+    if (!b || this._menu.hidden || this._menuMorph) return; // mid-morph the animation carries the position
+    if (this._phone) return this._phonePlaceMenu();
+    this._updateCamera();
+    // a robot vacuum drives on while its panel is open: the panel stays where it opened instead of chasing it
+    if (b.vac && this._menuAtFor !== b) { this._menuAtFor = b; this._menuAt = b.anchor.clone(); }
+    const v = (b.vac ? this._menuAt : b.anchor).clone().project(this._camera);
+    const m = this._menu;
+    if (v.z > 1) {
+      m.style.visibility = "hidden";
+      return;
+    }
+    m.style.visibility = "";
+    const w = this._wrap.clientWidth, h = this._wrap.clientHeight;
+    const x = ((v.x + 1) / 2) * w;
+    const y = ((1 - v.y) / 2) * h;
+    const mw = m.offsetWidth, mh = m.offsetHeight, gap = 22, pad = 8;
+    const pin = this._menuPin?.b === b && !m.classList.contains("mini") ? this._menuPin : null;
+    const pinPw = pin ? m.querySelector(".mf .pw") : null;
+    let below, left, top, by = 0;
+    if (pinPw) {
+      // grown from its power button: the button stays where it was (as an offset from the device, so it follows it)
+      // and the card rises above it; if there isn't room for all of it, it gets shorter and its controls scroll
+      if (pin.ox == null) { const wr = this._wrap.getBoundingClientRect(); pin.ox = pin.cx - wr.left - x; pin.oy = pin.cy - wr.top - y; }
+      const bx = x + pin.ox;
+      by = y + pin.oy;
+      // its full height even while capped (don't lift the cap to measure: that would snap its scroll back to the top)
+      const natural = m.scrollHeight, half = pinPw.offsetHeight / 2, padB = parseFloat(getComputedStyle(m).paddingBottom) || 0;
+      const fits = natural + pad <= by + half + padB;
+      const bottom = by + half + padB; // (scrolling, the button's footer sticks inside the card's bottom padding)
+      const H = fits ? natural : Math.max(120, bottom - pad);
+      const cap = fits ? "" : `${Math.round(H)}px`;
+      if (m.style.maxHeight !== cap) m.style.maxHeight = cap;
+      below = false;
+      left = Math.min(Math.max(bx - mw / 2, pad), Math.max(pad, w - mw - pad));
+      top = bottom - H;
+    } else {
+      if (m.style.maxHeight) m.style.maxHeight = "";
+      below = y - mh - gap < pad && y + gap + mh <= h - pad;
+      left = Math.min(Math.max(x - mw / 2, pad), Math.max(pad, w - mw - pad));
+      top = Math.min(Math.max(below ? y + gap : y - mh - gap, pad), Math.max(pad, h - mh - pad));
+    }
+    m.classList.toggle("below", below);
+    m.style.left = `${left}px`;
+    m.style.top = `${top}px`;
+    if (pinPw) {
+      const wr = this._wrap.getBoundingClientRect(), q = pinPw.getBoundingClientRect();
+      const dy = wr.top + by - (q.top + q.height / 2);
+      if (Math.abs(dy) > 0.5) { top += dy; m.style.top = `${top}px`; }
+    }
+    m.style.setProperty("--tail", `${x - left}px`);
+    m.style.setProperty("--sheen", `${Math.round(135 - (this._az * 180) / Math.PI)}deg`);
+  }
+
+  /* ------------------------------------------------------------ camera */
+
+  /* ------------------------------------------------------------ motion background */
+
+  /**
+   * A soft backdrop behind the room that reacts to motion: glows and floating dust sit at different depths
+   * and drift with the camera (parallax), streak a little when you spin the room fast, then settle.
+   * On a tablet or phone it also leans with the device. `background: none` turns it off.
+   */
+  _bgFrame(now, dt) {
+    const cv = this._bgCanvas || (this._bgCanvas = this.shadowRoot.querySelector("canvas.bg"));
+    if (!cv || !this._camera || this._bgOn === false) return;
+    const bg = this._bg || (this._bg = this._bgInit());
+    const az = this._az, el = this._el;
+    if (bg.az == null) { bg.az = az; bg.el = el; }
+    // how fast the room is turning (radians per second), smoothed so it swells and fades like momentum
+    const k = Math.min(1, dt * 7);
+    const vAz = dt > 0 ? wrapPi(az - bg.az) / dt : 0, vEl = dt > 0 ? (el - bg.el) / dt : 0;
+    bg.vx += (THREE.MathUtils.clamp(vAz, -12, 12) - bg.vx) * k;
+    bg.vy += (THREE.MathUtils.clamp(vEl, -8, 8) - bg.vy) * k;
+    bg.tx += (bg.tiltX - bg.tx) * Math.min(1, dt * 4);
+    bg.ty += (bg.tiltY - bg.ty) * Math.min(1, dt * 4);
+    // the glows take on the room's light colours, and swell a little while you touch the room
+    const touching = !!(this._pointers?.size || this._drag);
+    bg.touch += ((touching ? 1 : 0) - bg.touch) * Math.min(1, dt * (touching ? 6 : 2.2));
+    if (Math.abs(bg.touch - (touching ? 1 : 0)) < 0.003) bg.touch = touching ? 1 : 0;
+    const want = this._bgTargets();
+    let fading = false;
+    const kc = Math.min(1, dt * 2.5);
+    for (let i = 0; i < 3; i++) {
+      const cur = bg.col[i], t = want[i];
+      for (let j = 0; j < 4; j++) {
+        const d = t[j] - cur[j];
+        if (Math.abs(d) > 0.4 && j < 3 || Math.abs(d) > 0.002 && j === 3) { cur[j] += d * kc; fading = true; }
+        else cur[j] = t[j];
+      }
+    }
+    const easing = fading || (bg.touch > 0 && bg.touch < 1);
+    const moved = az !== bg.az || el !== bg.el;
+    bg.acc += wrapPi(az - bg.az); // total turning, never wraps: the dust drifts on smoothly lap after lap
+    bg.az = az; bg.el = el;
+    const busy = Math.abs(bg.vx) > 0.004 || Math.abs(bg.vy) > 0.004 || Math.abs(bg.tiltX - bg.tx) > 0.05 || Math.abs(bg.tiltY - bg.ty) > 0.05;
+    if (!moved && !busy && !easing && bg.sized && !bg.dirty && bg.drawnTouch === bg.touch) {
+      if (Math.abs(bg.vx) + Math.abs(bg.vy) > 0) { bg.vx = bg.vy = 0; this._bgDraw(cv, bg); } // settle the streaks
+      return;
+    }
+    bg.dirty = false;
+    bg.drawnTouch = bg.touch;
+    this._bgDraw(cv, bg);
+  }
+
+  /**
+   * What colour each of the three glows should be: the lights in the room that are on, at their colour and
+   * brightness (one light: the main glow is its colour, the other two are gentle shades of it), or a dim
+   * night blue when every light is off. `background_colors` in the config overrides this.
+   * Each entry is [r, g, b, strength].
+   */
+  _bgTargets() {
+    const cfg = this._config;
+    const key = this._bgKey;
+    if (this._bgWant && key === this._bgWantKey) return this._bgWant;
+    this._bgWantKey = key;
+    const rgbOf = (hex) => {
+      const x = (this._bgParse || (this._bgParse = document.createElement("canvas").getContext("2d")));
+      x.fillStyle = "#f5a524";
+      x.fillStyle = hex;
+      const h = /^#([0-9a-f]{6})$/i.test(x.fillStyle) ? x.fillStyle.slice(1) : "f5a524";
+      return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+    };
+    const strength = [0.2, 0.16, 0.1];
+    if (cfg.background_colors) {
+      return (this._bgWant = [0, 1, 2].map((i) => [...rgbOf(cfg.background_colors[i] || cfg.background_colors[0]), strength[i]]));
+    }
+    const pick = cfg.background_lights;
+    const lights = this._bindings.filter((b) =>
+      pick ? pick.includes(b.cfg.entity) : b.cfg.entity.startsWith("light.") && b.cfg.background !== false);
+    const on = lights.filter((b) => (b.baseFactor || 0) > 0 && b.baseCss);
+    if (!on.length) {
+      // every light off: a quiet night blue
+      return (this._bgWant = [[70, 92, 160, 0.12], [48, 64, 130, 0.1], [92, 70, 150, 0.06]]);
+    }
+    const shade = (c, dh, ds, dl) => {
+      const col = new THREE.Color(c.r, c.g, c.b), hsl = {};
+      col.getHSL(hsl);
+      col.setHSL((hsl.h + dh + 1) % 1, Math.min(1, Math.max(0, hsl.s + ds)), Math.min(0.85, Math.max(0.2, hsl.l + dl)));
+      return [col.r * 255, col.g * 255, col.b * 255];
+    };
+    const out = [];
+    for (let i = 0; i < 3; i++) {
+      const b = on[i % on.length];
+      const f = 0.55 + 0.45 * Math.min(1, b.baseFactor); // dimmer lamp, softer glow
+      const [cr, cg, cb] = rgbOf(b.baseCss);
+      const c = { r: cr / 255, g: cg / 255, b: cb / 255 };
+      // with one lamp the other two glows are neighbouring shades of it, so the whole backdrop matches
+      const rgb = on.length > i ? [c.r * 255, c.g * 255, c.b * 255] : i === 1 ? shade(c, -0.04, -0.1, -0.08) : shade(c, 0.05, -0.05, 0.05);
+      out.push([...rgb, strength[i] * f]);
+    }
+    return (this._bgWant = out);
+  }
+
+  _bgInit() {
+    // a fixed pseudo-random layout, so the dust doesn't reshuffle on every reload
+    let seed = 7;
+    const rnd = () => ((seed = (seed * 16807) % 2147483647) - 1) / 2147483646;
+    const dots = [];
+    for (let i = 0; i < 110; i++) {
+      const d = 0.25 + rnd() * 0.75; // depth: near dots are bigger, brighter and move more
+      dots.push({ x: rnd(), y: rnd(), d, r: 0.5 + d * 1.4, a: 0.1 + d * 0.38, tw: rnd() * 6.28 });
+    }
+    const bg = { touch: 0, col: [[70, 92, 160, 0.12], [48, 64, 130, 0.1], [92, 70, 150, 0.06]], acc: 0, sway: 0, swayY: 0, vx: 0, vy: 0, tx: 0, ty: 0, tiltX: 0, tiltY: 0, dots, sized: false, dirty: true };
+    if (this._config.background_tilt !== false && typeof window !== "undefined" && "DeviceOrientationEvent" in window) {
+      this._onTilt = (e) => {
+        if (e.gamma == null || e.beta == null) return;
+        bg.tiltX = THREE.MathUtils.clamp(e.gamma, -30, 30) / 30;
+        bg.tiltY = THREE.MathUtils.clamp(e.beta - 45, -30, 30) / 30;
+      };
+      window.addEventListener("deviceorientation", this._onTilt, { passive: true });
+    }
+    return bg;
+  }
+
+  _bgDraw(cv, bg) {
+    const W = this._wrap.clientWidth || 1, H = this._wrap.clientHeight || 1;
+    const scale = Math.min(window.devicePixelRatio || 1, 2) * 0.75; // soft by nature, so it can be a bit lower-res
+    if (!bg.sized || cv.width !== Math.round(W * scale)) {
+      cv.width = Math.round(W * scale);
+      cv.height = Math.round(H * scale);
+      bg.sized = true;
+    }
+    const g = cv.getContext("2d");
+    g.setTransform(scale, 0, 0, scale, 0, 0);
+    const night = this._night !== false;
+    const cfg = this._config;
+    const home = (cfg.start_azimuth ?? 45) * DEG, homeEl = (cfg.start_elevation ?? 35) * DEG;
+    const pe = bg.el - homeEl; // how far the camera is tilted from the start view
+    const speed = Math.min(1, Math.hypot(bg.vx, bg.vy * 0.6) / 4);
+    // the glows only sway a touch: a bounded, smooth function of the angle, so they never jump or leave the card
+    const sway = Math.sin(bg.az - home), swayY = Math.sin(THREE.MathUtils.clamp(pe, -1.2, 1.2));
+
+    // base
+    const base = g.createLinearGradient(0, 0, 0, H);
+    base.addColorStop(0, night ? "#0d1016" : "#161a22");
+    base.addColorStop(1, night ? "#07080b" : "#0d0f14");
+    g.fillStyle = base;
+    g.fillRect(0, 0, W, H);
+
+    // glows: big soft lights far behind the room, drifting against the spin
+    const R = Math.max(W, H);
+    const blobs = [
+      { x: 0.22, y: 0.3, r: 0.55, c: bg.col[0], d: 0.35 },
+      { x: 0.8, y: 0.72, r: 0.6, c: bg.col[1], d: 0.55 },
+      { x: 0.62, y: 0.12, r: 0.4, c: bg.col[2], d: 0.8 },
+    ];
+    const touch = bg.touch * bg.touch * (3 - 2 * bg.touch); // smoothstep: a soft swell, not a flash
+    g.globalCompositeOperation = "lighter";
+    for (const b of blobs) {
+      const x = b.x * W - sway * b.d * W * 0.035 + bg.tx * b.d * 14;
+      const y = b.y * H + swayY * b.d * H * 0.03 + bg.ty * b.d * 10;
+      const r = b.r * R * (1 + touch * 0.1);
+      const gr = g.createRadialGradient(x, y, 0, x, y, r);
+      const a = b.c[3] * (1 + touch * 0.65);
+      const rgb = `${Math.round(b.c[0])},${Math.round(b.c[1])},${Math.round(b.c[2])}`;
+      gr.addColorStop(0, `rgba(${rgb},${Math.min(1, a).toFixed(3)})`);
+      gr.addColorStop(0.45, `rgba(${rgb},${Math.min(1, a * 0.35).toFixed(3)})`);
+      gr.addColorStop(1, `rgba(${rgb},0)`);
+      g.fillStyle = gr;
+      g.fillRect(0, 0, W, H);
+    }
+
+    // dust: tiny motes at three depths; they slide with the camera and draw out into streaks when you spin fast
+    g.lineCap = "round";
+    const span = W + 60;
+    for (const p of bg.dots) {
+      let x = (p.x * span - bg.acc * p.d * W * 0.16 + bg.tx * p.d * 24) % span;
+      if (x < 0) x += span;
+      x -= 30;
+      let y = (p.y * (H + 60) + pe * p.d * H * 0.25 + bg.ty * p.d * 18) % (H + 60);
+      if (y < 0) y += H + 60;
+      y -= 30;
+      // a short, faint trail towards where it came from; longer trails get fainter so it never turns into warp speed
+      let sx = bg.vx * p.d * 3.2, sy = -bg.vy * p.d * 2.6;
+      const len = Math.hypot(sx, sy), cap = 16 * p.d;
+      if (len > cap) { sx *= cap / len; sy *= cap / len; }
+      const a = p.a * (0.85 + speed * 0.25) / (1 + Math.min(len, cap) / (5 + p.r * 2));
+      g.strokeStyle = `rgba(255,255,255,${a.toFixed(3)})`;
+      g.lineWidth = p.r * 2;
+      g.beginPath();
+      g.moveTo(x, y);
+      g.lineTo(x + sx + 0.01, y + sy);
+      g.stroke();
+    }
+    g.globalCompositeOperation = "source-over";
+
+    // gentle vignette keeps the edges calm so the room stays the focus
+    const vg = g.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, R * 0.75);
+    vg.addColorStop(0, "rgba(0,0,0,0)");
+    vg.addColorStop(1, "rgba(0,0,0,0.45)");
+    g.fillStyle = vg;
+    g.fillRect(0, 0, W, H);
+  }
+
+  /* ------------------------------------------------------------ weather */
+
+  _wxCfg() {
+    const w = this._config.weather;
+    if (!w) return null;
+    return typeof w === "string" ? { entity: w } : w;
+  }
+
+  /** Pixels kept free on the left for the weather panel (wide cards only; narrow ones get the small pill). */
+  _wxReserve(W) {
+    const cfg = this._wxCfg();
+    // while the list panel is growing out of (or shrinking into) its pill, the room holds still:
+    // moving it would make the panel's frosted glass redraw every frame and stutter
+    if (this._dlMorph) return this._wxRes ?? 0;
+    if (this._dlPanelRes && this._config.device_list_layout !== "anchored" && W >= 700) {
+      const dl = this.shadowRoot?.querySelector(".dl");
+      return (dl?.offsetWidth || 300) + 12 + 12; // the device list panel is open on the left
+    }
+    return cfg && cfg.show !== false && W >= 900 && this._wxOpen && !this._dlOpen && !this._dlPanelRes ? 58 + 252 + 12 : 0;
+  }
+
+  /** Called on every Home Assistant update: (re)subscribe to the forecast and redraw when anything changed. */
+  _weatherHass() {
+    const cfg = this._wxCfg();
+    const el = this.shadowRoot?.querySelector(".wx");
+    if (!cfg || !el || !this._hass) return;
+    const id = cfg.entity;
+    if (this._wxSubFor !== id && this._hass.connection?.subscribeMessage) {
+      this._wxSubFor = id;
+      for (const u of this._wxUnsub || []) Promise.resolve(u).then((f) => typeof f === "function" && f()).catch(() => {});
+      this._wxFc = {};
+      this._wxUnsub = ["daily", "hourly"].map((type) =>
+        this._hass.connection
+          .subscribeMessage((msg) => {
+            this._wxFc[type] = msg?.forecast || [];
+            this._renderWeather(true);
+          }, { type: "weather/subscribe_forecast", forecast_type: type, entity_id: id })
+          .catch(() => null) // this weather service doesn't offer that kind of forecast
+      );
+    }
+    if (!el.dataset.wired) {
+      el.dataset.wired = "1";
+      el.addEventListener("pointerdown", (e) => {
+        e.stopPropagation();
+        if (this._wxOpen) this._wxArm(); // using it keeps it open
+      });
+      el.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this._setWeatherOpen(!this._wxOpen); // the card's own forecast, in and out: never Home Assistant's dialog
+      });
+    }
+    this._renderWeather(false);
+  }
+
+  /** Open the full forecast, or shrink it back to the small pill. */
+  _setWeatherOpen(open) {
+    const el = this.shadowRoot?.querySelector(".wx");
+    this._wxOpen = open;
+    if (el) {
+      el.classList.toggle("mini", !open);
+      el.setAttribute("aria-expanded", String(open));
+    }
+    if (open) { this._wxArm(); clearTimeout(this._radarFitT); this._radarFitT = setTimeout(() => this._radarFit(), 560); } // once it has opened
+    else clearTimeout(this._wxT);
+  }
+
+  /** It shrinks after `collapse_after` seconds (default 10) without being touched. */
+  _wxArm() {
+    clearTimeout(this._wxT);
+    const secs = Number(this._wxCfg()?.collapse_after ?? 10);
+    if (secs > 0) this._wxT = setTimeout(() => this._setWeatherOpen(false), secs * 1000);
+  }
+
+  /* ------------------------------------------------------------ rain map */
+
+  /**
+   * A small animated rain radar under the forecast: the last hour or so of rain (and a short forecast when the
+   * service has one) over a dark map, centred on home. Radar by RainViewer, map by CARTO / OpenStreetMap.
+   * `weather: { rain_map: false }` turns it off; `rain_map: { zoom, latitude, longitude, height }` adjusts it.
+   * Home is Home Assistant's own location unless you give one.
+   */
+  _radarCfg() {
+    const w = this._wxCfg();
+    if (!w || w.rain_map === false) return null;
+    const r = typeof w.rain_map === "object" ? w.rain_map : {};
+    const zone = this._hass?.states?.["zone.home"]?.attributes || {};
+    const lat = Number(r.latitude ?? this._hass?.config?.latitude ?? zone.latitude);
+    const lon = Number(r.longitude ?? this._hass?.config?.longitude ?? zone.longitude);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    return { lat, lon, zoom: Math.round(Number(r.zoom ?? 7)), height: Number(r.height ?? 132), colors: Number(r.color_scheme ?? 2) };
+  }
+
+  /** The map element: built once and kept while the forecast is re-drawn around it. */
+  _radarEl() {
+    const c = this._radarCfg();
+    if (!c) return null;
+    const key = `${c.lat},${c.lon},${c.zoom},${c.height}`;
+    if (this._radar?.key === key) return this._radar.el;
+    this._radarStop();
+    const el = document.createElement("div");
+    el.className = "wx-radar";
+    el.style.height = `${c.height}px`;
+    el.innerHTML = `<div class="rd-map"><div class="rd-base"></div></div><span class="rd-home" aria-hidden="true"></span>
+      <div class="rd-bar"><button class="rd-play" aria-label="Pause">${svg("pause")}</button><span class="rd-t"></span><i class="rd-prog"><b></b></i></div>
+      <small class="rd-cr">© OpenStreetMap · CARTO · RainViewer</small><div class="rd-msg" hidden></div>`;
+    el.setAttribute("role", "img");
+    el.setAttribute("aria-label", "Rain radar around home");
+    // it's part of the forecast: using it doesn't fold the forecast away
+    el.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (e.target.closest(".rd-play")) this._radarPlay(!this._radar.playing);
+      this._wxArm();
+    });
+    this._radar = { key, el, c, h: c.height, frames: [], layers: [], i: 0, playing: true,
+      baseUrl: (z, x, y) => `https://${"abcd"[(x + y) % 4]}.basemaps.cartocdn.com/dark_all/${z}/${x}/${y}${devicePixelRatio > 1 ? "@2x" : ""}.png` };
+    this._radarLoad();
+    return el;
+  }
+
+  /** Where home is, in the map's world pixels at its zoom (Web Mercator, 256 px tiles). */
+  _radarPx(c) {
+    const n = 2 ** c.zoom, s = Math.sin((c.lat * Math.PI) / 180);
+    return { x: ((c.lon + 180) / 360) * n * 256, y: (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * n * 256 };
+  }
+
+  /** Lay out the tiles that cover the map, with home in the middle. */
+  _radarTiles(holder, url) {
+    const R = this._radar, c = R.c, W = R.el.clientWidth || 228, H = R.h, p = this._radarPx(c), n = 2 ** c.zoom;
+    const x0 = Math.floor((p.x - W / 2) / 256), x1 = Math.floor((p.x + W / 2) / 256);
+    const y0 = Math.max(0, Math.floor((p.y - H / 2) / 256)), y1 = Math.min(n - 1, Math.floor((p.y + H / 2) / 256));
+    let html = "";
+    for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) {
+      const wx = ((tx % n) + n) % n;
+      html += `<img alt="" draggable="false" loading="lazy" style="left:${Math.round(tx * 256 - p.x + W / 2)}px;top:${Math.round(ty * 256 - p.y + H / 2)}px" src="${url(c.zoom, wx, ty)}">`;
+    }
+    holder.innerHTML = html;
+    holder.querySelectorAll("img").forEach((im) => im.addEventListener("error", () => (im.style.visibility = "hidden"), { once: true }));
+  }
+
+  async _radarLoad() {
+    const R = this._radar;
+    if (!R) return;
+    const base = R.el.querySelector(".rd-base");
+    if (!base.childElementCount) this._radarTiles(base, R.baseUrl);
+    let data = null;
+    try {
+      const res = await fetch("https://api.rainviewer.com/public/weather-maps.json", { cache: "no-store" });
+      if (res.ok) data = await res.json();
+    } catch (e) { /* offline, or blocked */ }
+    if (this._radar !== R) return;
+    const frames = data?.host ? [...(data.radar?.past || []), ...(data.radar?.nowcast || [])].map((f) => ({ ...f, host: data.host, cast: (data.radar?.nowcast || []).includes(f) })) : [];
+    const msg = R.el.querySelector(".rd-msg");
+    msg.hidden = !!frames.length;
+    msg.textContent = frames.length ? "" : "Rain radar isn't available right now";
+    R.el.querySelector(".rd-bar").hidden = !frames.length;
+    if (frames.length) {
+      // a layer per frame, kept (only new frames load); the newest past frame is "now"
+      const map = R.el.querySelector(".rd-map"), keep = new Map(R.layers.map((l) => [l.f.path, l]));
+      R.layers = frames.map((f) => {
+        const old = keep.get(f.path);
+        if (old) { keep.delete(f.path); return old; }
+        const d = document.createElement("div");
+        d.className = "rd-layer";
+        map.appendChild(d);
+        const url = (z, x, y) => `${f.host}${f.path}/256/${z}/${x}/${y}/${R.c.colors}/1_1.png`;
+        this._radarTiles(d, url);
+        return { f, d, url };
+      });
+      for (const l of keep.values()) l.d.remove();
+      R.frames = frames;
+      R.now = Math.max(0, frames.length - 1 - (data.radar?.nowcast?.length || 0));
+      R.i = R.now;
+      this._radarShow();
+      this._radarPlay(R.playing);
+    }
+    clearTimeout(R.refresh);
+    R.refresh = setTimeout(() => this._radarLoad(), 10 * 60 * 1000); // new frames every ten minutes
+  }
+
+  _radarShow() {
+    const R = this._radar;
+    if (!R?.frames.length) return;
+    R.layers.forEach((l, k) => l.d.classList.toggle("on", k === R.i));
+    const f = R.frames[R.i], mins = Math.round((f.time * 1000 - R.frames[R.now].time * 1000) / 60000);
+    const t = new Date(f.time * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    R.el.querySelector(".rd-t").textContent = mins === 0 ? `Now · ${t}` : `${mins > 0 ? "+" : ""}${mins} min · ${t}`;
+    R.el.querySelector(".rd-prog b").style.width = `${((R.i + 1) / R.frames.length) * 100}%`;
+    R.el.classList.toggle("cast", !!f.cast);
+  }
+
+  /** Plays through the frames (a pause on "now" and at the end), only while the forecast is open. */
+  _radarPlay(on) {
+    const R = this._radar;
+    if (!R) return;
+    R.playing = on;
+    clearTimeout(R.t);
+    const btn = R.el.querySelector(".rd-play");
+    btn.innerHTML = svg(on ? "pause" : "play");
+    btn.setAttribute("aria-label", on ? "Pause" : "Play");
+    if (!on) return;
+    const tick = () => {
+      if (this._radar !== R || !R.playing) return;
+      if (this._wxOpen && R.frames.length && !this._reducedMotion) {
+        R.i = (R.i + 1) % R.frames.length;
+        this._radarShow();
+      }
+      R.t = setTimeout(tick, R.i === R.frames.length - 1 ? 1600 : R.i === R.now ? 1000 : 450);
+    };
+    R.t = setTimeout(tick, 600);
+  }
+
+  /** The map takes whatever height is left in the card (up to its own), so the open forecast never runs off it. */
+  _radarFit() {
+    const R = this._radar, el = this.shadowRoot?.querySelector(".wx");
+    if (!R || !el || !R.el.isConnected || el.classList.contains("mini")) return; // measured open, at its full width
+    const more = el.querySelector(".wx-more"), inner = more?.firstElementChild;
+    if (!more || !inner) return;
+    const natural = el.offsetHeight - more.offsetHeight + inner.scrollHeight; // the open panel's full height
+    const room = this._wrap.clientHeight - el.offsetTop - 10;
+    const h = Math.round(Math.max(70, Math.min(R.c.height, R.h + room - natural)));
+    if (h === R.h) return;
+    R.h = h;
+    R.el.style.height = `${h}px`;
+    this._radarTiles(R.el.querySelector(".rd-base"), R.baseUrl);
+    for (const l of R.layers) this._radarTiles(l.d, l.url);
+  }
+
+  _radarStop() {
+    if (!this._radar) return;
+    clearTimeout(this._radar.t);
+    clearTimeout(this._radar.refresh);
+    this._radar.el.remove();
+    this._radar = null;
+  }
+
+  _renderWeather(force) {
+    const cfg = this._wxCfg();
+    const el = this.shadowRoot?.querySelector(".wx");
+    if (!cfg || !el || !this._hass || !this._wrap) return;
+    if (cfg.show === false) { el.hidden = true; return; }
+    const st = this._hass?.states?.[cfg.entity];
+    const W = this._wrap.clientWidth || 1;
+    const a = st?.attributes || {};
+    const fc = this._wxFc || {};
+    const daily = (fc.daily?.length ? fc.daily : a.forecast || []).slice(0, cfg.days ?? 5);
+    const hourly = (fc.hourly || []).filter((f) => new Date(f.datetime) > Date.now() - 3600e3).slice(0, 6);
+    const key = JSON.stringify([st?.state, a.temperature, a.humidity, a.wind_speed, daily, hourly]);
+    if (!force && key === this._wxKey) return;
+    this._wxKey = key;
+    el.hidden = false;
+    if (this._wxOpen == null) this._setWeatherOpen(this._wxCfg()?.start_open === true); // starts as the pill
+    const esc = (v) => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    if (!st) {
+      el.innerHTML = `<div class="wx-empty">Weather: "${esc(cfg.entity)}" not found</div>`;
+      return;
+    }
+    const r = (v) => (v == null || Number.isNaN(Number(v)) ? "–" : Math.round(Number(v)));
+    const sun = this._hass.states["sun.sun"];
+    const nightAt = (t) => {
+      // night between sunset and sunrise, by time of day
+      const rise = sun?.attributes?.next_rising ? new Date(sun.attributes.next_rising) : null;
+      const set = sun?.attributes?.next_setting ? new Date(sun.attributes.next_setting) : null;
+      const h = t.getHours() + t.getMinutes() / 60;
+      const rh = rise ? rise.getHours() + rise.getMinutes() / 60 : 7, sh = set ? set.getHours() + set.getMinutes() / 60 : 20;
+      return h < rh || h >= sh;
+    };
+    const nowNight = sun ? sun.state === "below_horizon" : nightAt(new Date());
+    const today = daily[0];
+    const hi = today?.temperature, lo = today?.templow;
+    const name = cfg.name || String(a.friendly_name || "Weather").replace(/^Forecast\s+/i, "");
+    let html = `<div class="wx-top"><div class="wx-loc">${esc(name)}</div>
+      <div class="wx-ic">${wxIcon(st.state, nowNight)}</div>
+      <div class="wx-now"><b>${r(a.temperature)}°</b><span>${esc(WX_TEXT[st.state] || st.state)}</span>
+      ${hi != null ? `<small>H:${r(hi)}°  L:${r(lo)}°</small>` : ""}</div></div>`;
+    html += `<div class="wx-more"><div>`;
+    if (hourly.length && cfg.hourly !== false) {
+      html += `<div class="wx-sec wx-hours">${hourly
+        .map((f, i) => {
+          const t = new Date(f.datetime);
+          return `<div class="wx-h"><small>${i === 0 ? "Now" : String(t.getHours()).padStart(2, "0")}</small>
+            <i>${wxIcon(f.condition, nightAt(t))}</i><b>${r(f.temperature)}°</b></div>`;
+        })
+        .join("")}</div>`;
+    }
+    if (daily.length > 1 || (daily.length && !hourly.length)) {
+      const mins = daily.map((d) => d.templow ?? d.temperature), maxs = daily.map((d) => d.temperature);
+      const gMin = Math.min(...mins), gMax = Math.max(...maxs), span = Math.max(1, gMax - gMin);
+      const tc = (t) => (t <= -10 ? "#7aa7ff" : t <= 0 ? "#6fd0ff" : t <= 10 ? "#7ee3c4" : t <= 18 ? "#ffd166" : t <= 25 ? "#ff9f43" : "#ff6b4a");
+      const dayName = (d, i) => (i === 0 ? "Today" : new Date(d.datetime).toLocaleDateString(undefined, { weekday: "short" }));
+      html += `<div class="wx-sec wx-days">${daily
+        .map((d, i) => {
+          const l = d.templow ?? d.temperature, h = d.temperature;
+          const pa = ((l - gMin) / span) * 100, pb = 100 - ((h - gMin) / span) * 100;
+          const now = i === 0 && a.temperature != null ? Math.min(100, Math.max(0, ((a.temperature - gMin) / span) * 100)) : null;
+          const pp = d.precipitation_probability;
+          return `<div class="wx-d"><span>${esc(dayName(d, i))}</span>
+            <i>${wxIcon(d.condition, false)}${pp >= 20 ? `<em>${Math.round(pp)}%</em>` : ""}</i>
+            <span class="lo">${r(l)}°</span>
+            <span class="wx-bar" style="--a:${pa.toFixed(1)}%;--b:${pb.toFixed(1)}%;--c1:${tc(l)};--c2:${tc(h)}"><b></b>${now != null ? `<u style="--n:${now.toFixed(1)}%"></u>` : ""}</span>
+            <span class="hi">${r(h)}°</span></div>`;
+        })
+        .join("")}</div>`;
+    }
+    const wind = a.wind_speed != null ? `${r(a.wind_speed)} ${esc(a.wind_speed_unit || "")}` : null;
+    const arrow = a.wind_bearing != null ? `<svg viewBox="0 0 24 24" style="transform:rotate(${Number(a.wind_bearing) + 180}deg)"><path d="M12 3l6 16-6-4-6 4z"/></svg>` : "";
+    if (wind || a.humidity != null) {
+      html += `<div class="wx-sec wx-foot">${wind ? `<span>${arrow}Wind ${wind}</span>` : ""}${a.humidity != null ? `<span>Humidity ${r(a.humidity)}%</span>` : ""}</div>`;
+    }
+    const radar = this._radarEl();
+    if (radar) html += `<span class="wx-radar-slot"></span>`;
+    html += `</div></div>`;
+    el.innerHTML = html;
+    if (radar) el.querySelector(".wx-radar-slot").replaceWith(radar); // the same map every time: no reloading
+    if (radar && this._wxOpen) requestAnimationFrame(() => this._radarFit());
+    el.classList.toggle("mini", !this._wxOpen);
+    el.setAttribute("role", "button");
+    el.setAttribute("aria-expanded", String(!!this._wxOpen));
+    el.setAttribute("aria-label", `Weather: ${r(a.temperature)} degrees, ${WX_TEXT[st.state] || st.state}`);
+  }
+
+  _resize() {
+    const w = this._wrap.clientWidth || 1;
+    const h = this._wrap.clientHeight || 1;
+    this._renderer.setSize(w, h, false);
+    this._camera.aspect = w / h;
+    this._camera.updateProjectionMatrix();
+    if (this._bg) this._bg.sized = false;
+    this._dlSizes?.();
+    if (this._wxCfg()) this._renderWeather(true);
+    // keep the whole room in frame at the start view, whatever the card's shape
+    if (this._fitBox) this._fitHome();
+    else this._aspectZoom = w / h < 1 ? 1 / Math.max(w / h, 0.55) : 1;
+    this._dirty = true;
+  }
+
+  _updateCamera() {
+    const d = this._dist * (this._aspectZoom || 1);
+    const ce = Math.cos(this._el);
+    this._camera.position.set(
+      this._target.x + d * ce * Math.sin(this._az),
+      this._target.y + d * Math.sin(this._el),
+      this._target.z + d * ce * Math.cos(this._az)
+    );
+    this._camera.lookAt(this._target);
+    // keep the sun's shadow box centred on what we look at
+    this._sun.target.position.copy(this._target);
+    this._sun.position.set(this._target.x + 8, 14, this._target.z + 6);
+  }
+
+  /** Snap to the preset angles on release? `snap:` in the config, or the ☰ menu's switch (remembered per screen). */
+  _snapOn() {
+    if (this._snapPref == null) {
+      let v = null;
+      try { v = localStorage.getItem(`house3d-card:snap:${this._config.model || ""}`); } catch (e) {}
+      this._snapPref = v == null ? this._config.snap !== false : v === "1";
+    }
+    return this._snapPref;
+  }
+
+  _setSnap(on) {
+    this._snapPref = on;
+    try { localStorage.setItem(`house3d-card:snap:${this._config.model || ""}`, on ? "1" : "0"); } catch (e) {}
+    if (on) this._snap(); // settle into the nearest preset now
+  }
+
+  _snapAz(az) {
+    const list = this._config.snap_azimuths;
+    let best = az, bestD = Infinity;
+    for (const deg of list) {
+      const d = Math.abs(wrapPi(deg * DEG - az));
+      if (d < bestD) {
+        bestD = d;
+        best = az + wrapPi(deg * DEG - az);
+      }
+    }
+    return best;
+  }
+
+  _snapEl(el) {
+    let best = el, bestD = Infinity;
+    for (const deg of this._config.snap_elevations) {
+      const d = Math.abs(deg * DEG - el);
+      if (d < bestD) {
+        bestD = d;
+        best = deg * DEG;
+      }
+    }
+    return Math.min(best, 89 * DEG);
+  }
+
+  _animateTo(to, duration, ease) {
+    this._tween = {
+      from: { az: this._az, el: this._el, dist: this._dist, target: this._target.clone() },
+      to: {
+        az: to.az ?? this._az,
+        el: to.el ?? this._el,
+        dist: to.dist ?? this._dist,
+        target: to.target ? to.target.clone() : this._target.clone(),
+      },
+      start: performance.now(),
+      duration,
+      ease,
+    };
+  }
+
+  /**
+   * Release after a drag: the view keeps spinning with the speed you let go at, slows down like a
+   * flywheel and eases into the preset nearest to where it would have stopped. One ease-out curve whose
+   * starting speed matches the release speed, so there's no jolt and no springy overshoot.
+   */
+  _snap() {
+    const c = this._config;
+    const vAz = this._reducedMotion ? 0 : this._velAz || 0; // rad per ms
+    const vEl = this._reducedMotion ? 0 : this._velEl || 0;
+    const tau = Number(c.spin_friction ?? 520); // ms: how long a flick keeps spinning
+    const freeAz = this._az + vAz * tau;
+    const freeEl = THREE.MathUtils.clamp(this._el + vEl * tau * 0.6, 5 * DEG, 89 * DEG);
+    const snap = this._snapOn();
+    const az = snap ? this._snapAz(freeAz) : freeAz; // free: it glides to a stop where your flick takes it
+    const el = snap ? this._snapEl(freeEl) : freeEl;
+    const dAz = Math.abs(az - this._az);
+    const dEl = Math.abs(el - this._el);
+    if (dAz < 1e-4 && dEl < 1e-4) return;
+    // easeOutCubic starts at 3x its average speed: pick the duration that matches the release speed
+    const speed = Math.hypot(vAz, vEl);
+    const dist = Math.hypot(dAz, dEl);
+    const matched = speed > 1e-5 ? (3 * dist) / speed : 0;
+    const duration = THREE.MathUtils.clamp(matched || 450 + 500 * Math.min(dist / Math.PI, 1), 380, 2600);
+    this._animateTo({ az, el }, duration, easeOutCubic);
+  }
+
+  _step(dir) {
+    const list = this._config.snap_azimuths.map((d) => d * DEG);
+    let best = null;
+    for (const a of list) {
+      const d = wrapPi(a - this._az);
+      if (dir > 0 ? d > 0.02 : d < -0.02) {
+        if (best === null || Math.abs(d) < Math.abs(best)) best = d;
+      }
+    }
+    if (best === null) best = dir * (this._config.snap_step * DEG);
+    this._animateTo({ az: this._az + best }, 450, easeOutBack);
+  }
+
+  _toggleTop() {
+    const top = this._el > 75 * DEG;
+    const els = this._config.snap_elevations.map((e) => e * DEG).sort((a, b) => a - b);
+    this._animateTo({ el: top ? els[0] : Math.min(els[els.length - 1], 89 * DEG) }, 600, easeInOutCubic);
+  }
+
+  _goHome(duration = 700) {
+    const c = this._config;
+    this._animateTo(
+      { az: this._az + wrapPi(c.start_azimuth * DEG - this._az), el: c.start_elevation * DEG, dist: this._home.dist, target: this._home.target },
+      duration,
+      easeInOutCubic
+    );
+  }
+
+  _isHome() {
+    const c = this._config;
+    return (
+      Math.abs(wrapPi(c.start_azimuth * DEG - this._az)) < 0.01 &&
+      Math.abs(c.start_elevation * DEG - this._el) < 0.01 &&
+      Math.abs(this._home.dist - this._dist) < 0.01 * this._home.dist &&
+      this._target.distanceTo(this._home.target) < 0.01
+    );
+  }
+
+  /** `return_home: 4` glides the camera back to the start view after 4 s without any interaction. */
+  _scheduleReturn(extraMs = 0) {
+    clearTimeout(this._returnTimer);
+    if (this._phone) return; // phone view: the camera stays on the device you're looking at
+    // after tapping a device in the list: a 3 s look, even with its panel open
+    const secs = this._dlHold ? 3 : Number(this._config.return_home) || 0;
+    if (secs <= 0) return;
+    this._returnTimer = setTimeout(() => {
+      // an open card holds the view while you use it; just the round power button doesn't (it follows the device home)
+      const cardOpen = this._menuFor && !this._dlHold && !this._menu.classList.contains("mini");
+      if (this._pointers.size || this._drag || this._menuBusy || !this.isConnected || this._tween || cardOpen)
+        return this._scheduleReturn();
+      if (this._dlHold) {
+        this._goHome(1200);
+        clearTimeout(this._dlHoldT);
+        this._dlHoldT = setTimeout(() => this._endDlHold(), 1250);
+      } else if (!this._isHome()) this._goHome(1200);
+    }, secs * 1000 + extraMs);
+  }
+
+  _goToView(v) {
+    let target = this._home.target;
+    if (v.focus) {
+      const o = this._findObject(v.focus);
+      if (o) target = new THREE.Box3().setFromObject(o).getCenter(new THREE.Vector3());
+      else console.warn(`house3d-card: view focus object "${v.focus}" not found`);
+    }
+    const az = v.azimuth != null ? this._az + wrapPi(v.azimuth * DEG - this._az) : this._az;
+    this._animateTo(
+      {
+        az,
+        el: v.elevation != null ? v.elevation * DEG : this._el,
+        dist: this._home.dist * (v.zoom ?? 1),
+        target,
+      },
+      800,
+      easeInOutCubic
+    );
+  }
+
+  /* ------------------------------------------------------------ input */
+
+  _bindEvents() {
+    const cv = this._canvas;
+    const sr = this.shadowRoot;
+    sr.querySelector(".left").addEventListener("click", () => this._step(-1));
+    sr.querySelector(".right").addEventListener("click", () => this._step(1));
+    sr.querySelector(".top").addEventListener("click", () => this._toggleTop());
+    sr.querySelector(".home").addEventListener("click", () => this._goHome());
+
+    // auto-return: every interaction anywhere on the card restarts the countdown
+    const wrap = this._wrap;
+    wrap.addEventListener("pointerdown", () => clearTimeout(this._returnTimer), true);
+    for (const ev of ["pointerup", "pointercancel", "wheel", "keydown", "input", "change"]) {
+      wrap.addEventListener(ev, () => this._scheduleReturn(), { capture: true, passive: true });
+    }
+
+    const menu = this._menu;
+    // the rim is drawn inside the card, so it would scroll with the contents: shift it back by the scroll
+    menu.addEventListener("scroll", () => menu.style.setProperty("--st", `${menu.scrollTop}px`), { passive: true });
+    menu.addEventListener("click", (e) => {
+      const el = e.target.closest("[data-act]");
+      if (el && el.type !== "range") this._menuAction(el, true);
+    });
+    menu.addEventListener("input", (e) => {
+      if (e.target.type === "range") this._menuAction(e.target, false);
+    });
+    menu.addEventListener("change", (e) => {
+      if (e.target.type !== "range") return;
+      this._menuAction(e.target, true);
+      clearTimeout(this._busyTimer);
+      this._busyTimer = setTimeout(() => {
+        this._menuBusy = false;
+        this._renderMenu();
+      }, 700);
+    });
+    menu.addEventListener("pointerdown", (e) => {
+      if (e.target.type === "range") this._menuBusy = true;
+    });
+    menu.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") this._closeMenu();
+    });
+
+    cv.addEventListener("pointerdown", (e) => {
+      cv.setPointerCapture(e.pointerId);
+      this._pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      this._tween = null;
+      if (this._pointers.size === 1) {
+        this._drag = { x: e.clientX, y: e.clientY, moved: 0, t: performance.now(), longFired: false };
+        this._velAz = this._velEl = 0;
+        const hit = this._pick(e);
+        clearTimeout(this._longTimer);
+        if (hit) {
+          this._longTimer = setTimeout(() => {
+            if (this._drag && this._drag.moved < 8) {
+              this._drag.longFired = true;
+              this._longPress(hit);
+            }
+          }, 550);
+        }
+      } else if (this._pointers.size === 2) {
+        const [a, b] = [...this._pointers.values()];
+        this._pinch = { d: Math.hypot(a.x - b.x, a.y - b.y), dist: this._dist };
+        clearTimeout(this._longTimer);
+      }
+    });
+
+    cv.addEventListener("pointermove", (e) => {
+      if (!this._pointers.has(e.pointerId)) {
+        if (e.pointerType === "mouse") this._hover(e);
+        return;
+      }
+      const p = this._pointers.get(e.pointerId);
+      const dx = e.clientX - p.x;
+      const dy = e.clientY - p.y;
+      p.x = e.clientX;
+      p.y = e.clientY;
+
+      if (this._pointers.size >= 2 && this._pinch) {
+        const [a, b] = [...this._pointers.values()];
+        const d = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+        this._dist = THREE.MathUtils.clamp((this._pinch.dist * this._pinch.d) / d, this._minDist, this._maxDist);
+        this._dirty = true;
+        return;
+      }
+      if (!this._drag) return;
+      this._drag.moved += Math.abs(dx) + Math.abs(dy);
+      if (this._drag.moved >= 4) {
+        this._wrap.classList.add("dragging");
+        if (this._dlHold) this._endDlHold();
+      }
+      if (this._drag.moved < 4) return;
+      if (this._phone) return; // phone view: a drag is a swipe between devices, not a turn of the room
+      this._hideTip();
+      const now = performance.now();
+      const dt = Math.max(now - this._drag.t, 1);
+      this._drag.t = now;
+      const dAz = -dx * 0.008;
+      const dEl = dy * 0.006;
+      this._az += dAz;
+      this._el = THREE.MathUtils.clamp(this._el + dEl, 5 * DEG, 89 * DEG);
+      this._velAz = 0.7 * (this._velAz || 0) + 0.3 * (dAz / dt);
+      this._velEl = 0.7 * (this._velEl || 0) + 0.3 * (dEl / dt);
+      this._dirty = true;
+    });
+
+    const end = (e) => {
+      if (!this._pointers.has(e.pointerId)) return;
+      this._pointers.delete(e.pointerId);
+      clearTimeout(this._longTimer);
+      if (this._pointers.size === 1) {
+        // pinch ended, continue as a drag with the remaining finger
+        const [p] = [...this._pointers.values()];
+        this._pinch = null;
+        this._drag = { x: p.x, y: p.y, moved: 99, t: performance.now() };
+        return;
+      }
+      if (this._pointers.size > 0) return;
+      this._wrap.classList.remove("dragging");
+      const drag = this._drag;
+      const pinched = !!this._pinch;
+      this._drag = null;
+      this._pinch = null;
+      if (!drag) return;
+      if (!pinched && drag.moved < 8 && e.type === "pointerup") {
+        if (drag.longFired) return;
+        if (this._scIsOpen) return this._scOpen(false);
+        if (this._ad?.step === "place") return this._adPlace(e);
+        const hit = this._pick(e);
+        if (hit) this._tap(hit);
+        else if (this._phone) this._phoneOpen(false);
+        else this._closeMenu();
+        return;
+      }
+      if (this._phone) {
+        // phone view: swipe left for the next device, right for the previous one
+        const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+        if (!pinched && Math.abs(dx) > 40 && Math.abs(dx) > Math.abs(dy) * 1.2) this._phoneStep(dx < 0 ? 1 : -1);
+        return;
+      }
+      if (performance.now() - drag.t > 90) this._velAz = this._velEl = 0;
+      this._snap();
+    };
+    cv.addEventListener("pointerup", end);
+    cv.addEventListener("pointercancel", end);
+    cv.addEventListener("pointerleave", () => this._hideTip());
+
+    cv.addEventListener(
+      "wheel",
+      (e) => {
+        e.preventDefault();
+        const d0 = this._dist;
+        this._dist = THREE.MathUtils.clamp(this._dist * (1 + e.deltaY * 0.0012), this._minDist, this._maxDist);
+        // mid-glide (a flick spinning down, a snap, the way home): scale the glide's own distance too, so the zoom
+        // sticks instead of being undone on the next frame, and the spin carries on
+        const tw = this._tween;
+        if (tw && d0 > 0) {
+          const f = this._dist / d0, clamp = (v) => THREE.MathUtils.clamp(v * f, this._minDist, this._maxDist);
+          tw.from.dist = clamp(tw.from.dist);
+          tw.to.dist = clamp(tw.to.dist);
+        }
+        this._dirty = true;
+      },
+      { passive: false }
+    );
+
+    cv.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowLeft") this._step(-1);
+      else if (e.key === "ArrowRight") this._step(1);
+      else if (e.key === "ArrowUp" || e.key === "ArrowDown") this._toggleTop();
+      else return;
+      e.preventDefault();
+    });
+  }
+
+  _pick(e) {
+    if (!this._proxies?.length) return null;
+    const rect = this._canvas.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      -((e.clientY - rect.top) / rect.height) * 2 + 1
+    );
+    this._updateCamera();
+    this._raycaster.setFromCamera(ndc, this._camera);
+    const hits = this._raycaster.intersectObjects(this._proxies, false).filter((h) => !h.object.userData.binding?.hiddenByUser);
+    return hits.length ? hits[0].object.userData.binding : null;
+  }
+
+  _hover(e) {
+    const b = this._pick(e);
+    this._canvas.style.cursor = b ? "pointer" : "grab";
+    if (!b) return this._hideTip();
+    this._tipFor(b, e.clientX, e.clientY);
+  }
+
+  _tipFor(b, clientX, clientY) {
+    if (this._menuFor === b) return this._hideTip();
+    const st = this._stateOf(b.cfg.entity);
+    const name = b.cfg.name || st?.attributes?.friendly_name || b.cfg.entity;
+    let state = st ? st.state : "not found";
+    if (b.offline) state = "offline";
+    if (b.alert && b.sinceText) state = b.sinceText.charAt(0).toLowerCase() + b.sinceText.slice(1);
+    if (b.door && st) state = this._isOn(st, b.cfg.entity, b.cfg) ? "open" : "closed";
+    if (b.cover && st?.attributes?.current_position != null) state += ` · ${st.attributes.current_position}%`;
+    if (st?.state === "on" && st.attributes?.brightness != null) state += ` · ${Math.round((st.attributes.brightness / 255) * 100)}%`;
+    this._tip.innerHTML = "";
+    const bold = document.createElement("b");
+    bold.textContent = name;
+    this._tip.append(bold, document.createTextNode(` — ${state}`));
+    const rect = this._wrap.getBoundingClientRect();
+    this._tip.style.left = `${clientX - rect.left}px`;
+    this._tip.style.top = `${clientY - rect.top}px`;
+    this._tip.classList.add("show");
+  }
+
+  /* ------------------------------------------------------------ hints */
+
+  _buildHints() {
+    const holder = this.shadowRoot.querySelector(".hints");
+    holder.innerHTML = "";
+    if (this._config.hints === false) return;
+    this._bindings.forEach((b, i) => {
+      // devices without a dot still get one while they're offline
+      b.hintOnlyAlert = b.cfg.hint === false;
+      const el = document.createElement("button");
+      el.className = "hint";
+      el.innerHTML = '<span class="core"></span><span class="since"></span>';
+      el.style.setProperty("--d", `${((i * 0.73) % 2.8).toFixed(2)}s`);
+      if (b.cfg.dot_color) el.style.setProperty("--hc", b.cfg.dot_color); // e.g. green while the internet is up
+      const st = this._stateOf(b.cfg.entity);
+      el.setAttribute("aria-label", b.cfg.name || st?.attributes?.friendly_name || b.cfg.entity);
+      let timer = null, long = false;
+      el.addEventListener("pointerdown", (e) => {
+        e.stopPropagation();
+        long = false;
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          long = true;
+          this._longPress(b);
+        }, 550);
+      });
+      const cancel = () => clearTimeout(timer);
+      el.addEventListener("pointerup", cancel);
+      el.addEventListener("pointerleave", () => {
+        cancel();
+        this._hideTip();
+      });
+      el.addEventListener("pointerenter", (e) => {
+        if (e.pointerType === "mouse") {
+          const r = el.getBoundingClientRect();
+          this._tipFor(b, r.left + r.width / 2, r.top - 4);
+        }
+      });
+      el.addEventListener("contextmenu", (e) => e.preventDefault());
+      el.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (long) return;
+        this._hideTip();
+        this._tap(b);
+      });
+      holder.appendChild(el);
+      b.hint = el;
+    });
+    this._applyStates(true);
+    this._positionHints();
+  }
+
+  /* ------------------------------------------------------------ 3D labels */
+
+  /**
+   * Floating readouts pinned to a point in the room, e.g. the room temperature:
+   *   labels: [{ entity: sensor.room_temperature, position: [586, 190, 405] }]   (model units, Sweet Home 3D: cm)
+   *   or { entity: ..., object: some_object } to float just above an object.
+   */
+  _buildLabels() {
+    const holder = this.shadowRoot.querySelector(".labels");
+    holder.innerHTML = "";
+    this._labels = [];
+    for (const cfg of this._config.labels || []) {
+      let at = null;
+      if (Array.isArray(cfg.position) && this._root) at = this._root.localToWorld(new THREE.Vector3(...cfg.position.map(Number)));
+      else if (cfg.object) {
+        const o = this._findObject(cfg.object);
+        if (o) {
+          const bb = this._boxOf([o]);
+          at = new THREE.Vector3((bb.min.x + bb.max.x) / 2, bb.max.y + 0.35, (bb.min.z + bb.max.z) / 2);
+        } else console.warn(`house3d-card: label object "${cfg.object}" not found`);
+      }
+      if (!at) at = this._home.target.clone().setY(this._home.target.y + 2.5);
+      const el = document.createElement("button");
+      el.className = cfg.hide_when_moving === false ? "lbl keep" : "lbl";
+      el.addEventListener("pointerdown", (e) => e.stopPropagation());
+      el.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const target = cfg.menu_of && this._bindings.find((x) => x.cfg.entity === cfg.menu_of);
+        if (target) return this._openMenu(target);
+        const ev = new Event("hass-more-info", { bubbles: true, composed: true });
+        ev.detail = { entityId: cfg.entity || cfg.parts?.[0]?.entity };
+        this.dispatchEvent(ev);
+      });
+      holder.appendChild(el);
+      this._labels.push({ cfg, at, el, key: "" });
+    }
+    this._updateLabels();
+    this._positionLabels();
+  }
+
+  /** A label with `parts:` shows several values (and presence icons) in one pill. */
+  _updatePartsLabel(l) {
+    const parts = l.cfg.parts;
+    const esc = (v) => String(v).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+    const html = [];
+    const aria = [];
+    let key = "";
+    for (const p of parts) {
+      const st = this._stateOf(p.entity);
+      if (p.presence) {
+        const here = this._isPresent(st);
+        key += here ? "1" : "0";
+        html.push(`<i class="pp ${here ? "here" : ""}" title="${esc(p.name || p.entity)}">${svg(ICON[p.icon] ? p.icon : "phone")}</i>`);
+        aria.push(`${p.name || p.entity} ${here ? "connected" : "away"}`);
+      } else {
+        const v = this._fmtNum(st, p.decimals ?? 0);
+        const unit = p.unit ?? "";
+        key += v + "|";
+        html.push(`<i class="pv">${ICON[p.icon] ? svg(p.icon) : ""}${esc(v)}${unit ? `<small>${esc(unit)}</small>` : ""}</i>`);
+        aria.push(`${p.name || p.icon || p.entity} ${v}${unit}`);
+      }
+    }
+    if (key === l.key) return;
+    l.key = key;
+    l.el.classList.add("multi");
+    l.el.innerHTML = (l.cfg.icon && ICON[l.cfg.icon] ? svg(l.cfg.icon) : "") + html.join('<span class="sep"></span>');
+    l.el.setAttribute("aria-label", `${l.cfg.name || "Readout"}: ${aria.join(", ")}`);
+  }
+
+  _updateLabels() {
+    for (const l of this._labels || []) {
+      if (l.cfg.parts) {
+        this._updatePartsLabel(l);
+        continue;
+      }
+      const st = this._stateOf(l.cfg.entity);
+      let raw = st ? (l.cfg.attribute ? st.attributes?.[l.cfg.attribute] : st.state) : null;
+      const unit = l.cfg.unit ?? st?.attributes?.unit_of_measurement ?? (l.cfg.attribute?.includes("temperature") ? "°C" : "");
+      const num = Number(raw);
+      const ok = raw != null && raw !== "" && raw !== "unavailable" && raw !== "unknown" && !Number.isNaN(num);
+      const dec = l.cfg.decimals ?? 1;
+      const text = ok ? num.toFixed(dec) : "–";
+      const key = `${text}|${unit}`;
+      if (key === l.key) continue;
+      l.key = key;
+      const isTemp = (l.cfg.icon ?? (/°|temp/i.test(unit + (l.cfg.attribute || "") + l.cfg.entity) ? "thermo" : "")) === "thermo";
+      l.el.innerHTML = `${isTemp ? svg("thermo") : ""}<span></span>`;
+      const u = unit.replace(/^°[CF]$/, "°");
+      l.el.querySelector("span").textContent = text + (ok ? u : "");
+      if (ok && unit && !u.startsWith("°")) {
+        const sm = document.createElement("small");
+        sm.textContent = unit;
+        l.el.querySelector("span").textContent = text;
+        l.el.appendChild(sm);
+      }
+      if (isTemp && ok) {
+        // cool blue below ~18°, neutral around 21°, warm orange above ~24°
+        const t = Math.min(1, Math.max(0, (num - 17) / 8));
+        const c = new THREE.Color("#8cc8ff").lerp(new THREE.Color("#ffffff"), Math.min(1, t * 2)).lerp(new THREE.Color("#ffab66"), Math.max(0, t * 2 - 1));
+        l.el.style.setProperty("--tc", `#${c.getHexString()}`);
+      }
+      l.el.setAttribute("aria-label", `${l.cfg.name || st?.attributes?.friendly_name || l.cfg.entity}: ${text}${unit}`);
+    }
+  }
+
+  _positionLabels() {
+    if (!this._labels?.length) return;
+    const w = this._wrap.clientWidth, h = this._wrap.clientHeight;
+    for (const l of this._labels) {
+      const v = l.at.clone().project(this._camera);
+      const hide = v.z > 1;
+      if (l.el.hidden !== hide) l.el.hidden = hide;
+      if (hide) continue;
+      l.el.style.left = `${(((v.x + 1) / 2) * w).toFixed(1)}px`;
+      l.el.style.top = `${(((1 - v.y) / 2) * h).toFixed(1)}px`;
+    }
+  }
+
+  _positionHints() {
+    if (!this._bindings.length) return;
+    const w = this._wrap.clientWidth, h = this._wrap.clientHeight;
+    const placed = [];
+    for (const b of this._bindings) {
+      const el = b.hint;
+      if (!el) continue;
+      const v = b.anchor.clone().project(this._camera);
+      let x = ((v.x + 1) / 2) * w;
+      const y = ((1 - v.y) / 2) * h - 16;
+      // keep dots of neighbouring devices from sitting on top of each other. A robot vacuum's dot stays on the
+      // robot (it would hop sideways every time it drove past another device) and doesn't push the others about.
+      if (!b.vac) {
+        for (let i = 0; i < 6 && placed.some((q) => Math.hypot(q[0] - x, q[1] - y) < 24); i++) x += 26;
+        placed.push([x, y]);
+      }
+      const off = v.z > 1 || x < -20 || x > w + 20 || y < -20 || y > h + 20;
+      const hide = off || b.hiddenByUser || this._menuFor === b || (b.hintOnlyAlert && !b.alert && !b.back);
+      if (el.hidden !== hide) el.hidden = hide;
+      if (!hide) {
+        el.style.left = `${x.toFixed(1)}px`;
+        el.style.top = `${y.toFixed(1)}px`;
+      }
+    }
+  }
+
+  _hideTip() {
+    this._tip?.classList.remove("show");
+  }
+
+  /* ------------------------------------------------------------ loop */
+
+  /** TV flicker: slow colour drift plus small brightness changes, like a screen playing something. */
+  _runFx(t) {
+    const col = new THREE.Color();
+    for (const b of this._fxBindings) {
+      const s = b.seed;
+      const n = 0.55 * Math.sin(t * 1.9 + s) + 0.3 * Math.sin(t * 4.7 + s * 2.3) + 0.15 * Math.sin(t * 9.1 + s * 0.7);
+      const k = 0.82 + 0.18 * n;
+      col.copy(b.baseColor).lerp(TV_ALT, 0.3 + 0.3 * Math.sin(t * 0.45 + s));
+      for (const m of b.mats) {
+        m.mat.emissive.copy(col);
+        m.mat.emissiveIntensity = (0.25 + 0.75 * b.baseFactor) * k;
+      }
+      for (const light of b.lights) {
+        light.color.copy(col);
+        light.intensity = (b.cfg.intensity ?? 6) * b.baseFactor * k;
+      }
+    }
+    this._dirty = true;
+  }
+
+  _startLoop() {
+    const loop = (now) => {
+      this._raf = requestAnimationFrame(loop);
+      const dt = Math.min(0.05, Math.max(0, (now - (this._lastT ?? now)) / 1000));
+      this._lastT = now;
+      if (this._stepAnims(dt)) this._dirty = true;
+      if (this._stepLightFades(now)) this._dirty = true;
+      this._bgFrame(now, dt);
+      // the room glides aside while the full forecast is open on a wide card, and back when it shrinks
+      if (this._fitBox) {
+        const want = this._wxReserve(this._wrap.clientWidth || 1);
+        const cur = this._wxRes ?? want;
+        if (Math.abs(want - cur) > 0.5) {
+          this._wxRes = cur + (want - cur) * Math.min(1, dt * 5);
+          this._fitHome();
+        } else if (this._wxRes !== want) {
+          this._wxRes = want;
+          this._fitHome();
+        }
+      }
+      const moving = this._config.hide_when_moving !== false && (!!this._tween || !!(this._drag && this._drag.moved >= 4));
+      if (moving && this._wxOpen && this._drag) this._setWeatherOpen(false);
+      if (moving !== this._movingCls) {
+        this._movingCls = moving;
+        this._wrap.classList.toggle("moving", moving);
+      }
+      if (this._fxBindings?.length && now - (this._fxT || 0) > 70) {
+        this._fxT = now;
+        this._runFx(now / 1000);
+      }
+      const tw = this._tween;
+      if (tw) {
+        const t = Math.min((now - tw.start) / tw.duration, 1);
+        const k = tw.ease(Math.max(t, 0));
+        this._az = tw.from.az + (tw.to.az - tw.from.az) * k;
+        this._el = THREE.MathUtils.clamp(tw.from.el + (tw.to.el - tw.from.el) * k, 2 * DEG, 89.5 * DEG);
+        this._dist = tw.from.dist + (tw.to.dist - tw.from.dist) * k;
+        this._target.lerpVectors(tw.from.target, tw.to.target, k);
+        if (t >= 1) {
+          this._tween = null;
+          this._az = wrapPi(this._az);
+        }
+        this._dirty = true;
+      }
+      if (this._dlSpin && this._dlOpen && !this._tween && !(this._drag && this._drag.moved >= 4)) this._positionDeviceList();
+      // The room stays live through every panel animation (a card growing, the list opening, arranging, dragging,
+      // sliding a lamp's brightness), so a light fading or the blind moving is never paused.
+      if (!this._dirty) return;
+      this._dirty = false;
+      const topNow = this._el > 75 * DEG;
+      const tb = this.shadowRoot.querySelector(".top");
+      if (tb && tb.textContent !== (topNow ? "3D" : "Top")) tb.textContent = topNow ? "3D" : "Top";
+      this._updateCamera();
+      this._updateWallTargets();
+      this._renderer.render(this._scene, this._camera);
+      this._positionHints();
+      this._positionLabels();
+      this._adPositionMark();
+      if (this._dlOpen) this._positionDeviceList();
+      if (this._menuFor) this._positionMenu();
+    };
+    this._raf = requestAnimationFrame(loop);
+  }
+}
+
+/* ------------------------------------------------------------ demo house */
+
+function buildDemoHouse() {
+  const g = new THREE.Group();
+  g.name = "demo_house";
+  const mat = (color, rough = 0.85, extra = {}) => new THREE.MeshStandardMaterial({ color, roughness: rough, ...extra });
+  const M = {
+    wall: mat(0xf4f1ea),
+    slab: mat(0xd8d2c6),
+    wood: mat(0xc49a6c, 0.7),
+    tile: mat(0xe7e9ec, 0.4),
+    carpet: mat(0xb9c4b0, 1),
+    bathTile: mat(0xcfe0e6, 0.35),
+    sofa: mat(0x5c7087),
+    dark: mat(0x2b2b2b, 0.5),
+    white: mat(0xfafafa, 0.5),
+    counter: mat(0x44494f, 0.4),
+    oak: mat(0x9c7148, 0.6),
+    bed: mat(0xe9e4da),
+    blanket: mat(0xc0795f),
+    rug: mat(0xd9c7a8, 1),
+    shade: mat(0xf5ecd9, 0.9, { side: THREE.DoubleSide }),
+    metal: mat(0x3a3a3a, 0.35, { metalness: 0.6 }),
+    brass: mat(0xb08d57, 0.35, { metalness: 0.7 }),
+    plant: mat(0x4f7f4a),
+    pot: mat(0xb86b4b),
+  };
+  const add = (parent, geo, m, x, y, z, name) => {
+    const mesh = new THREE.Mesh(geo, m);
+    mesh.position.set(x, y, z);
+    if (name) mesh.name = name;
+    parent.add(mesh);
+    return mesh;
+  };
+  const box = (w, h, d, x, y, z, m, name, parent = g) => add(parent, new THREE.BoxGeometry(w, h, d), m, x, y, z, name);
+  const cyl = (rt, rb, h, x, y, z, m, name, parent = g, seg = 24, open = false) =>
+    add(parent, new THREE.CylinderGeometry(rt, rb, h, seg, 1, open), m, x, y, z, name);
+
+  const H = 1.15, T = 0.12;
+  const wallX = (x1, x2, z) => box(x2 - x1, H, T, (x1 + x2) / 2, H / 2, z, M.wall);
+  const wallZ = (z1, z2, x) => box(T, H, z2 - z1, x, H / 2, (z1 + z2) / 2, M.wall);
+
+  // slab + room floors
+  box(10.4, 0.12, 8.4, 0, -0.06, 0, M.slab);
+  box(6, 0.01, 4.5, -2, 0.005, -1.75, M.wood);
+  box(4, 0.01, 4.5, 3, 0.005, -1.75, M.tile);
+  box(5, 0.01, 3.5, -2.5, 0.005, 2.25, M.carpet);
+  box(5, 0.01, 3.5, 2.5, 0.005, 2.25, M.bathTile);
+
+  // outer walls
+  wallX(-5.06, 5.06, -4);
+  wallX(-5.06, -1.2, 4);
+  wallX(0.2, 5.06, 4);
+  wallZ(-4, 4, -5);
+  wallZ(-4, -2.4, 5);
+  wallZ(-0.8, 4, 5);
+  // inner walls with doorways
+  wallX(-5, -2, 0.5);
+  wallX(-1.1, 2.5, 0.5);
+  wallX(3.4, 5, 0.5);
+  wallZ(-4, -2.6, 1);
+  wallZ(-0.6, 0.5, 1);
+  wallZ(0.5, 4, 0);
+
+  // living room
+  box(3, 0.01, 2, -2.8, 0.012, -2.4, M.rug);
+  box(2.4, 0.42, 0.9, -2.8, 0.21, -3.4, M.sofa);
+  box(2.4, 0.45, 0.22, -2.8, 0.62, -3.78, M.sofa);
+  box(0.25, 0.3, 0.9, -4.1, 0.55, -3.4, M.sofa);
+  box(0.25, 0.3, 0.9, -1.5, 0.55, -3.4, M.sofa);
+  box(1.1, 0.06, 0.6, -2.8, 0.4, -2.3, M.oak);
+  [[-3.25, -2.5], [-2.35, -2.5], [-3.25, -2.1], [-2.35, -2.1]].forEach(([x, z]) => box(0.05, 0.37, 0.05, x, 0.185, z, M.metal));
+  box(1.8, 0.45, 0.4, -2.8, 0.225, 0.2, M.oak);
+  const tv = new THREE.Group();
+  tv.name = "tv_living";
+  tv.position.set(-2.8, 0.86, 0.22);
+  box(1.4, 0.8, 0.06, 0, 0, 0, M.dark, "tv_frame", tv);
+  box(1.3, 0.7, 0.01, 0, 0.02, -0.032, mat(0x0a0c11, 1), "screen", tv);
+  g.add(tv);
+  cyl(0.18, 0.14, 0.35, -0.6, 0.175, -3.5, M.pot);
+  add(g, new THREE.SphereGeometry(0.35, 16, 12), M.plant, -0.6, 0.65, -3.5);
+
+  const lampLiving = new THREE.Group();
+  lampLiving.name = "lamp_living";
+  lampLiving.position.set(-4.5, 0, -3.55);
+  cyl(0.2, 0.22, 0.04, 0, 0.02, 0, M.metal, null, lampLiving);
+  cyl(0.02, 0.02, 1.45, 0, 0.74, 0, M.brass, null, lampLiving);
+  cyl(0.17, 0.27, 0.35, 0, 1.55, 0, M.shade, "shade", lampLiving, 32, true);
+  add(lampLiving, new THREE.SphereGeometry(0.06, 12, 8), M.white, 0, 1.48, 0, "bulb");
+  g.add(lampLiving);
+
+  // kitchen
+  box(3.6, 0.88, 0.62, 3, 0.44, -3.62, M.white);
+  box(3.64, 0.04, 0.66, 3, 0.9, -3.62, M.counter);
+  box(0.62, 0.88, 1.8, 4.62, 0.44, -2.4, M.white);
+  box(0.66, 0.04, 1.84, 4.62, 0.9, -2.4, M.counter);
+  box(1.8, 0.88, 0.85, 2.8, 0.44, -1.4, M.oak);
+  box(1.9, 0.05, 0.95, 2.8, 0.905, -1.4, M.counter);
+  [2.2, 2.8, 3.4].forEach((x) => cyl(0.16, 0.16, 0.05, x, 0.65, -0.72, M.dark));
+
+  const lampKitchen = new THREE.Group();
+  lampKitchen.name = "lamp_kitchen";
+  lampKitchen.position.set(2.8, 0.93, -1.4);
+  cyl(0.09, 0.11, 0.03, 0, 0.015, 0, M.brass, null, lampKitchen);
+  cyl(0.015, 0.015, 0.3, 0, 0.17, 0, M.brass, null, lampKitchen);
+  const dome = add(
+    lampKitchen,
+    new THREE.SphereGeometry(0.2, 32, 12, 0, Math.PI * 2, 0, Math.PI / 2),
+    M.shade,
+    0,
+    0.3,
+    0,
+    "shade"
+  );
+  dome.scale.y = 0.8;
+  add(lampKitchen, new THREE.SphereGeometry(0.05, 12, 8), M.white, 0, 0.33, 0, "bulb");
+  g.add(lampKitchen);
+
+  // bedroom
+  box(1.7, 0.35, 2.1, -2.5, 0.175, 2.85, M.oak);
+  box(1.6, 0.18, 2.0, -2.5, 0.44, 2.85, M.bed);
+  box(1.64, 0.08, 1.3, -2.5, 0.55, 2.45, M.blanket);
+  box(0.55, 0.1, 0.35, -2.9, 0.58, 3.6, M.white);
+  box(0.55, 0.1, 0.35, -2.1, 0.58, 3.6, M.white);
+  box(1.7, 0.75, 0.08, -2.5, 0.55, 3.92, M.oak);
+  box(0.45, 0.5, 0.42, -3.75, 0.25, 3.62, M.oak);
+  box(0.45, 0.5, 0.42, -1.25, 0.25, 3.62, M.oak);
+  box(1.4, 1.0, 0.55, -4.6, 0.5, 1.6, M.white);
+
+  const lampBed = new THREE.Group();
+  lampBed.name = "lamp_bedroom";
+  lampBed.position.set(-3.75, 0.5, 3.62);
+  cyl(0.08, 0.1, 0.18, 0, 0.09, 0, M.brass, null, lampBed);
+  cyl(0.11, 0.16, 0.2, 0, 0.3, 0, M.shade, "shade", lampBed, 32, true);
+  add(lampBed, new THREE.SphereGeometry(0.04, 12, 8), M.white, 0, 0.26, 0, "bulb");
+  g.add(lampBed);
+
+  // bathroom
+  box(1.75, 0.55, 0.8, 4.05, 0.275, 3.52, M.white);
+  box(1.55, 0.05, 0.6, 4.05, 0.53, 3.52, M.bathTile);
+  box(0.9, 0.8, 0.5, 1.3, 0.4, 3.66, M.oak);
+  box(0.7, 0.05, 0.42, 1.3, 0.82, 3.66, M.white);
+  box(0.4, 0.4, 0.55, 0.4, 0.2, 1.1, M.white);
+  box(0.75, 0.55, 0.03, 1.3, 1.2, 3.92, mat(0xbfd4dc, 0.05, { metalness: 0.8 }));
+
+  const lampBath = new THREE.Group();
+  lampBath.name = "lamp_bath";
+  lampBath.position.set(1.3, 1.5, 3.88);
+  box(0.7, 0.06, 0.08, 0, 0, 0, M.white, "glow", lampBath);
+  box(0.74, 0.03, 0.06, 0, 0.045, 0.01, M.metal, null, lampBath);
+  g.add(lampBath);
+
+  return g;
+}
+
+customElements.define("house3d-card", House3DCard);
+window.customCards = window.customCards || [];
+window.customCards.push({
+  type: "house3d-card",
+  name: "3D House",
+  description: "Rotatable 3D model of your home with clickable lights.",
+  preview: false,
+});
+console.info(`%c HOUSE3D-CARD %c v${VERSION} `, "background:#c49a6c;color:#fff;border-radius:3px 0 0 3px", "background:#333;color:#fff;border-radius:0 3px 3px 0");
