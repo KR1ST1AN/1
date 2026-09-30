@@ -7584,6 +7584,7 @@ Object.assign(ICON, {
   osc: "M12 5C8 5 4.6 7.2 3 10.5l1.8.9C6.1 8.8 8.8 7 12 7s5.9 1.8 7.2 4.4l1.8-.9C19.4 7.2 16 5 12 5zM2 15.5l.6-6 5 3.4zm20 0-.6-6-5 3.4zM12 11.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5z",
   airflow: "M11 21V7.83l-4.59 4.58L5 11l7-7 7 7-1.41 1.41L13 7.83V21z",
   flame: "M13.5 1s.74 2.65.74 4.8c0 2.06-1.35 3.73-3.41 3.73-2.07 0-3.63-1.67-3.63-3.73l.03-.36C5.21 7.51 4 10.62 4 14c0 4.42 3.58 8 8 8s8-3.58 8-8C20 8.61 17.41 3.8 13.5 1zM11.71 19c-1.78 0-3.22-1.4-3.22-3.14 0-1.62 1.05-2.76 2.81-3.12 1.77-.36 3.6-1.21 4.62-2.58.39 1.29.59 2.65.59 4.04 0 2.65-2.15 4.8-4.8 4.8z",
+  kiosk: "M4 4h6v2H6v4H4zm10 0h6v6h-2V6h-4zM4 14h2v4h4v2H4zm14 4h-4v2h6v-6h-2z",
   eye: "M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5C21.27 7.61 17 4.5 12 4.5zM12 17a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-8a3 3 0 1 0 0 6 3 3 0 0 0 0-6z",
 });
 const ICON_EVENODD = new Set(["window", "door", "vacuum"]);
@@ -7882,6 +7883,7 @@ class House3DCard extends HTMLElement {
     this._weatherHass();
     if (this._modelReady && !this._adLoaded) this._adLoad();
     if (!this._auLoaded) this._auLoad();
+    if (this._modelReady && !this._kioskTried) { this._kioskTried = true; if (this._kioskPref()) setTimeout(() => this._setKiosk(true, false), 0); }
     if (this._modelReady && !this._phoneTried && this._bindings.length) { this._phoneTried = true; if (this._phonePref()) setTimeout(() => this._setPhone(true), 0); }
   }
 
@@ -7912,6 +7914,11 @@ class House3DCard extends HTMLElement {
       <style>
         :host { display:block; }
         ha-card { display:block; overflow:hidden; position:relative; }
+        /* kiosk mode: the card covers the whole screen, Home Assistant's header and sidebar included */
+        :host(.h3d-kiosk) { position:fixed; inset:0; z-index:10000; background:#000; }
+        :host(:fullscreen) { background:#000; }
+        :host(.h3d-kiosk) ha-card { height:100%; border-radius:0; border:0; box-shadow:none; }
+        .wrap.kiosk { height:100vh; height:100dvh; }
         .wrap { --accent: var(--h3d-accent, #f5a524); position:relative; width:100%; height:${c.height === "full" ? "calc(100vh - var(--header-height, 56px))" : `${Number(c.height) || 450}px`}; ${c.height === "full" ? "height:calc(100dvh - var(--header-height, 56px));" : ""} user-select:none; -webkit-user-select:none; }
         .hints { position:absolute; inset:0; pointer-events:none; z-index:1; overflow:hidden; transition:opacity .4s ease .12s; }
         /* while the room is moving (dragging, snapping, flying home) the dots and floating readouts fade away */
@@ -9051,6 +9058,7 @@ class House3DCard extends HTMLElement {
         this._applyStates();
         this._applyNight();
         this._modelReady = true;
+        if (!this._kioskTried) { this._kioskTried = true; if (this._kioskPref()) this._setKiosk(true, false); } // straight back to kiosk
         this._adLoad();
         this._status.style.display = "none";
         this._dirty = true;
@@ -10223,6 +10231,11 @@ class House3DCard extends HTMLElement {
       }
       if (this._dlEdit && el.closest(".dl-rows")) return; // arranging: taps don't switch things
       if (el.dataset.dl === "expand") return this._setDlCompact(!this._dlCompact());
+      if (el.dataset.dl === "kiosk") {
+        this._dlMenu(false);
+        this._setKiosk(!this._kiosk);
+        return;
+      }
       if (el.dataset.dl === "phone") {
         this._dlMenu(false);
         this._setPhone(!this._phone);
@@ -11025,6 +11038,7 @@ class House3DCard extends HTMLElement {
       ${this._plainLabels() ? `<button class="dl-mi" role="menuitemcheckbox" data-dl="temp" aria-pressed="${this._tempShown()}" aria-checked="${this._tempShown()}">${svg("thermo")}<span>${this._plainLabels()}</span><i></i></button>` : ""}
       <button class="dl-mi" role="menuitemcheckbox" data-dl="snap" aria-pressed="${this._snapOn()}" aria-checked="${this._snapOn()}">${svg("topview")}<span>Snap to angles</span><i></i></button>
       <button class="dl-mi" role="menuitemcheckbox" data-dl="phone" aria-pressed="${!!this._phone}" aria-checked="${!!this._phone}">${svg("phone")}<span>Phone view</span><i></i></button>
+      <button class="dl-mi" role="menuitemcheckbox" data-dl="kiosk" aria-pressed="${!!this._kiosk}" aria-checked="${!!this._kiosk}">${svg("kiosk")}<span>Kiosk mode</span><i></i></button>
       <button class="dl-mi go" role="menuitem" data-dl="arrange">${svg("grid")}<span>Arrange devices</span>${svg("chev")}</button>
       <button class="dl-mi go" role="menuitem" data-dl="hiddenlist">${svg("eyeoff")}<span>Hidden devices</span><em>${hidden.length || ""}</em>${svg("chev")}</button>`;
   }
@@ -13262,6 +13276,61 @@ class House3DCard extends HTMLElement {
     if (m.style.maxHeight !== want) m.style.maxHeight = want;
     m.style.left = `${Math.max(8, (w - m.offsetWidth) / 2)}px`;
     m.style.top = `${B - m.offsetHeight}px`;
+  }
+
+  /* ------------------------------------------------------------ kiosk mode */
+
+  /**
+   * Kiosk mode (☰ → Kiosk mode): the card covers the whole screen, over Home Assistant's header and sidebar, asks the
+   * browser for fullscreen, and keeps the screen awake. Made for a tablet on the wall. Remembered per screen: after a
+   * reload it covers the screen again straight away, and goes fullscreen again on the first tap (browsers only allow
+   * fullscreen after a tap). Leaving fullscreen (Esc, the back gesture) leaves kiosk mode too.
+   */
+  _kioskPref() {
+    try { return localStorage.getItem(`house3d-card:kiosk:${this._config.model || ""}`) === "1"; } catch (e) { return false; }
+  }
+
+  _setKiosk(on, fromTap = true) {
+    this._kiosk = on;
+    try { localStorage.setItem(`house3d-card:kiosk:${this._config.model || ""}`, on ? "1" : "0"); } catch (e) {}
+    this.classList.toggle("h3d-kiosk", on);
+    this._wrap.classList.toggle("kiosk", on);
+    if (!this._kioskWired) {
+      this._kioskWired = true;
+      document.addEventListener("fullscreenchange", () => {
+        if (document.fullscreenElement === this) this._kioskFs = true;
+        else if (this._kioskFs) { this._kioskFs = false; if (this._kiosk) this._setKiosk(false); } // Esc / back: out of kiosk
+      });
+      document.addEventListener("visibilitychange", () => { if (this._kiosk && document.visibilityState === "visible") this._kioskWake(true); });
+      // restored after a reload: fullscreen needs a tap, so the first tap on the card asks for it
+      this.addEventListener("pointerdown", () => { if (this._kiosk && !document.fullscreenElement) this._kioskFullscreen(); }, { capture: true });
+    }
+    if (on) {
+      if (this._dlOpen && fromTap) this._closeDeviceList();
+      if (fromTap) this._kioskFullscreen();
+      this._kioskWake(true);
+    } else {
+      if (document.fullscreenElement === this) { this._kioskFs = false; document.exitFullscreen?.().catch(() => {}); }
+      this._kioskWake(false);
+    }
+    this._resize?.();
+    this._dirty = true;
+  }
+
+  _kioskFullscreen() {
+    const req = this.requestFullscreen || this.webkitRequestFullscreen;
+    if (!req || document.fullscreenElement === this) return;
+    try { const r = req.call(this, { navigationUI: "hide" }); r?.catch?.(() => {}); } catch (e) { /* not allowed here: covering the page is enough */ }
+  }
+
+  /** Keep the screen from dimming and locking while in kiosk mode (where the browser supports it). */
+  async _kioskWake(on) {
+    if (!on) { try { await this._wakeLock?.release(); } catch (e) {} this._wakeLock = null; return; }
+    if (!navigator.wakeLock || this._wakeLock) return;
+    try {
+      this._wakeLock = await navigator.wakeLock.request("screen");
+      this._wakeLock.addEventListener("release", () => { this._wakeLock = null; });
+    } catch (e) { /* not allowed (battery saver, insecure page): the screen just follows its own settings */ }
   }
 
   _isNight() {

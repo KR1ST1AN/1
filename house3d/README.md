@@ -36,6 +36,9 @@ companion app load the new version.
 - **Rain map:** uses Home Assistant's home location, radar from RainViewer and map tiles from CARTO /
   OpenStreetMap (needs internet). Adjust or turn off with `weather: { entity: ..., rain_map: { zoom: 7 } }` or
   `rain_map: false`.
+- **Kiosk mode** (☰ → Kiosk mode): the card covers the whole screen over Home Assistant's header and sidebar, goes
+  fullscreen and keeps the screen awake, for a wall tablet. It's remembered per screen; after a reload it covers the
+  screen straight away and goes fullscreen again on the first tap. Leave it from ☰, or with Esc / the back gesture.
 - **Phone view** order: `phone_first:` and `phone_last:`; everything else goes left to right from the start view.
 - **Free camera:** `snap: false` (or ☰ → Snap to angles). `return_home: 4` glides back to the start view after
   4 s without interaction; set it to `0` to turn that off.
