@@ -9705,10 +9705,10 @@ class House3DCard extends HTMLElement {
     this._vanishing = vanishing;
     for (const w of this._walls || []) {
       if (w.cur === w.target) continue;
-      w.cur = approach(w.cur, w.target, 7);
+      w.cur = approach(w.cur, w.target, 10); // a short follow, so it stays soft even when you flick the room
       for (const m of w.mats) {
         m.opacity = w.cur;
-        m.depthWrite = w.cur > 0.97;
+        m.depthWrite = w.cur > 0.995; // solid only once it's fully back: no visible snap on the way in
       }
       for (const mesh of w.meshes) mesh.castShadow = w.shadows && w.cur > 0.5;
       active = true;
@@ -12879,9 +12879,14 @@ class House3DCard extends HTMLElement {
     const cl = Math.hypot(cx, cz) || 1;
     const topDown = this._el > 72 * DEG;
     const faded = this._config.wall_opacity ?? 0.08;
+    // how much a wall faces the camera, eased: it fades gradually as the room turns, in step with the spin
+    // (it used to switch at one angle and then catch up on its own, so a wall seemed to pop in or out)
+    const ss = (a, b, x) => { const k = Math.min(1, Math.max(0, (x - a) / (b - a))); return k * k * (3 - 2 * k); };
+    const up = ss(72 * DEG, 60 * DEG, this._el); // looking straight down: every wall shows
     for (const w of this._walls) {
       const d = (w.dir.x * cx + w.dir.z * cz) / cl;
-      w.target = !topDown && d > 0.2 ? faded : 1;
+      const k = ss(-0.05, 0.45, d) * up;
+      w.target = 1 - (1 - faded) * k;
     }
   }
 
